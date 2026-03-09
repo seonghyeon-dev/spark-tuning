@@ -55,29 +55,52 @@
    - 분할 기준과 실행 시간의 관계 그래프
    - 최적 분할 기준값 도출 (또는 데이터 크기별 동적 기준)
 
+#### 벤치마크 결과 ✅
+
+| 테스트 ID | num-executors | 총 코어 수 | 소요시간 | 결과 |
+|-----------|---------------|-----------|---------|------|
+| NE-01 | 16 | 64 | 55초 | 코어 부족 |
+| **NE-02** | **24** | **96** | **44초** | **✅ 최적** |
+| NE-03 | 32 | 128 | 51초 | 오버헤드 발생 |
+| NE-04 | 60 | 240 | 51초 | 과다 할당 확인 |
+
+**결론**: `PARALLELISM_FACTOR=1.5`(24개)가 최적. 산정식: `ceil(총 크기 / 128MB × 1.5 / executor-cores)`
+
+#### Shuffle 발생 확인 (Stage 분석) ✅
+
+Spark UI Stages 탭에서 확인한 결과, **shuffle이 발생한다** (9.2GiB 규모).
+
+| Stage | 역할 | Input | Shuffle Write | Shuffle Read | Output |
+|-------|------|-------|---------------|--------------|--------|
+| 0 | collect (메타데이터) | 580.6KiB | 163.8KiB | - | - |
+| 1 | collect (skipped) | - | - | - | - |
+| 2 | collect (메타데이터) | - | - | 163.9KiB | - |
+| 3 | 파일 목록 조회 (5355 paths) | - | - | - | - |
+| 4 | append (avro 읽기) | 7.9GiB | - | - | - |
+| 5 | append (shuffle 준비) | 7.9GiB | **9.2GiB** | - | - |
+| 7 | append (Iceberg 쓰기) | - | - | **9.2GiB** | 6.5GiB |
+
+- Stage 5→7에서 Iceberg `write.distribution-mode`에 의한 대규모 shuffle 발생
+- Stage 0/2의 소량 shuffle(163.8KiB)은 Iceberg 메타데이터 collect 관련으로 무시 가능
+
+---
+
 ### 1.2 spark.sql.shuffle.partitions (우선순위: P2)
 
 **현재 상태**: 70
 **문제점**: 기본값 200 대비 낮게 설정했으나 근거 없음
+**선행 확인 완료**: shuffle 9.2GiB 발생 확인 → 이 옵션은 성능에 영향을 미침
 
 #### 검증 방법
-1. 고정 변수: executor-cores=4, executor-memory=8g, num-executors=NE-01~05 최적값 사용
+1. 고정 변수: executor-cores=4, executor-memory=8g, num-executors=24 (NE 최적값)
 2. 변경 변수:
 
 | 테스트 ID | 파티션 수 | 비고 |
 |-----------|-----------|------|
-| SP-01 | 50 | executor 수 × cores에 근접 |
-| SP-02 | 70 | 현재 설정 (baseline) |
-| SP-03 | 100 | |
-| SP-04 | 200 | Spark 기본값 |
-| SP-05 | AQE 자동 | shuffle.partitions=200 + AQE에 맡김 |
+| SP-01 | 70 | 현재 설정 (baseline) |
+| SP-02 | 200 | Spark 기본값. AQE가 자동 조정하도록 위임 |
 
 3. 측정 지표: 1.1과 동일 + 셔플 파티션당 데이터 크기 분포
-
-4. 추가 확인사항
-   - avro → Iceberg append에서 실제로 shuffle이 발생하는지 확인 (Spark UI의 Stage DAG 확인)
-   - shuffle이 없다면 이 설정의 영향도는 낮음
-   - Iceberg의 write.distribution-mode에 따라 shuffle 발생 여부가 달라짐
 
 ### 1.3 Executor 리소스 (우선순위: P3)
 
@@ -120,16 +143,24 @@
 
 ## 3. 결과 정리 템플릿
 
-### 테스트 결과 기록
+### num-executors 결과 (✅ 완료)
+
+| 테스트 ID | num-executors | 실행시간(s) | 비고 |
+|-----------|---------------|------------|------|
+| NE-01 | 16 | 55 | 코어 부족 |
+| **NE-02** | **24** | **44** | **✅ 최적** |
+| NE-03 | 32 | 51 | 오버헤드 발생 |
+| NE-04 | 60 | 51 | 과다 할당 |
+
+### shuffle.partitions / parallelismFirst 결과 (⚠️ 대기)
 
 | 테스트 ID | 실행시간(s) | Task 중앙값(s) | Task p95(s) | GC 비율(%) | 메모리 peak(%) | 셔플 크기 | 파일 수 |
 |-----------|------------|----------------|-------------|------------|---------------|-----------|---------|
 | | | | | | | | |
 
 ### 결론 도출
-- 각 검증 대상별 최적값과 근거
-- 데이터 크기별 동적 설정이 필요한지 여부
-- 설정 변경 전후 비교 (현재 설정 vs 최적 설정)
+- **num-executors**: 24개 최적 (`PARALLELISM_FACTOR=1.5`). 기존 60개 대비 리소스 60% 절감, 성능 13% 향상
+- shuffle.partitions, parallelismFirst: 벤치마크 대기
 
 ---
 
