@@ -10,7 +10,6 @@
 
 ```
 ├── CLAUDE.md                  # 작업 지시서
-├── project-context.md         # 아키텍처, 워크플로우, 현재 설정값
 ├── benchmarking-plan.md       # 벤치마크 계획서 및 결과
 ├── spark-tuning-guide.md      # ✅ 최종 산출물
 └── handoff.md                 # 이 파일
