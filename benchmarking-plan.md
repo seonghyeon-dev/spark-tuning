@@ -57,6 +57,7 @@
 | 3 | 파일 목록 조회 (5355 paths) | - | - | - | - |
 | 4 | append (avro 읽기) | 7.9GiB | - | - | - |
 | 5 | append (shuffle 준비) | 7.9GiB | **9.2GiB** | - | - |
+| 6 | append (skipped) | - | - | - | - |
 | 7 | append (Iceberg 쓰기) | - | - | **9.2GiB** | 6.5GiB |
 
 Stage 5→7에서 Iceberg `write.distribution-mode=range`에 의한 9.2GiB shuffle 발생.

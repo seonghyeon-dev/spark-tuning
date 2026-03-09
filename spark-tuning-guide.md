@@ -269,6 +269,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 | 3 | 파일 목록 조회 (5355 paths) | - | - | - | - |
 | 4 | append (avro 읽기) | 7.9GiB | - | - | - |
 | 5 | append (shuffle 준비) | 7.9GiB | **9.2GiB** | - | - |
+| 6 | append (skipped) | - | - | - | - |
 | 7 | append (Iceberg 쓰기) | - | - | **9.2GiB** | 6.5GiB |
 
 ---
