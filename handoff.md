@@ -3,8 +3,9 @@
 ## 현재 상태
 - **주요 작업 완료**: `spark-tuning-guide.md` 작성 완료 (Confluence 복사/붙여넣기 가능)
 - **num-executors 벤치마크 완료**: 24개 최적 확인 (`PARALLELISM_FACTOR=1.5`), 기존 60개 대비 리소스 60% 절감·성능 13% 향상
+- **벤치마크 테스트 조건**: 모든 테스트에서 `shuffle.partitions`=200(기본값), `parallelismFirst`=true(기본값) — 별도 설정하지 않음
 - **Shuffle 발생 확인**: 9.2GiB 규모 shuffle 확인 (Iceberg `write.distribution-mode`에 의한 파티션 키 기준 재분배)
-- **다음 작업**: shuffle.partitions 벤치마크 (70 vs 200), parallelismFirst 전환 테스트
+- **다음 작업**: shuffle.partitions=70 테스트 (200 결과는 이미 확보), parallelismFirst=false 전환 테스트
 
 ## 파일 구조
 
@@ -29,6 +30,7 @@
 - **num-executors 벤치마크 완료**: 16/24/32/60개 비교 → 24개 최적 (44초)
 - **Shuffle 발생 확인**: Stage 분석 (9.2GiB shuffle, Stage 5→7)
 - PARALLELISM_FACTOR 설명 추가 (Spark 옵션이 아닌 산정식의 여유 계수)
+- 벤치마크 테스트 조건 명시: shuffle.partitions·parallelismFirst 모두 기본값으로 테스트
 
 ## 다음에 해야 할 작업
 
@@ -37,8 +39,8 @@
 | 순서 | 항목 | 현재 상태 |
 |------|------|-----------|
 | 테스트 1 | `num-executors` 최적값 (16/24/32/60 비교) | ✅ 완료 (24개 최적) |
-| 테스트 2 | `spark.sql.shuffle.partitions` (70 vs 200 비교) | ⚠️ 벤치마크 대기 |
-| 테스트 3 | `parallelismFirst` false 전환 (Iceberg 소파일 개선) | ⚠️ 벤치마크 대기 |
+| 테스트 2 | `spark.sql.shuffle.partitions` 70으로 변경 테스트 | ⚠️ 벤치마크 대기 (200 결과는 이미 확보: 44초) |
+| 테스트 3 | `parallelismFirst` false로 변경 테스트 | ⚠️ 벤치마크 대기 (true 결과는 이미 확보: 44초) |
 
 ## 핵심 맥락 요약
 

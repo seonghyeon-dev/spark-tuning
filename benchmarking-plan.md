@@ -13,8 +13,8 @@
 **문제점**: 70MB 기준에 대한 이론적 근거 없음
 
 #### 검증 방법
-1. 고정 변수: executor-cores=4, executor-memory=8g
-2. 변경 변수: 분할 기준을 변경하며 테스트
+1. 고정 변수: executor-cores=4, executor-memory=8g, **shuffle.partitions=200(기본값), parallelismFirst=true(기본값)** — 별도 설정하지 않음
+2. 변경 변수: num-executors만 변경하며 테스트
 
 | 테스트 ID | num-executors | 산정 근거 | 총 코어 수 |
 |-----------|---------------|----------|-----------|
@@ -91,14 +91,16 @@ Spark UI Stages 탭에서 확인한 결과, **shuffle이 발생한다** (9.2GiB 
 **문제점**: 기본값 200 대비 낮게 설정했으나 근거 없음
 **선행 확인 완료**: shuffle 9.2GiB 발생 확인 → 이 옵션은 성능에 영향을 미침
 
+> **참고**: num-executors 벤치마크(P1)는 `shuffle.partitions=200(기본값)` 상태에서 수행됨. 200 기준 결과(44초)는 이미 확보.
+
 #### 검증 방법
-1. 고정 변수: executor-cores=4, executor-memory=8g, num-executors=24 (NE 최적값)
+1. 고정 변수: executor-cores=4, executor-memory=8g, num-executors=24 (NE 최적값), parallelismFirst=true(기본값)
 2. 변경 변수:
 
 | 테스트 ID | 파티션 수 | 비고 |
 |-----------|-----------|------|
-| SP-01 | 70 | 현재 설정 (baseline) |
-| SP-02 | 200 | Spark 기본값. AQE가 자동 조정하도록 위임 |
+| SP-01 | 70 | 현재 설정. num-executors=24 고정, 이 옵션만 변경하여 테스트 |
+| SP-02 | 200 | ✅ 이미 확보 (NE-02에서 44초) |
 
 3. 측정 지표: 1.1과 동일 + 셔플 파티션당 데이터 크기 분포
 

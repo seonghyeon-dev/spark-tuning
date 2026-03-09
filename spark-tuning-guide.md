@@ -274,7 +274,7 @@ num_executors = ceil(64 × 1.5 / 4) = 24
 | **개선 (128MB + cores + 1.5배)** | **24** | **96** | **✅ 벤치마크 최적값** |
 | 최소 (1라운드 처리) | 16 | 64 | 태스크 수 = 코어 수 |
 
-**벤치마크 결과 (10분 주기 배치, ~8GB avro)**
+**벤치마크 결과 (10분 주기 배치, ~8GB avro, shuffle.partitions=200·parallelismFirst=true 기본값)**
 
 | 케이스 | num-executors | 총 코어 수 | 소요시간 | 비고 |
 |--------|---------------|-----------|---------|------|
@@ -347,16 +347,18 @@ Spark 3.2+ (Spark 4.1.1 포함)에서 AQE는 기본 활성화(`spark.sql.adaptiv
 > ⚠️ **개선 필요 (벤치마크 대기)**
 > 현재 70으로 설정되어 있으나 명확한 근거가 부족합니다. shuffle이 9.2GiB 규모로 발생하는 것이 확인되었으므로 아래 벤치마크가 필요합니다.
 >
+> **참고**: num-executors 벤치마크는 `shuffle.partitions=200(기본값)` 상태에서 수행되었으므로, 200 기준 결과(24개 executor에서 44초)는 이미 확보되어 있다.
+>
 > **벤치마크 테스트 케이스**:
 > | 케이스 | 값 | 비고 |
 > |--------|-----|------|
-> | A | 70 (현재) | 비교 기준선 |
-> | B | 200 (기본값) | AQE가 자동 조정하도록 위임 |
+> | A | 70 (현재 설정) | num-executors=24 고정, 이 옵션만 변경하여 테스트 |
+> | B | 200 (기본값) | ✅ 이미 확보 (44초) |
 >
 > **산정 기준 참고**:
 > - `총 shuffle 데이터 크기(MB) / 100~200 = 적정 파티션 수` → `9,420MB / 100~200 = 47~94`
 > - `executor 수(24) × executor-cores(4) × 2 = 192`
-> - 현재 70은 산정 기준 범위(47~94) 안에 있으나, AQE 자동 조정(200)과 비교 벤치마크 필요
+> - 현재 70은 산정 기준 범위(47~94) 안에 있으나, 기본값 200(AQE 자동 조정) 대비 성능 차이 확인 필요
 
 ---
 
@@ -614,6 +616,10 @@ spark-submit \
 | `driver-memory` | `2g` | 경량 메타데이터 collect만 발생 |
 | `executor-cores` | `4` | I/O throughput과 GC 균형 |
 | `executor-memory` | `8g` | 코어당 2GB 기준 |
+| `spark.sql.shuffle.partitions` | `200` (기본값) | 별도 설정하지 않음 |
+| `spark.sql.adaptive.coalescePartitions.parallelismFirst` | `true` (기본값) | 별도 설정하지 않음 |
+
+> **참고**: 모든 벤치마크 테스트에서 `shuffle.partitions`와 `parallelismFirst`는 별도로 설정하지 않고 Spark 기본값(각각 200, true)으로 진행하였다.
 
 **벤치마크 결과**:
 
@@ -632,25 +638,29 @@ spark-submit \
 
 **선행 확인 완료**: Spark UI Stages 탭에서 **9.2GiB 규모의 shuffle 발생 확인** → 이 옵션은 성능에 영향을 미침
 
+> **참고**: num-executors 벤치마크(테스트 1)는 `shuffle.partitions=200(기본값)` 상태에서 수행되었다. 따라서 200 기준 결과(24개 executor에서 44초)는 이미 확보되어 있다. 70으로 변경하여 비교하면 된다.
+
 **테스트 케이스**:
 
 | 케이스 | 값 | 비고 |
 |--------|-----|------|
-| A | 70 (현재) | 비교 기준선 |
-| B | 200 (기본값) | AQE가 자동 조정하도록 위임 |
+| A | 70 (현재 설정) | num-executors=24 고정, 이 옵션만 변경하여 테스트 |
+| B | 200 (기본값) | ✅ 이미 확보 (테스트 1에서 44초) |
 
 ---
 
-#### 테스트 3 (낮음): parallelismFirst=false 전환 검토
+#### 테스트 3 (대기): parallelismFirst=false 전환 검토
 
 **목표**: 공식 권장에 따라 Iceberg 소파일 문제 개선
+
+> **참고**: num-executors 벤치마크(테스트 1)는 `parallelismFirst=true(기본값)` 상태에서 수행되었다. 따라서 true 기준 결과는 이미 확보되어 있다. false로 변경하여 비교하면 된다.
 
 **테스트 케이스**:
 
 | 케이스 | 값 | 효과 |
 |--------|-----|------|
-| A | `true` (현재) | 병렬성 우선. 소파일 다수 생성 가능 |
-| B | `false` (공식 권장) | 파티션당 ~64MB로 병합. 소파일 감소 |
+| A | `true` (기본값) | ✅ 이미 확보 (테스트 1에서 44초). 병렬성 우선. 소파일 다수 생성 가능 |
+| B | `false` (공식 권장) | num-executors=24 고정, 이 옵션만 변경하여 테스트. 파티션당 ~64MB로 병합 |
 
 **확인 사항**: Iceberg 테이블에 생성된 parquet 파일 수와 평균 크기 비교
 
@@ -663,13 +673,14 @@ spark-submit \
 ```
 ✅ 완료: Spark UI에서 shuffle 발생 확인 (9.2GiB)
 ✅ 완료: num-executors 테스트 → 24개 최적 (PARALLELISM_FACTOR=1.5)
+         (테스트 조건: shuffle.partitions=200, parallelismFirst=true — 모두 기본값)
 
-다음 단계:
-1단계: shuffle.partitions 벤치마크 (70 vs 200)
-       → num-executors=24 고정, shuffle.partitions만 변경하여 비교
+다음 단계 (기본값 결과는 이미 확보됨):
+1단계: shuffle.partitions=70으로 변경하여 테스트
+       → 200(이미 44초) vs 70 비교
 
-2단계: parallelismFirst 테스트 (true vs false)
-       → Iceberg 파일 품질 비교
+2단계: parallelismFirst=false로 변경하여 테스트
+       → true(이미 44초) vs false 비교. Iceberg 파일 품질도 확인
 ```
 
 ---
