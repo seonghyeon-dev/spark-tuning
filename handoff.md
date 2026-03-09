@@ -24,7 +24,7 @@
 | executor-cores | 4 | 📘 일반적 관행 |
 | executor-memory | 8g | 📘 일반적 관행 |
 | num-executors | ceil(총크기/128MB×1.5/cores) | ✅ 벤치마크 (24개 최적, 44초) |
-| shuffle.partitions | 200 (기본값, 설정 불필요) | ✅ 벤치마크 (70 설정 시 1~2초 느림) |
+| shuffle.partitions | 200 (기본값, 설정 불필요) | ✅ 벤치마크 (기본값 최적) |
 | parallelismFirst | true (기본값, 설정 불필요) | ✅ 벤치마크 (false 시 23% 느림) |
 
 ## 핵심 맥락
