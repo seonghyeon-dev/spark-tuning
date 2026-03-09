@@ -65,6 +65,7 @@ Airflow DAG
 |------|----|
 | 컬럼 수 | 약 19개 |
 | 데이터 타입 | string, double, integer, array, timestamp_ntz 등 |
+| `write.distribution-mode` | `range` |
 
 **파티션 설정 (3개)**
 
@@ -86,7 +87,7 @@ ALTER TABLE TABLE_A WRITE ORDERED BY
 **Shuffle과의 관계**
 
 이 파티션 설정과 write ordering이 **9.2GiB shuffle의 직접적 원인**이다:
-- Iceberg의 `write.distribution-mode`(기본값: `hash`)에 의해, 쓰기 전 3개 파티션 키 기준으로 데이터가 재분배(shuffle)된다
+- Iceberg의 `write.distribution-mode`(`range`로 설정)에 의해, 쓰기 전 파티션 키 + write ordering 기준으로 데이터가 범위 기반 재분배(shuffle)된다
 - Write ordering에 의해 각 파티션 내에서 정렬이 수행된다
 
 > ⚠️ **변동 가능성**
@@ -231,7 +232,7 @@ num_executors = max(num_executors, 1)
 > | **읽기 파티션** | `spark.sql.files.maxPartitionBytes` | 128MB | `spark.read` 단계. 소파일들을 묶어 하나의 파티션으로 생성 |
 > | **셔플 파티션** | `spark.sql.shuffle.partitions` | 200 | shuffle 발생 시 파티션 수 결정 |
 >
-> 이 워크플로우에서는 Iceberg의 `write.distribution-mode`에 의해 파티션 키 기준 데이터 재분배가 발생하며, 벤치마크에서 **9.2GiB 규모의 shuffle이 확인**되었다 (Stage 5→7, 1.3절 참고).
+> 이 워크플로우에서는 Iceberg의 `write.distribution-mode=range`에 의해 파티션 키 + write ordering 기준 범위 기반 데이터 재분배가 발생하며, 벤치마크에서 **9.2GiB 규모의 shuffle이 확인**되었다 (Stage 5→7, 1.3절 참고).
 
 ### 3.1 spark.sql.shuffle.partitions
 
@@ -310,7 +311,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 
 `advisoryPartitionSizeInBytes`(64MB)는 인접한 작은 shuffle 파티션을 **병합할 때의 목표 크기**이다. 단, AQE는 이미 64MB를 초과하는 파티션을 **분할할 수는 없다**.
 
-이 워크로드에서 Iceberg hash 분배는 3개 파티션 키 기준으로 데이터를 배치하므로, 파티션 키의 고유 조합 수(~28개)만큼의 shuffle 파티션에 데이터가 집중된다. 나머지 파티션은 비어 있다:
+이 워크로드에서 Iceberg range 분배는 파티션 키 + write ordering 기준으로 데이터를 배치하므로, 키 조합 수(~28개)만큼의 shuffle 파티션에 데이터가 집중된다. 나머지 파티션은 비어 있다:
 
 ```
 200개 shuffle 파티션:

@@ -59,7 +59,7 @@
 | 5 | append (shuffle 준비) | 7.9GiB | **9.2GiB** | - | - |
 | 7 | append (Iceberg 쓰기) | - | - | **9.2GiB** | 6.5GiB |
 
-Stage 5→7에서 Iceberg `write.distribution-mode`에 의한 9.2GiB shuffle 발생.
+Stage 5→7에서 Iceberg `write.distribution-mode=range`에 의한 9.2GiB shuffle 발생.
 
 ### 2.3 shuffle.partitions ✅
 
