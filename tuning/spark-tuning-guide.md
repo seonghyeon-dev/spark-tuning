@@ -7,7 +7,24 @@
 | 작성 목적 | Spark Job의 리소스 및 성능 설정에 대한 근거 기반 가이드 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.1.7 |
-| 최종 수정일 | 2026-03-09 |
+| 최종 수정일 | 2026-03-16 |
+
+### 근거 수준 라벨
+
+| 라벨 | 의미 |
+|------|------|
+| ✅ 벤치마크 검증 | 실제 환경에서 벤치마크로 검증된 값 |
+| 📘 일반적 관행 | 커뮤니티에서 널리 사용되는 값. 공식 문서 또는 업계 관행 기반 |
+| ⚠️ 개선 필요 | 근거 부족. 벤치마크/프로파일링으로 재검증 필요 |
+
+### 목차
+
+- [1. 개요](#1-개요) — 워크플로우, 문서 범위, 테이블 스키마
+- [2. 리소스 설정](#2-리소스-설정) — driver-cores/memory, executor-cores/memory, num-executors
+- [3. 성능 설정](#3-성능-설정) — shuffle.partitions, parallelismFirst
+- [4. 설정 근거 요약 및 벤치마크 결과](#4-설정-근거-요약-및-벤치마크-결과) — 요약표, 벤치마크, 모니터링, 트러블슈팅
+- [5. 용어집](#5-용어집)
+- [6. 참고 자료](#6-참고-자료)
 
 ---
 
@@ -48,7 +65,7 @@ Airflow DAG
 - Spark Job의 리소스 설정 (`driver-cores`, `driver-memory`, `executor-cores`, `executor-memory`, `num-executors`)
 - Spark SQL 성능 설정 (`spark.sql.shuffle.partitions`, `spark.sql.adaptive.coalescePartitions.parallelismFirst`)
 - 각 설정의 공식 문서 기반 설명, 기본값, 권장값, 근거
-- SparkKubernetesOperator / spark-submit 설정 예시
+- K8S 환경 리소스 요구사항
 
 **다루지 않는 것**
 - Airflow DAG 로직 및 get_jobs Task 구현 상세
@@ -344,171 +361,9 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 
 ---
 
-## 4. 종합 설정 예시
+## 4. 설정 근거 요약 및 벤치마크 결과
 
-### 4.1 SparkKubernetesOperator 설정 예시
-
-```python
-from airflow import DAG
-from airflow.providers.cncf.kubernetes.operators.spark_kubernetes import SparkKubernetesOperator
-from airflow.utils.dates import days_ago
-from datetime import timedelta
-
-
-def calculate_num_executors(total_avro_size_mb: float) -> int:
-    """
-    avro 파일들의 총 크기를 기반으로 num-executors를 산정한다.
-
-    산정식: ceil(총 크기 / 128MB × 1.5 / executor-cores)
-    ✅ 벤치마크 검증 완료 (24개 최적, PARALLELISM_FACTOR=1.5)
-    """
-    import math
-    MAX_PARTITION_BYTES_MB = 128  # spark.sql.files.maxPartitionBytes 기본값
-    EXECUTOR_CORES = 4
-    PARALLELISM_FACTOR = 1.5     # 벤치마크 결과 최적값 (여유 50%)
-
-    total_partitions = math.ceil(total_avro_size_mb / MAX_PARTITION_BYTES_MB)
-    num_executors = math.ceil(total_partitions * PARALLELISM_FACTOR / EXECUTOR_CORES)
-    return max(num_executors, 1)
-
-
-SPARK_APPLICATION_TEMPLATE = """
-apiVersion: sparkoperator.k8s.io/v1beta2
-kind: SparkApplication
-metadata:
-  name: avro-to-iceberg-{{ task_instance.task_id }}
-  namespace: spark-jobs
-spec:
-  type: Python
-  mode: cluster
-  image: "your-registry/spark:4.1.1-iceberg-1.10.1"
-  imagePullPolicy: Always
-  mainApplicationFile: "s3a://your-bucket/spark-apps/avro_to_iceberg.py"
-
-  arguments:
-    - "{{ params.iceberg_table }}"
-    - "{{ params.avro_list_s3_path }}"
-
-  sparkConf:
-    # ── 성능 설정 ──
-    # shuffle.partitions(200), parallelismFirst(true): 기본값 유지 — 별도 설정 불필요
-    # ✅ 벤치마크 결과: 기본값이 최적 성능 (44초)
-
-    # ── Iceberg 카탈로그 설정 ──
-    spark.sql.catalog.iceberg_catalog: "org.apache.iceberg.spark.SparkCatalog"
-    spark.sql.catalog.iceberg_catalog.type: "hadoop"
-    spark.sql.catalog.iceberg_catalog.warehouse: "s3a://your-bucket/warehouse"
-
-    # ── S3 (MinIO) 설정 ──
-    spark.hadoop.fs.s3a.endpoint: "http://minio:9000"
-    spark.hadoop.fs.s3a.access.key: "{{ var.value.MINIO_ACCESS_KEY }}"
-    spark.hadoop.fs.s3a.secret.key: "{{ var.value.MINIO_SECRET_KEY }}"
-    spark.hadoop.fs.s3a.path.style.access: "true"
-    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
-
-  # ── Driver 설정 ──
-  driver:
-    cores: 1          # 📘 일반적 관행: 1코어
-    memory: "2g"      # 📘 일반적 관행: 2GB
-    serviceAccount: spark-sa
-    labels:
-      app: avro-to-iceberg
-
-  # ── Executor 설정 ──
-  executor:
-    cores: 4          # 📘 일반적 관행: 4코어
-    memory: "8g"      # 📘 일반적 관행: 코어당 ~2GB
-    instances: "{{ params.num_executors }}"   # ✅ 동적 산정: ceil(총 크기/128MB × 1.5 / cores)
-    labels:
-      app: avro-to-iceberg
-
-  restartPolicy:
-    type: Never
-"""
-
-
-default_args = {
-    "owner": "data-engineering",
-    "depends_on_past": False,
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5),
-}
-
-with DAG(
-    dag_id="avro_to_iceberg_append",
-    default_args=default_args,
-    schedule_interval=None,
-    start_date=days_ago(1),
-    catchup=False,
-    tags=["spark", "iceberg"],
-) as dag:
-
-    # Task 1: get_jobs (PythonOperator - 별도 구현)
-    # - Oracle DB 조회, in_progress 상태 업데이트
-    # - num_executors 산정 후 xcom 저장
-    # - avro 경로 리스트 파일 S3 업로드
-
-    # Task 2: append_data
-    append_data = SparkKubernetesOperator(
-        task_id="append_data",
-        application_file=SPARK_APPLICATION_TEMPLATE,
-        namespace="spark-jobs",
-        kubernetes_conn_id="kubernetes_default",
-        params={
-            "iceberg_table": "{{ ti.xcom_pull(task_ids='get_jobs', key='iceberg_table') }}",
-            "avro_list_s3_path": "{{ ti.xcom_pull(task_ids='get_jobs', key='avro_list_s3_path') }}",
-            "num_executors": "{{ ti.xcom_pull(task_ids='get_jobs', key='num_executors') }}",
-        },
-        on_success_callback=on_success_handler,
-        on_failure_callback=on_failure_handler,
-    )
-```
-
-### 4.2 spark-submit 명령어 예시
-
-```bash
-spark-submit \
-  --master k8s://https://<k8s-api-server>:6443 \
-  --deploy-mode cluster \
-  --name avro-to-iceberg \
-  \
-  # ── Driver 설정 ──
-  --driver-cores 1 \
-  --driver-memory 2g \
-  \
-  # ── Executor 설정 ──
-  --executor-cores 4 \
-  --executor-memory 8g \
-  --num-executors 24 \
-  \
-  # ── 성능 설정: 기본값 유지 (별도 설정 불필요) ──
-  # shuffle.partitions=200, parallelismFirst=true
-  \
-  # ── Iceberg 카탈로그 ──
-  --conf spark.sql.catalog.iceberg_catalog=org.apache.iceberg.spark.SparkCatalog \
-  --conf spark.sql.catalog.iceberg_catalog.type=hadoop \
-  --conf spark.sql.catalog.iceberg_catalog.warehouse=s3a://your-bucket/warehouse \
-  \
-  # ── S3 (MinIO) ──
-  --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
-  --conf spark.hadoop.fs.s3a.path.style.access=true \
-  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
-  \
-  # ── K8S ──
-  --conf spark.kubernetes.container.image=your-registry/spark:4.1.1-iceberg-1.10.1 \
-  --conf spark.kubernetes.namespace=spark-jobs \
-  --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark-sa \
-  \
-  s3a://your-bucket/spark-apps/avro_to_iceberg.py \
-  <iceberg_table_name> \
-  <avro_list_s3_path>
-```
-
----
-
-## 5. 설정 근거 요약 및 벤치마크 결과
-
-### 5.1 설정 요약
+### 4.1 설정 요약
 
 | 옵션 | 값 | 기본값 | 근거 수준 | 비고 |
 |------|-----|--------|-----------|------|
@@ -520,7 +375,7 @@ spark-submit \
 | `shuffle.partitions` | `200` (기본값) | `200` | ✅ 벤치마크 검증 | AQE 자동 조정에 맡김 |
 | `parallelismFirst` | `true` (기본값) | `true` | ✅ 벤치마크 검증 | I/O 중심 워크로드에 적합. 소파일은 컴팩션으로 해결 |
 
-### 5.2 벤치마크 테스트 환경
+### 4.2 벤치마크 테스트 환경
 
 **테스트 데이터 (10분 주기 배치 기준)**
 
@@ -534,7 +389,7 @@ spark-submit \
 
 **테스트 조건**: 모든 벤치마크에서 `shuffle.partitions`와 `parallelismFirst`는 별도 설정하지 않고 Spark 기본값(200, true)으로 진행.
 
-### 5.3 벤치마크 결과 요약
+### 4.3 벤치마크 결과 요약
 
 | 테스트 | 결과 | 결론 |
 |--------|------|------|
@@ -542,14 +397,26 @@ spark-submit \
 | shuffle.partitions | 기본값(200) 최적 | 기본값 유지. AQE 자동 조정에 맡김 |
 | parallelismFirst (true vs false) | true(기본값)가 10초 빠름 | 기본값 유지. 소파일은 컴팩션으로 해결 |
 
-### 5.4 향후 재검증 필요 사항
+### 4.4 K8S 클러스터 리소스 요구사항
+
+벤치마크 최적 설정(num-executors=24) 기준, Spark Job 실행 시 필요한 K8S 리소스:
+
+| 구성 요소 | 수량 | CPU (request) | 메모리 (request) |
+|----------|------|--------------|-----------------|
+| Driver Pod | 1개 | 1 core | 2g + 384MB = **2.4g** |
+| Executor Pod | 24개 | 4 core × 24 = **96 core** | 8.8g × 24 = **211.2g** |
+| **합계** | **25 Pod** | **97 core** | **≈ 213.6g** |
+
+> **참고**: `memoryOverhead` 기본값(executor-memory × 0.10, 최소 384MB)이 포함된 값이다. K8S 노드 풀에 위 리소스를 수용할 수 있는 여유가 있어야 한다.
+
+### 4.5 향후 재검증 필요 사항
 
 ```
 ⚠️ 파티션/write ordering 최종 확정 후:
    → shuffle 패턴이 달라지므로 num-executors·shuffle.partitions 재검증
 ```
 
-### 5.5 모니터링 지표 체크리스트
+### 4.6 모니터링 지표 체크리스트
 
 | 지표 | 확인 위치 | 목표 |
 |------|----------|------|
@@ -558,6 +425,31 @@ spark-submit \
 | Task 소요시간 분포 | Spark UI → Stages 탭 | 최대/최소 편차 3배 이내 (스큐 없음) |
 | Executor 메모리 사용률 | Spark UI → Executors 탭 | 80% 미만 (OOM 여유) |
 | Pod CPU 사용률 | K8S Metrics (Grafana 등) | request 대비 70~90% |
+
+### 4.7 트러블슈팅
+
+| 증상 | 원인 | 대응 |
+|------|------|------|
+| Executor OOM (`OutOfMemoryError`) | executor-memory 부족 또는 데이터 스큐 | executor-memory를 8g → 12g → 16g 순으로 증가. Spark UI에서 태스크별 메모리 사용량 확인 |
+| Driver OOM | Iceberg 메타데이터 collect 과다 (파일 수 급증) | driver-memory를 2g → 4g로 증가 |
+| Shuffle 단계 느림 | 파티션 스큐 (특정 키에 데이터 집중) | Spark UI → Stages → shuffle read 크기 편차 확인. 파티션 키 재설계 검토 |
+| S3 타임아웃 / 연결 오류 | MinIO 과부하 또는 동시 접속 초과 | `fs.s3a.connection.maximum` 확인 (기본 96). num-executors 줄여 동시 접속 감소 |
+| Pod Pending (스케줄링 지연) | K8S 노드 리소스 부족 | 4.4절 리소스 요구사항 대비 노드 풀 용량 확인. num-executors 축소 검토 |
+| 전체 소요시간 급증 | 데이터 볼륨 증가 | num-executors 산정식이 자동 반영. 산정 결과가 32 이상이면 executor-cores/memory 조합 재검토 |
+
+---
+
+## 5. 용어집
+
+| 용어 | 정의 |
+|------|------|
+| **AQE** | Adaptive Query Execution. Spark 4.1.1 기본 활성화. 런타임에 shuffle 파티션 병합, 조인 전략 변경 등을 자동 수행 |
+| **PARALLELISM_FACTOR** | num-executors 산정식의 여유 계수. Spark 옵션이 아닌 Airflow `get_jobs` task의 코드 상수 (현재 1.5) |
+| **coalescePartitions** | AQE의 기능. shuffle 후 작은 파티션들을 자동으로 병합하여 태스크 수를 줄임 |
+| **advisoryPartitionSizeInBytes** | AQE 파티션 병합 시 목표 크기 (기본 64MB). 이미 초과한 파티션은 분할 불가 |
+| **write.distribution-mode** | Iceberg 쓰기 전 데이터 재분배 방식. `range`는 파티션 키 + write ordering 기준 범위 분배 |
+| **memoryOverhead** | JVM 외부 메모리 (off-heap, 네이티브 라이브러리 등). K8S Pod 메모리 = executor-memory + memoryOverhead |
+| **컴팩션** | Iceberg `rewrite_data_files` 프로시저. 소파일을 병합하여 읽기 성능 최적화 |
 
 ---
 
