@@ -89,16 +89,16 @@ Airflow DAG
 | 파티션 | 타입 | 설명 |
 |--------|------|------|
 | `day(ts)` | timestamp_ntz | 일 단위 시간 파티션 (Iceberg hidden partition) |
-| `column_a` | string | 비즈니스 키 파티션 |
-| `column_b` | string | 비즈니스 키 파티션 |
+| `par_a` | string | 비즈니스 키 파티션 |
+| `par_b` | string | 비즈니스 키 파티션 |
 
 **Write Ordering 설정 (3개, ALTER TABLE로 적용)**
 
 ```sql
 ALTER TABLE TABLE_A WRITE ORDERED BY
-  column_c ASC NULLS FIRST,
-  column_d ASC NULLS FIRST,
-  column_e ASC NULLS FIRST;
+  sort_a ASC NULLS FIRST,
+  sort_b ASC NULLS FIRST,
+  sort_c ASC NULLS FIRST;
 ```
 
 **Shuffle과의 관계**
