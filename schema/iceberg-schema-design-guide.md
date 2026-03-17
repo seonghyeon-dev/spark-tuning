@@ -874,17 +874,31 @@ ADD PARTITION FIELD bucket(16, par_a);
 
 아래 쿼리는 Spark SQL 또는 Trino에서 실행 가능하다.
 
-**1) 카디널리티 (고유값 수)**
+> **핵심**: Iceberg의 복합 파티션(`day(ts)`, `par_a`, `par_b`)은 계층 구조가 아닌 **평면 복합 키**이다. 실제 파티션 수 = `DISTINCT (par_a, par_b)` 조합 수이므로, 개별 카디널리티보다 **조합 수**를 먼저 확인해야 한다.
+
+**1) 파티션 조합 수 (핵심 — 실제 파티션 개수)**
+
+```sql
+-- day 파티션 내 실제 (par_a, par_b) 조합 수 = 일일 파티션 수
+SELECT COUNT(*) AS partition_combination_count
+FROM (
+    SELECT DISTINCT par_a, par_b
+    FROM catalog.db.TABLE_A
+    WHERE date(ts) = '2026-03-15'
+);
+```
+
+**2) 개별 카디널리티 (참고)**
 
 ```sql
 SELECT
     COUNT(DISTINCT par_a) AS par_a_cardinality,
     COUNT(DISTINCT par_b) AS par_b_cardinality
 FROM catalog.db.TABLE_A
-WHERE ts >= timestamp '2026-03-15' AND ts < timestamp '2026-03-16';  -- 하루치 샘플
+WHERE date(ts) = '2026-03-15';
 ```
 
-**2) 파티션 조합별 데이터 크기·파일 수 (Iceberg 메타데이터 테이블)**
+**3) 파티션 조합별 데이터 크기·파일 수 (Iceberg 메타데이터 테이블)**
 
 ```sql
 -- Iceberg 메타데이터 테이블로 파티션별 파일 수·크기 확인
@@ -896,24 +910,30 @@ SELECT
 FROM catalog.db.TABLE_A.partitions;
 ```
 
-**3) 값 분포 (스큐 확인)**
+**4) 조합별 분포·스큐 확인**
 
 ```sql
-SELECT par_a, par_b, COUNT(*) AS cnt
+SELECT
+    par_a,
+    par_b,
+    COUNT(*) AS row_count
 FROM catalog.db.TABLE_A
-WHERE ts >= timestamp '2026-03-15' AND ts < timestamp '2026-03-16'
+WHERE date(ts) = '2026-03-15'
 GROUP BY par_a, par_b
-ORDER BY cnt DESC
+ORDER BY row_count DESC
 LIMIT 50;
 ```
 
 **카디널리티 판단 기준**
 
-| par_a/par_b 카디널리티 | 판단 | 조치 |
-|----------------------|------|------|
-| 수십 이하 (~30) | ✅ identity 유지 | 현재 설정 유지 |
-| 수십~수백 (30~300) | ⚠️ 조합 수 확인 | `day × par_a × par_b` 조합별 데이터 크기가 100MB 이상인지 확인 |
-| 수백 이상 (300+) | ❌ bucket 전환 필요 | `bucket(N, par_a)` 또는 `bucket(N, par_b)`로 변경. N은 16~64 |
+파티션 트랜스폼 결정의 핵심 지표는 **파티션 조합 수**와 **조합별 데이터 크기**이다:
+
+| 확인 항목 | 판단 | 조치 |
+|----------|------|------|
+| 파티션 조합 수 수십 이하 + 조합별 100MB 이상 | ✅ identity 유지 | 현재 설정 유지 |
+| par_a 카디널리티 수백 이상 | ❌ par_a를 bucket 전환 | `bucket(N, par_a)` |
+| par_b 카디널리티 수백 이상 | ❌ par_b를 bucket 전환 | `bucket(N, par_b)` |
+| 파티션 조합 수 수백 이상 | ⚠️ 조합별 데이터 크기 확인 | 100MB 미만 다수 → bucket 전환 또는 파티션 키 축소 |
 
 **small 파일 판단 기준**
 
@@ -974,13 +994,16 @@ LIMIT 100;
 
 **파티션 트랜스폼 결정 (A.1 결과 기반)**
 
-| par_a 카디널리티 | par_b 카디널리티 | 조합별 크기 | 결정 |
-|----------------|----------------|-----------|------|
-| ≤30 | ≤30 | ≥100MB | `identity(par_a)`, `identity(par_b)` 유지 |
-| ≤30 | >30 | <100MB | `identity(par_a)`, `bucket(N, par_b)` |
-| >30 | ≤30 | <100MB | `bucket(N, par_a)`, `identity(par_b)` |
-| >30 | >30 | <100MB | `bucket(N, par_a)`, `bucket(N, par_b)` |
-| 어느 쪽이든 | 어느 쪽이든 | ≤10MB 다수 | 파티션 키 하나 제거 검토 (par_b → write ordering으로 이동) |
+파티션 조합 수(`DISTINCT (par_a, par_b)`)와 조합별 데이터 크기를 기준으로 판단한다:
+
+| 파티션 조합 수 | 조합별 크기 | 결정 |
+|--------------|-----------|------|
+| ≤30 | ≥100MB | `identity(par_a)`, `identity(par_b)` 유지 |
+| ≤30 | <100MB | 컴팩션 주기 단축 또는 파티션 키 축소 검토 |
+| 30~200 | ≥100MB | identity 유지 가능, 일일 파일 수 모니터링 |
+| 30~200 | <100MB | 고카디널리티 쪽을 `bucket(N)` 전환 |
+| >200 | 무관 | `bucket(N, par_a)` 및/또는 `bucket(N, par_b)` 전환 |
+| 어느 쪽이든 | ≤10MB 다수 | 파티션 키 하나 제거 검토 (par_b → write ordering으로 이동) |
 
 **Write Ordering 컬럼 순서 결정 (A.2 결과 기반)**
 
