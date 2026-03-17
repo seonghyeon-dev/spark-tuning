@@ -7,7 +7,7 @@
 | 작성 목적 | Iceberg 테이블의 파티션, 정렬, 스키마 설계에 대한 근거 기반 가이드 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.1.7 |
-| 최종 수정일 | 2026-03-16 |
+| 최종 수정일 | 2026-03-17 |
 
 ### 근거 수준 라벨
 
@@ -28,7 +28,7 @@
 - [7. 설계 결정 요약](#7-설계-결정-요약) — 의사결정 매트릭스, DDL 예시
 - [8. 용어집](#8-용어집)
 - [9. 참고 자료](#9-참고-자료)
-- [부록 A. 설계 검증용 쿼리](#부록-a-설계-검증용-쿼리) — 카디널리티 확인, 조회 패턴 분석, 판단 매트릭스
+- [부록 A. 설계 검증용 쿼리 및 실제 데이터 분석](#부록-a-설계-검증용-쿼리-및-실제-데이터-분석) — 카디널리티 확인, 조회 패턴 분석, 판단 매트릭스
 
 ---
 
@@ -55,6 +55,17 @@
 | 파티션 | `day(ts)`, `par_a`, `par_b` |
 | Write Ordering | `sort_a`, `sort_b`, `sort_c` ASC NULLS FIRST |
 | `write.distribution-mode` | `range` |
+
+**컬럼 관계 매핑**
+
+> 마스킹된 컬럼명 중 일부는 동일 컬럼이 파티션 키와 Write Ordering에 중복 사용된다.
+
+| 마스킹명 | 용도 | 비고 |
+|---------|------|------|
+| par_b | 파티션 키 | = sort_b (동일 컬럼) |
+| sort_a | Write Ordering 1순위 | WHERE 절 등가 조건 빈번 |
+| sort_b | Write Ordering 2순위 (기존) | = par_b, 파티션 프루닝으로 대체 → Write Ordering에서 제외 검토 |
+| sort_c | Write Ordering 3순위 | WHERE 절 등가 조건 |
 
 ### 1.2 조회 패턴
 
@@ -863,14 +874,14 @@ ADD PARTITION FIELD bucket(16, par_a);
 
 ---
 
-## 부록 A. 설계 검증용 쿼리
+## 부록 A. 설계 검증용 쿼리 및 실제 데이터 분석
 
-본 문서에서 ⚠️ 개선 필요로 표시된 항목의 최종 결정을 위해 아래 데이터를 확인해야 한다:
+본 문서에서 ⚠️ 개선 필요로 표시된 항목의 최종 결정을 위해 아래 데이터를 확인하고, 실제 결과를 반영하였다:
 
-1. **par_a, par_b 카디널리티** → 파티션 트랜스폼 결정 (identity vs bucket)
+1. **파티션 현황 및 카디널리티** → 파티션 트랜스폼 결정 (identity vs bucket)
 2. **조회 로그 (WHERE 절 컬럼별 빈도)** → Write Ordering 순서, Z-ordering, Bloom Filter 결정
 
-### A.1 par_a, par_b 카디널리티 확인
+### A.1 파티션 현황 및 카디널리티 확인
 
 아래 쿼리는 Spark SQL 또는 Trino에서 실행 가능하다.
 
@@ -890,40 +901,55 @@ GROUP BY partition
 ORDER BY total_size_mb DESC;
 ```
 
-**2) 개별 카디널리티 (참고)**
+**2) par_a별 후보 컬럼 카디널리티 비교**
 
 ```sql
-SELECT
-    COUNT(DISTINCT par_a) AS par_a_cardinality,
-    COUNT(DISTINCT par_b) AS par_b_cardinality
-FROM catalog.db.TABLE_A
-WHERE date(ts) = '2026-03-15';
-```
-
-**3) 조합별 분포·스큐 확인**
-
-```sql
+-- par_b, par_c, par_d를 한 번에 비교하여 3번째 파티션 키 후보 판단
 SELECT
     par_a,
-    par_b,
-    COUNT(*) AS row_count
+    COUNT(DISTINCT par_b) AS par_b_card,
+    COUNT(DISTINCT par_c) AS par_c_card,
+    COUNT(DISTINCT par_d) AS par_d_card,
+    COUNT(*) AS total_rows
 FROM catalog.db.TABLE_A
 WHERE date(ts) = '2026-03-15'
-GROUP BY par_a, par_b
-ORDER BY row_count DESC
-LIMIT 50;
+GROUP BY par_a
+ORDER BY par_a;
 ```
 
-**카디널리티 판단 기준**
+**실제 결과: files 메타데이터 (248개 파티션 조합, day × par_a × par_b)**
 
-파티션 트랜스폼 결정의 핵심 지표는 **파티션 조합 수**와 **조합별 데이터 크기**이다:
+| 순위 범위 | 크기 범위 | 파일 수 | 특징 |
+|----------|----------|--------|------|
+| 1~50위 | 1~203GB | 다수 | ✅ 충분한 크기, 대부분의 데이터 차지 |
+| 50~60위 | 0.001~1GB | 소수 | ⚠️ target-file-size(512MB) 미만 포함 |
+| 60위 이후 | 0.001GB 이하 | 전부 1개 | ❌ small file, 컴팩션 필수 |
 
-| 확인 항목 | 판단 | 조치 |
-|----------|------|------|
-| 파티션 조합 수 수십 이하 + 조합별 100MB 이상 | ✅ identity 유지 | 현재 설정 유지 |
-| par_a 카디널리티 수백 이상 | ❌ par_a를 bucket 전환 | `bucket(N, par_a)` |
-| par_b 카디널리티 수백 이상 | ❌ par_b를 bucket 전환 | `bucket(N, par_b)` |
-| 파티션 조합 수 수백 이상 | ⚠️ 조합별 데이터 크기 확인 | 100MB 미만 다수 → bucket 전환 또는 파티션 키 축소 |
+> **진단**: 248개 조합 → 기준 2의 "수백" 범위로 ⚠️ 주의 구간이다. 상위 50개가 대부분의 데이터를 차지하여 **스큐가 존재**하며, 하위 ~190개 조합이 1GB 미만으로 **small file 주의** (컴팩션 필수) 상태이다.
+
+**실제 결과: par_a별 카디널리티**
+
+| par_a | par_b 카디널리티 | par_c 카디널리티 | par_d 카디널리티 |
+|-------|-----------------|-----------------|-----------------|
+| A | 42 | 677 | 179 |
+| B | 72 | 11,918 | 704 |
+| C | 70 | 8,245 | 523 |
+| D | 64 | 5,102 | 381 |
+
+- **par_a**: 4개 (A, B, C, D) — 매우 낮음, identity 최적
+- **par_b**: par_a별 42~72개 (전체 150개) — 중간, identity 가능하나 조합 수 주의
+- **par_c**: par_a별 677~11,918개 — 고카디널리티, identity 불가
+- **par_d**: par_a별 179~704개 — 중카디널리티, identity 불가
+
+**3번째 파티션 키 후보 비교표**
+
+| 후보 | par_a별 카디널리티 | day당 총 조합 수 추정 | 파티션 트랜스폼 | 판단 |
+|------|-------------------|---------------------|---------------|------|
+| par_b | 42~72 | ~248 (확인됨) | identity | ⚠️ 조합 수 많으나 상위 50개가 대부분의 데이터 차지 |
+| par_c | 677~11,918 | 수만 | bucket 필수 | ❌ identity 불가, small file 문제 |
+| par_d | 179~704 | 수천 | bucket 필수 | ❌ identity 불가 |
+
+> **결론**: 3번째 파티션 키로 par_b identity가 현실적인 유일한 선택지이다. par_c, par_d는 identity 사용이 불가능하며, bucket 적용 시에도 조합 수가 par_b보다 줄어들지 않는다. 다만 par_b의 248개 조합에서 하위 ~190개의 small file은 **정기 컴팩션으로 관리**해야 한다.
 
 **small 파일 판단 기준**
 
@@ -955,36 +981,32 @@ LIMIT 100;
 
 > **참고**: `system.runtime.queries`는 Trino 코디네이터 메모리에 보관되며, 재시작 시 초기화된다. 장기 분석이 필요하면 Trino의 Event Listener를 설정하여 쿼리 로그를 별도 저장소에 적재해야 한다.
 
-**수동 분석 절차**
+**실제 분석 결과**
 
-위 쿼리로 추출한 쿼리 목록에서 WHERE 절의 컬럼 사용 빈도를 집계한다:
+| 절 | 사용 컬럼 | 빈도 | 조건 유형 | 비고 |
+|----|----------|------|----------|------|
+| WHERE | ts | 항상 | `date(ts) = ...` | 모든 쿼리에 포함, `day(ts)` 파티션으로 프루닝 |
+| WHERE | sort_a | 높음 | 등가 (`=`, `IN`) | Write Ordering 1순위 후보 |
+| WHERE | sort_b (=par_b) | 높음 | 등가 (`=`, `IN`) | 파티션 키(`par_b`)로 이미 프루닝됨 → Write Ordering 불필요 |
+| WHERE | sort_c | 있음 | 등가 (`=`) | Write Ordering 2순위 후보 |
+| GROUP BY | (확인 필요) | — | — | 추가 로그 확보 후 분석 |
+| ORDER BY | (확인 필요) | — | — | 추가 로그 확보 후 분석 |
 
-| 단계 | 작업 |
-|------|------|
-| 1 | 추출된 쿼리 목록에서 WHERE 절을 분리 |
-| 2 | 각 WHERE 절에서 사용된 컬럼명을 추출 (등가 조건 `=` / 범위 조건 `>`, `<`, `BETWEEN` 구분) |
-| 3 | 컬럼별 등장 횟수를 집계 |
-| 4 | 아래 결과 기반 판단 매트릭스에 대입 |
-
-**집계 결과 예시 (작성 템플릿)**
-
-| 컬럼 | 등가 조건 (`=`) 횟수 | 범위 조건 횟수 | 총 빈도 | 비율 |
-|------|---------------------|-------------|---------|------|
-| ts | - | ? | ? | ?% |
-| par_a | ? | - | ? | ?% |
-| par_b | ? | - | ? | ?% |
-| sort_a | ? | ? | ? | ?% |
-| sort_b | ? | ? | ? | ?% |
-| sort_c | ? | ? | ? | ?% |
-| 기타 | ? | ? | ? | ?% |
+> **핵심 발견**: `sort_b = par_b`는 동일 컬럼이다 (1.1절 컬럼 관계 매핑 참조). 파티션 키(`par_b`)로 이미 파티션 프루닝이 수행되므로, Write Ordering에서 sort_b를 별도로 정렬하는 것은 **중복 비용**이다.
 
 ### A.3 결과 기반 판단 매트릭스
 
-확인한 데이터를 아래 매트릭스에 대입하여 설계를 최종 결정한다.
+실제 데이터를 반영한 최종 판단이다.
 
-**파티션 트랜스폼 결정 (A.1 결과 기반)**
+**파티션 설계 (A.1 결과 기반)**
 
-파티션 조합 수(`DISTINCT (par_a, par_b)`)와 조합별 데이터 크기를 기준으로 판단한다:
+| 파티션 | 트랜스폼 | 근거 수준 | 판단 |
+|--------|---------|-----------|------|
+| `day(ts)` | 시간 트랜스폼 | 📘 일반적 관행 | ✅ 유지 — 모든 조회에 시간 조건 포함 |
+| `par_a` | identity | ✅ 벤치마크 검증 | ✅ 유지 — 카디널리티 4, identity 최적 |
+| `par_b` | identity | ⚠️ 개선 필요 | ⚠️ 유지 — 248 조합, 스큐 있으나 상위 50개 충분한 크기. 정기 컴팩션 필수 |
+
+파티션 조합 수(`day × par_a × par_b` = ~248)와 조합별 데이터 크기를 기준으로 판단:
 
 | 파티션 조합 수 | 조합별 크기 | 결정 |
 |--------------|-----------|------|
@@ -995,26 +1017,32 @@ LIMIT 100;
 | >200 | 무관 | `bucket(N, par_a)` 및/또는 `bucket(N, par_b)` 전환 |
 | 어느 쪽이든 | ≤10MB 다수 | 파티션 키 하나 제거 검토 (par_b → write ordering으로 이동) |
 
-**Write Ordering 컬럼 순서 결정 (A.2 결과 기반)**
+> **TABLE_A 현재 위치**: 248개 조합으로 ">200" 구간에 해당하나, 상위 50개 조합이 대부분의 데이터를 차지하고 par_b 외의 대안(par_c, par_d)은 모두 더 많은 조합을 생성하므로, **par_b identity를 유지하면서 정기 컴팩션으로 small file을 관리**하는 전략이 현실적이다.
 
-| 조건 | Write Ordering |
-|------|---------------|
-| sort_a 빈도 > sort_b > sort_c | `sort_a, sort_b, sort_c` (현재 유지) |
-| sort_b 빈도가 sort_a보다 높음 | `sort_b, sort_a, sort_c` (순서 변경) |
-| 특정 컬럼이 거의 사용되지 않음 | 해당 컬럼을 Write Ordering에서 제거 |
+**Write Ordering (A.2 결과 기반)**
+
+| 기존 | 변경 후 (권장) | 근거 |
+|------|-------------|------|
+| `sort_a, sort_b, sort_c` | `sort_a, sort_c` | sort_b = par_b이므로 파티션 프루닝으로 대체됨, Write Ordering에서 제외 |
+
+- **sort_a** (1순위): WHERE 절 등가 조건 빈도 높음 → data skipping 효과 최대
+- **sort_b 제외**: par_b와 동일 컬럼, 파티션 키로 이미 프루닝됨 → 정렬 비용만 발생, 추가 skipping 효과 없음
+- **sort_c** (2순위): WHERE 절 등가 조건 있음 → sort_a 이후 보조 skipping
 
 **Z-ordering 적용 결정 (A.2 결과 기반)**
 
 | 조건 | 결정 |
 |------|------|
 | sort_a 단독 필터 비율 70% 이상 | Write Ordering 유지, Z-ordering 불필요 |
-| sort_b 또는 sort_c 단독 필터 비율 30% 이상 | 컴팩션 시 Z-ordering 적용 검토 |
+| sort_c 단독 필터 비율 30% 이상 | 컴팩션 시 Z-ordering 적용 검토 |
 | 필터 컬럼 조합이 고정되지 않고 다양 | Z-ordering 적극 검토 |
+
+> **현재 판단**: sort_a, sort_c 2개 컬럼 체제에서 sort_c 단독 필터 빈도가 충분히 확인되면 Z-ordering 전환을 검토한다. 2개 컬럼은 Z-ordering의 최적 범위(2~4개)에 해당한다.
 
 **Bloom Filter 적용 결정 (A.2 결과 기반)**
 
 | 조건 | 결정 |
 |------|------|
-| sort_b/sort_c가 등가 조건(`=`)으로 자주 사용됨 | Bloom Filter 활성화 |
-| sort_b/sort_c가 범위 조건으로만 사용됨 | Bloom Filter 불필요 (등가 조건 전용) |
+| sort_c가 등가 조건(`=`)으로 자주 사용됨 | Bloom Filter 활성화 권장 |
 | sort_a가 등가 조건으로 사용되지만 Write Ordering 1순위 | Bloom Filter 효과 제한적 (min/max로 충분) |
+| sort_b (=par_b) | ❌ 불필요 — 파티션 키로 이미 프루닝됨 |
