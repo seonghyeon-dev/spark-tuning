@@ -879,14 +879,14 @@ ADD PARTITION FIELD bucket(16, par_a);
 **1) 파티션 조합별 현황 (핵심 — Iceberg 메타데이터)**
 
 ```sql
--- 데이터 읽기 없이 메타데이터만으로 파티션 조합 수·크기·파일 수 한 번에 확인
+-- 데이터 읽기 없이 메타데이터만으로 파티션 조합 수·레코드 수·파일 수 한 번에 확인
 SELECT
     partition,
+    spec_id,
     record_count,
-    file_count,
-    total_size / 1024 / 1024 AS total_size_mb
+    file_count
 FROM catalog.db.TABLE_A.partitions
-ORDER BY total_size DESC;
+ORDER BY record_count DESC;
 ```
 
 **2) 개별 카디널리티 (참고)**
