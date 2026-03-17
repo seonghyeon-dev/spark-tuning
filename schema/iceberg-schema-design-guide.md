@@ -876,16 +876,17 @@ ADD PARTITION FIELD bucket(16, par_a);
 
 > **핵심**: Iceberg의 복합 파티션(`day(ts)`, `par_a`, `par_b`)은 계층 구조가 아닌 **평면 복합 키**이다. 실제 파티션 수 = `DISTINCT (par_a, par_b)` 조합 수이므로, 개별 카디널리티보다 **조합 수**를 먼저 확인해야 한다.
 
-**1) 파티션 조합 수 (핵심 — 실제 파티션 개수)**
+**1) 파티션 조합별 현황 (핵심 — Iceberg 메타데이터)**
 
 ```sql
--- day 파티션 내 실제 (par_a, par_b) 조합 수 = 일일 파티션 수
-SELECT COUNT(*) AS partition_combination_count
-FROM (
-    SELECT DISTINCT par_a, par_b
-    FROM catalog.db.TABLE_A
-    WHERE date(ts) = '2026-03-15'
-);
+-- 데이터 읽기 없이 메타데이터만으로 파티션 조합 수·크기·파일 수 한 번에 확인
+SELECT
+    partition,
+    record_count,
+    file_count,
+    total_size / 1024 / 1024 AS total_size_mb
+FROM catalog.db.TABLE_A.partitions
+ORDER BY total_size DESC;
 ```
 
 **2) 개별 카디널리티 (참고)**
@@ -898,19 +899,7 @@ FROM catalog.db.TABLE_A
 WHERE date(ts) = '2026-03-15';
 ```
 
-**3) 파티션 조합별 데이터 크기·파일 수 (Iceberg 메타데이터 테이블)**
-
-```sql
--- Iceberg 메타데이터 테이블로 파티션별 파일 수·크기 확인
-SELECT
-    partition,
-    file_count,
-    total_records,
-    total_file_size_in_bytes / 1024 / 1024 AS total_size_mb
-FROM catalog.db.TABLE_A.partitions;
-```
-
-**4) 조합별 분포·스큐 확인**
+**3) 조합별 분포·스큐 확인**
 
 ```sql
 SELECT
