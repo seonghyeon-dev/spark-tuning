@@ -57,16 +57,16 @@ Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
 - **산출물**: `schema/iceberg-schema-design-guide.md` (Confluence 복사/붙여넣기용)
 - **상태**: 실데이터 기반 분석 완료, 부록 본문 통합, 용어 통일 완료
 - **확정 사항**:
-  - 파티션: `day(ts)` ✅, `par_a`(identity, Cardinality 4) ✅, `par_b`(identity, 조합 248개) ⚠️ 검토 중
-  - 파티션 프루닝: `day(ts)` + `par_a` 유효. par_b는 UI WHERE 절 포함 여부 확인 필요
+  - 파티션: `day(ts)` ✅, `par_a`(identity, Cardinality 4) ✅, `par_b`(identity, 조합 248개) ✅
+  - 파티션 프루닝: `day(ts)` + `par_a` + `par_b` 모두 유효 (WHERE 절 항상 포함 확정)
   - Write Ordering: `sort_a, sort_b, sort_c` (sort_b ≠ par_b, 별개 컬럼)
   - Bucketing 불필요, Z-ordering은 2단계 검토
+- **Compaction 실측**: 23,789 → 1,834 파일 (92% 감소), 850,955 → 850,695 MB
 - **추천 전략** (7.1절):
-  - A안 (권장): 현행 유지 — par_b WHERE 포함 확정 시. 읽기 성능 최대, Compaction 필수
-  - B안 (차선): par_b 파티션 제거 — par_b WHERE 미포함 시. 파일 수 98% 감소, 운영 단순
-  - C안 (절충): par_b → bucket(16) 전환 — 프루닝 유지 + 파일 수 74% 감소
+  - A안 (권장): 현행 identity 유지, Compaction 실측 검증 완료. 프루닝 1/248 최대
+  - B안 (차선): truncate(3, par_b) — 파일 수 46% 감소, 프루닝 1/135 유지
+  - C안 (절충): bucket(16, par_b) — 파일 수 74% 감소, 프루닝 1/16
 - **잔여 작업**:
-  - par_b의 UI WHERE 절 포함 가능 여부 확인 → A안/B안/C안 최종 결정
   - sort_b, sort_c 단독 필터 빈도 추가 확인 → Z-ordering 전환 여부 결정
 
 ## 파일 구조
