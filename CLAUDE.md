@@ -29,10 +29,10 @@
 
 ### 대상 테이블 (TABLE_A)
 
-- 컬럼 수: 약 19개 (string, double, integer, array, timestamp_ntz 등)
+- 컬럼 수: 19개 (timestamp_ntz, string, double, integer, array<integer>, array<double>, array<string>)
 - 파티션 (3개): `day(ts)`, `par_a`, `par_b` — 변동 가능
 - Write Ordering (3개): `sort_a`, `sort_b`, `sort_c` ASC NULLS FIRST — 변동 가능
-- array 타입 컬럼 8개: `write.metadata.metrics.column.*` = `none`
+- array 타입 컬럼 8개 (val_arr_1~4, yn_arr, tval_1~3): `write.metadata.metrics.column.*` = `none`
 - `write.distribution-mode`: `range`
 
 ### 워크플로우
@@ -55,8 +55,14 @@ Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
 ## 작업 2: Iceberg 스키마 설계 가이드 ✅ 완료
 
 - **산출물**: `schema/iceberg-schema-design-guide.md` (Confluence 복사/붙여넣기용)
-- **상태**: 9개 섹션 작성 완료 (파티션, Write Ordering, 버킷팅, Z-ordering, 스키마 고려사항, DDL 예시)
-- **대기**: 카디널리티 확인 후 identity/bucket 파티션 최종 결정, 조회 로그 분석 후 write ordering 재검증
+- **상태**: 실데이터 기반 분석 완료, 부록 본문 통합, 용어 통일 완료
+- **확정 사항**:
+  - 파티션: `day(ts)`, `par_a`(identity, Cardinality 4), `par_b`(identity, 조합 248개) — par_a, par_b는 WHERE 절에 없어 프루닝 불가, 데이터 조직화/Compaction 관리 목적
+  - 파티션 프루닝: `day(ts)`만 유효 (WHERE 절 `date(ts) = ...`)
+  - Write Ordering: `sort_a, sort_b, sort_c` (sort_b ≠ par_b, 별개 컬럼)
+  - Bucketing 불필요, Z-ordering은 2단계 검토
+- **잔여 작업**:
+  - sort_b, sort_c 단독 필터 빈도 추가 확인 → Z-ordering 전환 여부 결정
 
 ## 파일 구조
 
