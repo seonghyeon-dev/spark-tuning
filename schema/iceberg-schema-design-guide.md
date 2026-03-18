@@ -67,11 +67,12 @@
 
 ### 1.2 조회 패턴
 
-TABLE_A의 주요 조회는 **다차원 필터** 패턴이다. WHERE 절에는 항상 `date(ts)`, `sort_a`, `sort_b`, `sort_c` 4개 컬럼이 사용되며, **par_a, par_b는 WHERE 절에 포함되지 않는다**.
+TABLE_A의 주요 조회는 **다차원 필터** 패턴이다. WHERE 절에는 `date(ts)`, `sort_a`, `sort_b`, `sort_c`가 사용되며, `par_a`도 조건에 포함된다.
 
 ```sql
 SELECT * FROM TABLE_A
 WHERE date(ts) = timestamp '2026-03-11'
+  AND par_a = 'A'
   AND sort_a = 'value1'
   AND sort_b = 'value2'
   AND sort_c = 'value3';
@@ -79,17 +80,18 @@ WHERE date(ts) = timestamp '2026-03-11'
 
 **실제 조회 패턴 분석 결과**
 
-내부 쿼리 이력 시스템에서 TABLE_A 관련 Trino 쿼리를 분석한 결과:
+UI에서 사용하는 Trino 쿼리를 분석한 결과 (UI 기능상 WHERE 절에 추가 가능한 조건 기준):
 
 | 절 | 사용 컬럼 | 빈도 | 조건 유형 | 비고 |
 |----|----------|------|----------|------|
-| WHERE | ts | 항상 | `date(ts) = ...` | 모든 쿼리에 포함, `day(ts)` 파티션으로 프루닝 |
+| WHERE | ts | 항상 | `date(ts) = ...`, `date(ts) IN (...)` | 모든 쿼리에 포함, `day(ts)` 파티션으로 프루닝 |
+| WHERE | par_a | 항상 | 등가 (`=`, `IN`) | 파티션 프루닝 유효 |
 | WHERE | sort_a | 높음 | 등가 (`=`, `IN`) | Write Ordering 1순위 |
 | WHERE | sort_b | 높음 | 등가 (`=`, `IN`) | Write Ordering 2순위 |
-| WHERE | sort_c | 있음 | 등가 (`=`) | Write Ordering 3순위 |
-| WHERE | par_a, par_b | 없음 | - | WHERE 절에 사용되지 않음 |
+| WHERE | sort_c | 있음 | 등가 (`=`, `IN`) | Write Ordering 3순위 |
+| WHERE | par_b | ⚠️ 검토 중 | 등가 (`=`, `IN`) | UI에서 조건 추가 가능 여부 확인 필요. 파티션 분포 불균등으로 추가 검토 필요 |
 
-스키마 설계의 핵심 목표는 이러한 다차원 필터 조회에서 **불필요한 파일 읽기를 최소화**(Data Skipping)하는 것이다. `day(ts)`만 파티션 프루닝이 작동하므로, **sort_a, sort_b, sort_c의 Write Ordering + Data Skipping이 핵심 최적화 수단**이다.
+스키마 설계의 핵심 목표는 이러한 다차원 필터 조회에서 **불필요한 파일 읽기를 최소화**(Data Skipping)하는 것이다. 파티션 프루닝은 `day(ts)` + `par_a`에서 작동하며(par_b는 검토 중), **sort_a, sort_b, sort_c의 Write Ordering + Data Skipping이 추가 최적화 수단**이다.
 
 ---
 
@@ -201,8 +203,8 @@ TABLE_A 실측값:
 | 파티션 | 트랜스폼 | 근거 수준 | 근거 |
 |--------|---------|-----------|------|
 | `day(ts)` | 시간 트랜스폼 | 📘 일반적 관행 | 모든 조회에 `date(ts) = ...` 조건 포함 → ✅ 파티션 프루닝 유효. 일 적재량 ~936GB이므로 `day` 단위가 적정 |
-| `par_a` | identity | ✅ 벤치마크 검증 | Cardinality 4. WHERE 절에 없어 프루닝 불가하나, 매우 낮은 Cardinality로 데이터 조직화 + Compaction 관리에 적합. sort_a(31,697), sort_b(25,820), sort_c(563,691)은 고 Cardinality로 identity 파티션 불가 |
-| `par_b` | identity | ✅ 벤치마크 검증 | par_a별 42~72개, 전체 조합 248개. WHERE 절에 없어 프루닝 불가하나, 데이터 조직화 + Compaction 관리 목적으로 유지. ⚠️ 주의 구간이나 상위 50개가 대부분의 데이터 차지. 정기 Compaction 필수 |
+| `par_a` | identity | ✅ 벤치마크 검증 | Cardinality 4. WHERE 절에 항상 포함되어 파티션 프루닝 유효. 매우 낮은 Cardinality로 identity 최적 |
+| `par_b` | identity | ✅ 벤치마크 검증 | par_a별 42~72개, 전체 조합 248개. ⚠️ WHERE 절 포함 여부 검토 중 (UI 조건 추가 가능 여부 확인 필요). 프루닝 가능 시 효과적이나 파티션 분포 불균등으로 추가 검토 필요. 데이터 조직화 + Compaction 관리 목적으로도 유효. 정기 Compaction 필수 |
 
 **day(ts) 선택 이유**
 
@@ -301,7 +303,7 @@ Write Ordering은 쓰기 비용(shuffle)을 지불하고 읽기 성능(Data Skip
 | 파티션 프루닝 후에도 파일 수가 많고, WHERE 절에 파티션 외 컬럼이 자주 사용되는가? | **Write Ordering 필요** | Write Ordering 불필요 |
 | 쓰기 후 조회가 거의 없는가? (적재 전용, 조회는 다른 시스템에서) | Write Ordering 불필요 | **Write Ordering 필요** |
 
-**TABLE_A 판단**: 파티션 프루닝(`day(ts)`)만으로는 대상 파일이 충분히 줄어들지 않으며(par_a, par_b는 WHERE 절에 없어 프루닝 불가), `sort_a`, `sort_b`, `sort_c`로 추가 필터링이 필요하고 반복 조회가 발생한다. → **Write Ordering 필요** ✅
+**TABLE_A 판단**: 파티션 프루닝(`day(ts)` + `par_a`, par_b는 검토 중) 후에도 `sort_a`, `sort_b`, `sort_c`로 추가 필터링이 필요하며, 반복 조회가 발생한다. → **Write Ordering 필요** ✅
 
 > **Write Ordering 미사용 시**: `write.distribution-mode`는 `hash`(파티션 격리만) 또는 `none`(shuffle 제거)으로 설정한다. 이 경우 shuffle 비용(9.2GiB)이 사라져 쓰기가 빨라지지만, 파티션 내 파일 간 데이터가 무작위 분포하여 Data Skipping이 사실상 불가능하다.
 

@@ -57,11 +57,12 @@ Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
 - **산출물**: `schema/iceberg-schema-design-guide.md` (Confluence 복사/붙여넣기용)
 - **상태**: 실데이터 기반 분석 완료, 부록 본문 통합, 용어 통일 완료
 - **확정 사항**:
-  - 파티션: `day(ts)`, `par_a`(identity, Cardinality 4), `par_b`(identity, 조합 248개) — par_a, par_b는 WHERE 절에 없어 프루닝 불가, 데이터 조직화/Compaction 관리 목적
-  - 파티션 프루닝: `day(ts)`만 유효 (WHERE 절 `date(ts) = ...`)
+  - 파티션: `day(ts)`, `par_a`(identity, Cardinality 4), `par_b`(identity, 조합 248개)
+  - 파티션 프루닝: `day(ts)` + `par_a` 유효. par_b는 WHERE 절 포함 여부 검토 중 (UI 조건 확인 필요, 파티션 분포 불균등)
   - Write Ordering: `sort_a, sort_b, sort_c` (sort_b ≠ par_b, 별개 컬럼)
   - Bucketing 불필요, Z-ordering은 2단계 검토
 - **잔여 작업**:
+  - par_b의 UI WHERE 절 포함 가능 여부 확인 → 파티션 프루닝 효과 확정
   - sort_b, sort_c 단독 필터 빈도 추가 확인 → Z-ordering 전환 여부 결정
 
 ## 파일 구조
