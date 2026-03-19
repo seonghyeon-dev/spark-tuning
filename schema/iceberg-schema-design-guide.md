@@ -1164,20 +1164,95 @@ CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
 
 ---
 
+**D안 (검토): hour(ts) + par_a — 파티션 구조 변경**
+
+A~C안이 par_b의 트랜스폼 선택에 집중하는 반면, D안은 **파티션 구조 자체를 변경**하는 접근이다. par_b를 파티션에서 제거하고 Sort Order 1순위로 이동하며, 시간 파티션을 `day` → `hour`로 세분화한다.
+
+```
+파티션: hour(ts), par_a
+Sort Order: par_b, sort_a, sort_b, sort_c ASC NULLS FIRST
+distribution-mode: range
+파티션 조합: 24시간 × 4 par_a = 96개/일
+```
+
+| 항목 | 내용 |
+|------|------|
+| 프루닝 체인 | `hour(ts)`(1/24) → `par_a`(1/4) → par_b **Data Skipping** → sort Data Skipping |
+| 일일 파일 수 | Compaction 전: 144배치 × 4파티션 × ceil(2GB/512MB) = **~2,304개** ✅ → Compaction 후: **~1,632개** 추정 ✅ |
+| Compaction 부담 | **최저** — Compaction 없이도 ✅ 안전 구간(5,000 이하). 선택적 운영 |
+| 프루닝 정밀도 | par_b는 Sort Order 1순위 + range 모드의 min/max Data Skipping으로 필터링 (파티션 프루닝이 아닌 통계적 skipping) |
+| Skew 영향 | **없음** — hour × par_a는 시간대별로 균등 분포. par_b의 구조적 Skew 문제 해소 |
+
+**장점**
+
+| # | 내용 |
+|---|------|
+| 1 | **Small file 문제 대폭 감소** — 배치당 쓰기 대상 파티션 248개 → 4개. 일일 파일 수 23,789 → ~2,304개 (90% 감소). Compaction 없이도 안전 구간 |
+| 2 | **파티션 Skew 해소** — A안의 하위 ~190개 파티션(0.001GB 이하) 구조적 Skew가 사라짐. 파티션당 ~8.9GB로 균등 분포 |
+| 3 | **시간 단위 파티션 프루닝** — 사용자가 시간 조건을 포함하므로 day 대비 최대 1/24 추가 scan 축소 |
+| 4 | **파티션당 데이터 크기 적정화** — day + par_a 기준 ~213GB/파티션 → hour + par_a 기준 ~8.9GB/파티션. Compaction 단위 적정 |
+| 5 | **연간 총 파티션 수 감소** — 90,520개/년(A안) → 35,040개/년 (61% 감소). 메타데이터 부담 경감 |
+| 6 | **Compaction 운영 부담 경감** — 필수(A~C안) → 선택적. 운영 복잡도 대폭 감소 |
+
+**단점**
+
+| # | 내용 |
+|---|------|
+| 1 | **par_b 필터 방식 변경** — 파티션 프루닝(보장됨) → Data Skipping(통계적). par_b가 Sort Order 1순위이고 range 모드여서 파일 간 값 범위 분리가 보장되므로 실질적 성능 차이는 미미할 것으로 판단되나, 파티션 프루닝만큼의 100% 보장은 아님 |
+| 2 | **Sort Order 컬럼 수 증가 (3→4)** — par_b가 Sort Order에 추가되면서 기존 3순위였던 sort_c가 4순위로 밀림. sort_c의 Data Skipping 효과 소폭 감소 |
+| 3 | **시간 경계 배치 파티션 분산** — 10분 배치가 정시를 걸치는 경우(예: 12:55~13:05) 2개 시간 파티션에 쓰기 발생. 경계 시간의 파일 크기가 작아질 수 있음 |
+| 4 | **벤치마크 재검증 필요** — 파티션 구조와 shuffle 패턴이 변경되므로 기존 벤치마크(num-executors 24개, 44초)의 유효성 재확인 필요 |
+
+**par_b가 Sort Order 1순위로 유효한 근거**
+
+par_b는 Sort Order 1순위 + `range` 모드 조합에서 높은 Data Skipping 효과를 기대할 수 있다:
+
+| 조건 | par_b 상황 |
+|------|-----------|
+| Cardinality | par_a별 42~72개 (중간) — 1순위 정렬에 최적 구간 |
+| WHERE 포함 빈도 | 항상 — 모든 조회에 par_b 등가 조건 포함 |
+| range 모드 효과 | 파일 간 par_b 값 범위 분리 보장 (글로벌 정렬) → 파티션 프루닝에 근접한 skipping |
+
+**D안 적용 시 DDL 변경**
+
+```sql
+-- Partition Evolution: day(ts) → hour(ts), par_b 제거
+ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD day(ts);
+ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
+ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD hour(ts);
+
+-- Sort Order 변경: par_b를 1순위로 추가
+ALTER TABLE catalog.db.TABLE_A
+WRITE ORDERED BY
+    par_b ASC NULLS FIRST,
+    sort_a ASC NULLS FIRST,
+    sort_b ASC NULLS FIRST,
+    sort_c ASC NULLS FIRST;
+
+-- 기존 데이터 재정리
+CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
+```
+
+---
+
 **전략 비교 매트릭스**
 
-| 항목 | A안 (identity) | B안 (truncate) | C안 (bucket) |
-|------|---------------|---------------|-------------|
-| 파티션 조합 수 | 248 | 135 | 64 (4×16) |
-| Compaction 전 파일/일 | ~23,789 ⚠️ | ~19,440 ⚠️ | 9,216 ⚠️ |
-| Compaction 후 파일 (추정) | 1,834 ✅ (실측) | ~1,500 ✅ | ~1,300 ✅ |
-| 프루닝 정밀도 | 1/248 (**최대**) | 1/135 (높음) | 1/16 (중간) |
-| 읽기 성능 | ★★★★★ | ★★★★☆ | ★★★☆☆ |
-| 운영 복잡도 | ★★★★★ (높음) | ★★★★ (높음) | ★★★ (중간) |
-| Compaction 부담 | 높음 | 중간 (46% 감소) | 낮음 (74% 감소) |
-| Skew | 있음 | 완화 | 없음 |
-| 접두사/범위 프루닝 | ✅ | ✅ | ❌ |
-| 전환 비용 | 없음 (현행) | DDL 2줄 | DDL 2줄 |
+| 항목 | A안 (identity) | B안 (truncate) | C안 (bucket) | D안 (hour+par_a) |
+|------|---------------|---------------|-------------|-----------------|
+| 파티션 구조 | day, par_a, par_b | day, par_a, truncate(3,par_b) | day, par_a, bucket(16,par_b) | **hour, par_a** |
+| Sort Order | sort_a, sort_b, sort_c | sort_a, sort_b, sort_c | sort_a, sort_b, sort_c | **par_b**, sort_a, sort_b, sort_c |
+| 파티션 조합 수 | 248 | 135 | 64 (4×16) | **96** (24×4) |
+| Compaction 전 파일/일 | ~23,789 ⚠️ | ~19,440 ⚠️ | 9,216 ⚠️ | **~2,304** ✅ |
+| Compaction 후 파일 (추정) | 1,834 ✅ (실측) | ~1,500 ✅ | ~1,300 ✅ | **~1,632** ✅ |
+| par_b 프루닝 방식 | 파티션 프루닝 | 파티션 프루닝 | 파티션 프루닝 | **Data Skipping** |
+| par_b 프루닝 정밀도 | 1/248 (**최대**) | 1/135 (높음) | 1/16 (중간) | Sort Order 1순위 min/max |
+| 읽기 성능 | ★★★★★ | ★★★★☆ | ★★★☆☆ | ★★★★☆ |
+| 운영 복잡도 | ★★★★★ (높음) | ★★★★ (높음) | ★★★ (중간) | **★★ (낮음)** |
+| Compaction 부담 | 높음 | 중간 (46% 감소) | 낮음 (74% 감소) | **최저 (선택적)** |
+| Skew | 있음 | 완화 | 없음 | **없음** |
+| 접두사/범위 프루닝 | ✅ | ✅ | ❌ | ❌ (par_b는 Data Skipping) |
+| 시간 프루닝 세밀도 | 일 단위 | 일 단위 | 일 단위 | **시간 단위** |
+| 전환 비용 | 없음 (현행) | DDL 2줄 | DDL 2줄 | DDL 3줄 + Sort Order 변경 |
 
 **결론**
 
@@ -1189,18 +1264,24 @@ A안 (권장): identity 유지 + Compaction (1시간 + 1일)
 Compaction 운영 부담이 과도한 경우:
   ├─ B안 (truncate): 프루닝 정밀도 소폭 저하 (1/248 → 1/135), 파일 수 46% 감소
   └─ C안 (bucket): 프루닝 정밀도 대폭 저하 (1/248 → 1/16), 파일 수 74% 감소
+
+파티션 구조 자체를 변경하는 경우:
+  └─ D안 (hour+par_a): par_b를 Sort Order로 이동, small file 문제 근본 해소
+     → Compaction 없이도 안전 구간 (2,304 파일/일)
+     → 시간 단위 프루닝 추가, 운영 복잡도 최저
+     → par_b 프루닝이 파티션 → Data Skipping으로 변경 (벤치마크 검증 필요)
 ```
 
-> **단계적 접근**: 모든 안에서 Partition Evolution으로 무중단 전환이 가능하다. **A안으로 운영 시작 → Compaction 부담이 과도하면 B안(truncate) 전환**이 가장 합리적인 경로이다. B안은 A안 대비 읽기 성능 저하가 ~1.84배로 미미하면서 파일 수를 46% 줄일 수 있다.
+> **단계적 접근**: 모든 안에서 Partition Evolution으로 무중단 전환이 가능하다. **A안으로 운영 시작 → Compaction 부담이 과도하면 B안(truncate) 전환**이 가장 합리적인 경로이다. B안은 A안 대비 읽기 성능 저하가 ~1.84배로 미미하면서 파일 수를 46% 줄일 수 있다. **D안은 파티션 구조를 근본적으로 변경하여 small file 문제와 Compaction 부담을 동시에 해소하는 접근**으로, 시간 단위 프루닝이 필요하거나 운영 단순화가 중요한 경우 검토한다.
 
 ### 7.2 설계 항목별 정리
 
 | 설계 항목 | 선택지 | TABLE_A 적용 | 판단 기준 |
 |----------|--------|-------------|----------|
-| 시간 파티션 | `hour`/`day`/`month` | `day(ts)` | 일 단위 조회 패턴, 일 적재량 ~851GB |
+| 시간 파티션 | `hour`/`day`/`month` | `day(ts)` (A~C안), `hour(ts)` (D안) | A~C안: 일 단위 조회 패턴. D안: 시간 단위 프루닝 + 파티션당 크기 적정화(~8.9GB) |
 | par_a 파티션 | `identity`/`bucket` | `identity` | Cardinality 4, WHERE 항상 포함 → 프루닝 유효 |
-| par_b 파티션 | `identity`/`truncate`/`bucket` | `identity` (A안 권장) | 조합 248개, WHERE 항상 포함. Compaction 부담 시 truncate(3) B안 또는 bucket(16) C안 (7.1절 참조) |
-| Sort Order | 사용/미사용, 컬럼 선택 | `sort_a, sort_b, sort_c` (사용) | WHERE 절의 3개 필터 컬럼을 모두 정렬에 반영 |
+| par_b 파티션 | `identity`/`truncate`/`bucket`/Sort Order 이동 | `identity` (A안 권장), Sort Order 이동 (D안) | A~C안: 파티션 키 유지. D안: 파티션에서 제거, Sort Order 1순위로 이동 (7.1절 참조) |
+| Sort Order | 사용/미사용, 컬럼 선택 | A~C안: `sort_a, sort_b, sort_c`. D안: `par_b, sort_a, sort_b, sort_c` | A~C안: WHERE 절 3개 필터 컬럼. D안: par_b를 1순위로 추가하여 Data Skipping 확보 |
 | Distribution Mode | `none`/`hash`/`range` | `range` | Sort Order 사용 시 range 필수 |
 | Z-ordering | 미적용/Compaction 시 적용 | 미적용 (2단계 검토) | sort_b, sort_c 단독 필터 빈도 추가 확인 후 결정 |
 | Column Metrics | `none`/`truncate`/`full` | 기본값 유지 + array는 `none` | 필터 대상 컬럼 통계 수집 필수 |
