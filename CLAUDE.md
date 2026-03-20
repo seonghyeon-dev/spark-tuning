@@ -44,7 +44,7 @@ Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
 - Spark 4.1.1 Configuration: https://spark.apache.org/docs/4.1.1/configuration.html
 - Spark 4.1.1 SQL Performance Tuning: https://spark.apache.org/docs/4.1.1/sql-performance-tuning.html
 - Spark on Kubernetes: https://spark.apache.org/docs/4.1.1/running-on-kubernetes.html
-- Iceberg 1.10.1 Spark Configuration: https://iceberg.apache.org/docs/1.10.1/spark-configuration/
+- Iceberg 1.10.1 Spark Configuration: https://iceberg.apache.org/docs/latest/spark-configuration/
 
 ## 작업 1: Spark 튜닝 가이드 ✅ 완료
 

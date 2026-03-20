@@ -21,7 +21,7 @@
 
 - [1. 개요](#1-개요) — 워크플로우, 문서 범위, 테이블 스키마
 - [2. 리소스 설정](#2-리소스-설정) — driver-cores/memory, executor-cores/memory, num-executors
-- [3. 성능 설정](#3-성능-설정) — shuffle.partitions, parallelismFirst, Whole-Stage CodeGen과 UDF
+- [3. 성능 설정](#3-성능-설정) — shuffle.partitions, parallelismFirst
 - [4. 설정 근거 요약 및 벤치마크 결과](#4-설정-근거-요약-및-벤치마크-결과) — 요약표, 벤치마크, 모니터링, 트러블슈팅
 - [5. 용어집](#5-용어집)
 - [6. 참고 자료](#6-참고-자료)
@@ -359,54 +359,6 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 | `spark.sql.adaptive.advisoryPartitionSizeInBytes` | `64MB` | 파티션 병합 시 목표 크기 |
 | `spark.sql.adaptive.coalescePartitions.minPartitionSize` | `1MB` | 병합 후 최소 파티션 크기 |
 
-### 3.3 Whole-Stage CodeGen과 내장 함수 vs UDF
-
-#### Whole-Stage CodeGen이란?
-
-Spark SQL은 쿼리 플랜의 여러 연산자(Filter, Project, Aggregate 등)를 **하나의 Java 바이트코드로 통째로 컴파일**하는 Whole-Stage CodeGen을 사용한다. 전통적인 Volcano 모델에서는 연산자마다 가상 함수 호출로 row를 하나씩 전달하지만, CodeGen은 여러 단계를 하나의 루프로 합쳐 가상 함수 호출 오버헤드를 제거하고 CPU 캐시 효율을 극대화한다.
-
-```
--- Volcano 모델 (CodeGen 없음)
-Filter → row 꺼냄 → Project → row 꺼냄 → Aggregate → row 꺼냄
-         (가상함수 호출)        (가상함수 호출)         (가상함수 호출)
-
--- Whole-Stage CodeGen
-Filter + Project + Aggregate가 하나의 Java 메서드로 합쳐짐
-→ 가상함수 호출 없음, CPU 캐시 효율 극대화
-```
-
-Spark 4.1.1에서 기본 활성화(`spark.sql.codegen.wholeStage=true`)되어 있으며, 별도 설정 없이 자동 적용된다.
-
-#### 내장 xxhash64 vs UDF xxhash64
-
-해싱 함수를 사용할 때, Spark 내장 `xxhash64()`와 사용자 정의 UDF로 감싼 `xxhash64()`는 알고리즘은 동일하지만 **실행 경로가 다르다**.
-
-| 항목 | 내장 xxhash64 | UDF xxhash64 |
-|------|-------------|-------------|
-| CodeGen | 바이트코드에 **인라인** 포함 | CodeGen 파이프라인 **끊김** |
-| 데이터 포맷 | Tungsten UnsafeRow 위에서 직접 계산 | Java 객체로 변환(deserialize) 필요 |
-| 함수 호출 | 인라인/직접 호출 | 리플렉션 경유 |
-| GC 부담 | 없음 | row마다 객체 생성 → GC 부담 증가 |
-
-**UDF가 느린 이유:**
-
-```
-[CodeGen 파이프라인]
-    ↓ UDF 호출 시점에서 끊김
-    ↓ UnsafeRow → Java 객체로 변환 (deserialize)
-    ↓ UDF 함수 호출 (리플렉션)
-    ↓ 결과를 다시 UnsafeRow로 변환 (serialize)
-    ↓ CodeGen 파이프라인 재개
-```
-
-UDF를 사용하면 CodeGen이 끊기면서 **serialize/deserialize 오버헤드**가 row마다 발생한다. 8GB 배치처럼 row 수가 많은 워크로드에서는 이 비용이 누적되어 유의미한 성능 차이로 이어진다.
-
-#### 결론
-
-**내장 함수를 사용할 수 있는 경우 항상 내장 함수를 우선 사용한다.** UDF로 감싸는 것은 CodeGen 최적화를 포기하는 것이며, 이 워크로드(~8GB, 628,699건)에서는 쓰기 성능에 불리하다.
-
-> **참고**: 읽기 시점에는 이미 저장된 데이터를 읽는 것이므로 이 차이가 적용되지 않는다. CodeGen/UDF 오버헤드는 **쓰기 시점에만** 발생한다.
-
 ---
 
 ## 4. 설정 근거 요약 및 벤치마크 결과
@@ -498,9 +450,6 @@ UDF를 사용하면 CodeGen이 끊기면서 **serialize/deserialize 오버헤드
 | **write.distribution-mode** | Iceberg 쓰기 전 데이터 재분배 방식. `range`는 파티션 키 + write ordering 기준 범위 분배 |
 | **memoryOverhead** | JVM 외부 메모리 (off-heap, 네이티브 라이브러리 등). K8S Pod 메모리 = executor-memory + memoryOverhead |
 | **컴팩션** | Iceberg `rewrite_data_files` 프로시저. 소파일을 병합하여 읽기 성능 최적화 |
-| **Whole-Stage CodeGen** | Spark SQL이 쿼리 플랜의 여러 연산자를 하나의 Java 바이트코드로 컴파일하는 최적화. 가상함수 호출 제거, CPU 캐시 효율 극대화. 기본 활성화 |
-| **UDF** | User Defined Function. 사용자 정의 함수. CodeGen 파이프라인을 끊고 serialize/deserialize 오버헤드를 발생시키므로 내장 함수 대비 느림 |
-| **UnsafeRow** | Spark Tungsten의 바이너리 row 포맷. Java 객체 변환 없이 직접 연산 가능하여 GC 부담 없음 |
 
 ---
 
@@ -509,4 +458,4 @@ UDF를 사용하면 CodeGen이 끊기면서 **serialize/deserialize 오버헤드
 - [Spark 4.1.1 Configuration](https://spark.apache.org/docs/4.1.1/configuration.html)
 - [Spark 4.1.1 SQL Performance Tuning (AQE 포함)](https://spark.apache.org/docs/4.1.1/sql-performance-tuning.html)
 - [Spark on Kubernetes](https://spark.apache.org/docs/4.1.1/running-on-kubernetes.html)
-- [Iceberg 1.10.1 Spark Configuration](https://iceberg.apache.org/docs/1.10.1/spark-configuration/)
+- [Iceberg 1.10.1 Spark Configuration](https://iceberg.apache.org/docs/latest/spark-configuration/)
