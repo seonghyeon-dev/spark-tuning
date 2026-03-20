@@ -52,22 +52,21 @@ Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
 - **상태**: 7개 설정 확정, 벤치마크 검증 완료
 - **대기**: 파티션/Sort Order 최종 확정 후 벤치마크 재검증
 
-## 작업 2: Iceberg 스키마 설계 가이드 ✅ 완료
+## 작업 2: Iceberg 스키마 설계 가이드 — 테스트 대기
 
 - **산출물**: `schema/iceberg-schema-design-guide.md` (Confluence 복사/붙여넣기용)
-- **상태**: 실데이터 기반 분석 완료, 부록 본문 통합, 용어 통일 완료
-- **확정 사항**:
-  - 파티션: `day(ts)` ✅, `par_a`(identity, Cardinality 4) ✅, `par_b`(identity, 조합 248개) ✅
-  - 파티션 프루닝: `day(ts)` + `par_a` + `par_b` 모두 유효 (WHERE 절 항상 포함 확정)
-  - Sort Order: `sort_a, sort_b, sort_c` (sort_b ≠ par_b, 별개 컬럼)
-  - Bucketing 불필요, Z-ordering은 2단계 검토
+- **상태**: 5개 전략(A~E안) 분석 완료, A안 vs D안 실측 비교 테스트 대기
+- **조회 패턴 (확정)**:
+  - ts(날짜 또는 시간), par_a, par_b, sort_a, sort_b, sort_c — **모두 필수**
+  - 테이블 설정(파티션, Sort Order 등)은 테스트 결과에 따라 수정 가능
 - **Compaction 실측**: 23,789 → 1,834 파일 (92% 감소), 850,955 → 850,695 MB
-- **추천 전략** (7.1절):
-  - A안 (권장): 현행 identity 유지, Compaction 실측 검증 완료. 프루닝 1/248 최대
-  - B안 (차선): truncate(3, par_b) — 파일 수 46% 감소, 프루닝 1/135 유지
-  - C안 (절충): bucket(16, par_b) — 파일 수 74% 감소, 프루닝 1/16
-- **잔여 작업**:
-  - sort_b, sort_c 단독 필터 빈도 추가 확인 → Z-ordering 전환 여부 결정
+- **전략 비교** (7.1절):
+  - A안: 현행 identity 유지 + Compaction 필수. 프루닝 1/248, Skew 있음
+  - B안: truncate(3, par_b) — 파일 수 46% 감소, 프루닝 1/135
+  - C안: bucket(16, par_b) — 파일 수 74% 감소, 프루닝 1/16
+  - D안: hour(ts) + par_a — 파티션 구조 변경, par_b Sort Order 이동, Compaction 선택적
+  - E안: bucket(N, hash_val) — 멀티 컬럼 해시 버킷, Spark-Trino 해시 호환성 검증 필요
+- **다음 작업**: A안 vs D안 테스트 실행 (8절 테스트 계획 참조)
 
 ## 파일 구조
 
