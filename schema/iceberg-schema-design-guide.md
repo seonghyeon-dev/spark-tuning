@@ -1178,13 +1178,13 @@ distribution-mode: range
 | 항목 | 내용 |
 |------|------|
 | 프루닝 체인 | `hour(ts)`(1/24) → `par_a`(1/4) → par_b **Data Skipping** → sort Data Skipping |
-| Compaction 부담 | **최저** — 배치당 쓰기 대상 파티션이 248개 → 4개로 감소하여 small file 문제 근본적 완화. Compaction 선택적 운영 가능 |
+| Compaction 부담 | **최저** — 일일 파티션 조합 수가 248개 → 96개로 감소하여 small file 문제 근본적 완화. Compaction 선택적 운영 가능 |
 | 프루닝 정밀도 | par_b는 Sort Order 1순위 + range 모드의 min/max Data Skipping으로 필터링 (파티션 프루닝이 아닌 통계적 skipping) |
 | Skew 영향 | **없음** — hour × par_a는 시간대별로 균등 분포. par_b의 구조적 Skew 문제 해소 |
 
 **A~C안 대비 핵심 변경점**
 
-- **Small file 문제 근본 해소** — 배치당 쓰기 대상 파티션 248개 → 4개. A안의 구조적 원인(높은 파티션 조합 수)을 제거한다
+- **Small file 문제 근본 해소** — 일일 파티션 조합 수 248개 → 96개 (61% 감소). A안의 구조적 원인(높은 파티션 조합 수)을 제거한다
 - **파티션 Skew 해소** — A안의 하위 ~190개 파티션(0.001GB 이하) 구조적 Skew가 사라짐. hour × par_a 기준 파티션당 ~8.9GB로 균등 분포
 - **시간 단위 파티션 프루닝** — 시간값 조건 포함 시 day 대비 최대 1/24 추가 scan 축소. 일 단위 조건 시에는 24개 파티션의 매니페스트 엔트리를 읽지만, 이는 메타데이터 수준이므로 읽기 성능 영향 무시 가능
 - **연간 총 파티션 수 감소** — 90,520개/년(A안) → 35,040개/년 (61% 감소)
@@ -1193,7 +1193,7 @@ distribution-mode: range
 **트레이드오프**
 
 - **par_b 필터 방식 변경** — 파티션 프루닝(100% 보장) → Data Skipping(통계적). 다만 par_b가 Sort Order 1순위 + range 모드이므로 파일 간 값 범위 분리가 보장되어, 파티션 프루닝에 근접한 skipping 효과를 기대할 수 있다 (실측 검증 필요)
-- **Sort Order 컬럼 수 증가 (3→4)** — par_b 추가로 sort_c가 4순위로 밀림. sort_c 단독 필터의 Data Skipping 효과 소폭 감소
+- **Sort Order 컬럼 수 증가 (3→4)** — par_b 추가로 sort_c가 4순위로 밀림. sort_c 단독 필터의 Data Skipping 효과 소폭 감소. 단, sort_c 단독 필터 빈도가 낮다면 Sort Order에서 제거하여 3개로 유지할 수 있다
 - **시간 경계 배치 분산** — 10분 배치가 정시를 걸치는 경우(예: 12:55~13:05) 2개 시간 파티션에 쓰기 발생. 경계 시간의 파일 크기가 작아질 수 있음
 - **벤치마크 재검증 필요** — 파티션 구조와 shuffle 패턴이 변경되므로 기존 벤치마크(num-executors 24개, 44초)의 유효성 재확인 필요
 
@@ -1252,7 +1252,7 @@ CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
 | par_b 프루닝 정밀도 | 1/248 (**최대**) | 1/135 (높음) | 1/16 (중간) | Sort Order 1순위 min/max |
 | 운영 복잡도 | 높음 (Compaction 필수) | 높음 (Compaction 필수) | 중간 (Compaction 필수) | **낮음 (Compaction 선택적)** |
 | Skew | 있음 | 완화 | 없음 | **없음** |
-| 접두사/범위 프루닝 | ✅ | ✅ | ❌ | ❌ (par_b는 Data Skipping) |
+| par_b 접두사/범위 조건 프루닝 | ✅ (identity) | ✅ (truncate) | ❌ (hash 분배) | — (par_b는 파티션이 아닌 Sort Order) |
 | 시간 프루닝 세밀도 | 일 단위 | 일 단위 | 일 단위 | **시간 단위** |
 | 전환 비용 | 없음 (현행) | DDL 2줄 | DDL 2줄 | DDL 3줄 + Sort Order 변경 |
 
@@ -1269,7 +1269,7 @@ Compaction 운영 부담이 과도한 경우:
 
 파티션 구조 자체를 변경하는 경우:
   └─ D안 (hour+par_a): par_b를 Sort Order로 이동, small file 문제 근본 해소
-     → 배치당 쓰기 대상 파티션 248개 → 4개, Compaction 선택적 운영
+     → 일일 파티션 조합 수 248개 → 96개, Compaction 선택적 운영
      → 시간 단위 프루닝 추가, 운영 복잡도 최저
      → par_b 프루닝이 파티션 → Data Skipping으로 변경 (벤치마크 검증 필요)
 ```
