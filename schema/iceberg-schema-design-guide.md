@@ -1,14 +1,5 @@
 # Iceberg 스키마 설계 가이드
 
-## 문서 정보
-
-| 항목 | 내용 |
-|------|------|
-| 작성 목적 | Iceberg 테이블의 파티션, 정렬, 스키마 설계에 대한 근거 기반 가이드 |
-| 대상 독자 | 데이터 엔지니어, 운영팀 |
-| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.1.7 |
-| 최종 수정일 | 2026-03-20 |
-
 ### 목차
 
 - [1. 개요](#1-개요) — 대상 테이블, 조회 패턴
@@ -196,10 +187,6 @@ TABLE_A 실측값:
 > **TABLE_A**: 일일 ~23,789 파일로 ⚠️ 주의 구간. 정기 Compaction이 필수이며, 이미 운영 계획에 포함되어 있다 (1시간 + 1일 단위 배치).
 
 **Compaction 실측 결과** (참고: [Iceberg Metadata Evolution After Compaction — e6data](https://www.e6data.com/blog/iceberg-metadata-evolution-after-compaction))
-
-> | Compaction 전 | Compaction 후 |
-> |-------------|-------------|
-> | ![Before Compaction](images/compaction-before.png) | ![After Compaction](images/compaction-after.png) |
 
 1일치 데이터 기준 Compaction 테스트 결과:
 
@@ -628,12 +615,6 @@ Z-ordering은 Compaction 시 적용하는 **추가 최적화**이다. Sort Order
 
 Z-ordering은 **Z-curve(모튼 코드)**를 이용해 다차원 데이터를 1차원으로 매핑하여 정렬하는 기법이다. 일반 정렬(Sort Order)이 첫 번째 컬럼을 우선하는 반면, Z-ordering은 **여러 컬럼을 균등하게** 고려한다.
 
-**Z-curve 시각화** (이미지 출처: [Z-order curve — Wikipedia](https://en.wikipedia.org/wiki/Z-order_curve))
-
-![Z-curve](images/z-curve.svg)
-
-> Z-curve는 2차원 좌표의 비트를 인터리빙(교차 배치)하여 1차원 값으로 변환한다. 이를 통해 두 차원 모두에서 인접한 값이 1차원에서도 가까이 위치하게 되어, 다차원 필터에서 Data Skipping이 균등하게 작동한다.
-
 **파일 단위 동작 비교**
 
 {code}
@@ -659,22 +640,17 @@ Z-ordering (sort_a, sort_b 균등):
   WHERE sort_a = 'A' AND sort_b = 1 → 파일 1만 읽음 (1/4) ✅ 두 조건 모두 유리
 {code}
 
-**격자 시각화 (보충)**
+**정렬 순서에 따른 Data Skipping 효과 비교**
 
-{code}
-일반 정렬 (sort_a, sort_b):          Z-ordering (sort_a, sort_b):
-sort_b                               sort_b
-  │                                      │
-4 │ 4  8  12 16                        4 │ 3  4  11 12
-3 │ 3  7  11 15                        3 │ 1  2  9  10
-2 │ 2  6  10 14                        2 │ 7  8  15 16
-1 │ 1  5  9  13                        1 │ 5  6  13 14
-  └──────────── sort_a                 └──────────── sort_a
-    1  2  3  4                             1  2  3  4
+위 예시의 핵심을 요약하면:
 
-→ sort_a 단독 필터: 정렬이 유리      → sort_a, sort_b 개별 필터:
-→ sort_b 단독 필터: 효과 없음           Z-ordering이 균등하게 유리
-{code}
+| 조회 조건 | 일반 정렬 (sort_a 우선) | Z-ordering (균등) |
+|----------|----------------------|-------------------|
+| `sort_a = 'B'` (단독) | 1/4 파일 읽음 ✅ | 2/4 파일 읽음 ⚠️ |
+| `sort_b = 2` (단독) | 4/4 파일 읽음 ❌ | 2/4 파일 읽음 ✅ |
+| `sort_a = 'A' AND sort_b = 1` | 1/4 파일 읽음 ✅ | 1/4 파일 읽음 ✅ |
+
+> 일반 정렬은 1순위 컬럼에 최적화되지만 2순위 이하는 효과 없음. Z-ordering은 모든 컬럼에 균등한 효과를 제공하되, 단일 컬럼 최적 성능은 일반 정렬보다 약간 불리하다.
 
 ### 5.2 Sort Order vs Z-ordering vs Bucket 비교
 
