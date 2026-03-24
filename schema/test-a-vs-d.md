@@ -141,17 +141,17 @@ WHERE date(ts) = timestamp '2026-03-11'
 
 | 지표 | A안 (date 기준) | D안 (hour 기준) | 차이 |
 |------|----------------|----------------|------|
-| **Physical Input Rows** | 41.1K | 41.1K | 동일 |
-| **Physical Input Data** | 10.2MB | 10.2MB | 동일 |
-| **Physical Input Read Time** | 69ms | 67ms | 2ms |
-| CPU Time | 339ms | 266ms | A안 73ms 더 많음 |
-| Planning CPU Time | 14.63ms | 13.96ms | 거의 동일 |
-| Scheduled Time | 477ms | 410ms | A안 67ms 더 많음 |
-| Input Rows | 41.1K | 41.1K | 동일 |
-| Input Data (논리적) | 72.3MB | 72.4MB | 동일 |
+| **Physical Input Rows** | 41.1K | **16.3K** | **D안 60% 적음** |
+| **Physical Input Data** | 10.2MB | **24.7MB** | **D안 142% 많음** |
+| **Physical Input Read Time** | 69ms | 82ms | D안 13ms 더 많음 |
+| CPU Time | 339ms | 274ms | D안 19% 적음 |
+| Planning CPU Time | 14.63ms | 14.04ms | 거의 동일 |
+| Scheduled Time | 477ms | 365ms | D안 23% 적음 |
+| Input Rows | 41.1K | 16.3K | D안 60% 적음 |
+| Input Data (논리적) | 72.3MB | 61.1MB | D안 15% 적음 |
 | Internal Network Rows | 59.7K | 59.7K | 동일 |
-| Internal Network Data | 5.62MB | 5.62MB | 동일 |
-| Peak User Memory | 2.20MB | 3.14MB | D안 0.94MB 더 많음 |
+| Internal Network Data | 5.62MB | 5.60MB | 동일 |
+| Peak User Memory | 2.20MB | 2.82MB | D안 0.62MB 더 많음 |
 | Output Rows | 29.9K | 29.9K | 동일 |
 | Output Data | 3.25MB | 3.25MB | 동일 |
 
@@ -159,29 +159,39 @@ WHERE date(ts) = timestamp '2026-03-11'
 
 | Operator | 지표 | A안 (date) | D안 (hour) | 차이 |
 |----------|------|-----------|-----------|------|
-| MergeOperator | Throughput | 88.8K rows/s (10.8MB/s) | 89.0K rows/s (10.8MB/s) | 동일 |
+| MergeOperator | Throughput | 88.8K rows/s (10.8MB/s) | 88.6K rows/s (10.7MB/s) | 동일 |
 | MergeOperator | Output | 29.9K rows (3.62MB) | 29.9K rows (3.62MB) | 동일 |
-| MergeOperator | CPU Time | 16.1ms | 14.6ms | 1.5ms |
-| MergeOperator | Wall Time | 336ms | 335ms | 1ms |
-| MergeOperator | Blocked | 320ms | 321ms | 1ms |
-| FilterAndProject | Throughput | 61.4M rows/s (7.27GB/s) | 85.6M rows/s (10.1GB/s) | D안 39% 높음 |
-| FilterAndProject | CPU Time | 0.44ms | 0.35ms | 0.09ms |
-| FilterAndProject | Wall Time | 0.49ms | 0.35ms | 0.14ms |
-| TaskOutput | Throughput | 14.9M rows/s (1.45GB/s) | 14.9M rows/s (1.45GB/s) | 동일 |
-| TaskOutput | CPU Time | 1.98ms | 1.99ms | 동일 |
+| MergeOperator | CPU Time | 16.1ms | 8.77ms | D안 46% 적음 |
+| MergeOperator | Wall Time | 336ms | 337ms | 동일 |
+| MergeOperator | Blocked | 320ms | 328ms | 동일 |
+| FilterAndProject | Throughput | 61.4M rows/s (7.27GB/s) | 138M rows/s (16.4GB/s) | D안 125% 높음 |
+| FilterAndProject | CPU Time | 0.44ms | 0.22ms | D안 50% 적음 |
+| FilterAndProject | Wall Time | 0.49ms | 0.22ms | D안 55% 적음 |
+| TaskOutput | Throughput | 14.9M rows/s (1.45GB/s) | 36.8M rows/s (3.57GB/s) | D안 147% 높음 |
+| TaskOutput | CPU Time | 1.98ms | 0.81ms | D안 59% 적음 |
 
-> MergeOperator의 Wall Time(336ms) 중 Blocked(320ms)가 95%를 차지 — 실제 연산이 아닌 I/O 대기가 대부분이다. FilterAndProject의 throughput 차이(61.4M vs 85.6M)는 0.1ms 미만 구간의 측정 오차 수준.
+> FilterAndProject와 TaskOutput의 throughput 차이(61.4M→138M, 14.9M→36.8M)는 처리할 행 수(Input Rows)가 적어 sub-millisecond 구간에서 더 빠르게 완료된 결과이다. 절대 시간 차이는 각각 0.27ms, 1.17ms로, 전체 쿼리 시간 대비 미미하다.
+
+#### Trino Timeline 비교
+
+| 지표 | A안 | D안 | 차이 |
+|------|-----|-----|------|
+| Parallelism | 0.51 | 0.35 | D안 31% 낮음 |
+| Scheduled Time/s | 0.71 | 0.46 | D안 35% 낮음 |
+| Input rows/s | 64K | 20.5K | D안 68% 낮음 |
+| Input bytes/s | 113MB | 77MB | D안 32% 낮음 |
+| Physical Input Bytes | 173MB | 301MB | **D안 74% 많음** |
+
+> Input rows/s가 낮은 것은 성능 저하가 아니라 **읽을 행 자체가 적기 때문**이다. Physical Input Bytes가 D안에서 더 큰 것은 Resource Utilization의 Physical Input Data(10.2MB vs 24.7MB)와 동일한 패턴으로, D안의 파일이 크기 때문에 Row Group 단위 읽기 시 불필요한 데이터도 함께 읽히는 구조적 특성이다.
 
 #### 분석
 
-**결과: 유의미한 차이 없음**
+**결과: D안이 스캔 행 수와 CPU에서 유리, 물리적 I/O에서 불리**
 
-1. **Physical Input이 완전히 동일** — 양쪽 모두 41.1K rows / 10.2MB를 S3에서 읽었다. 파티션 프루닝 + Data Skipping 결과 동일한 양의 파일을 스캔한 것으로, 이 쿼리 패턴에서는 파티션 전략 차이가 I/O에 영향을 주지 않았다.
+1. **D안이 읽은 행 수 60% 적음 (41.1K → 16.3K)** — D안의 hour 파티션이 시간 단위로 더 정밀하게 프루닝한 결과. A안은 하루 전체 파티션에서 41.1K rows를 읽었지만, D안은 해당 시간 파티션에서 16.3K rows만 읽었다.
 
-2. **CPU Time 차이(339ms vs 266ms, 27%)는 오차 범위** — 10.2MB 수준의 소량 데이터에서는 JVM warmup, 캐시 상태 등에 의해 쉽게 뒤집힐 수 있다. 반복 실행으로 평균을 내야 유의미한 판단 가능.
+2. **그러나 Physical Input Data는 D안이 142% 더 많음 (10.2MB → 24.7MB)** — D안은 par_b가 파티션이 아닌 Sort Order이므로, 파티션당 파일이 크고 적다. Parquet Row Group 단위로 읽을 때 불필요한 데이터도 함께 읽히면서 물리적 I/O가 증가한다. 반면 A안은 par_b가 파티션이라 파일이 작고 많아, 필요한 파일만 정확히 읽는다.
 
-3. **Input Rows(41.1K) → Output Rows(29.9K)** — 약 11.2K rows가 필터에서 탈락. Parquet Row Group 단위 읽기 특성상, 조건에 맞지 않는 행도 함께 읽힌 후 필터링된 것이다.
+3. **CPU Time / Scheduled Time은 D안 유리** — CPU 339ms→274ms(19%), Scheduled 477ms→365ms(23%). 읽은 행 수가 적어 처리할 데이터도 줄었다.
 
-4. **차이가 나지 않는 이유** — 6개 필수 조건(ts, par_a, par_b, sort_a, sort_b, sort_c)이 모두 걸려있어, 파티션 프루닝 이후 Data Skipping이 대부분의 필터링을 수행한다. 최종 스캔 대상 데이터(10.2MB)가 매우 작아 파티션 전략 차이가 체감되지 않는다.
-
-> **향후 확인**: 데이터 규모가 커지면 차이가 벌어지는지는 쿼리 패턴에 따라 다르다. 시간 단위 조회에서는 D안이 hour 프루닝으로 유리할 수 있으나, 현재 조회 패턴(6개 필수 조건)에서는 Data Skipping이 이미 충분히 효과적이어서 차이가 크지 않을 가능성이 높다.
+4. **트레이드오프 구조** — D안은 행 수 기준 프루닝에서 우위(hour 파티션)이나, 파일 구조 차이로 물리적 I/O는 더 많다. 현재 규모(MB 수준)에서는 체감 차이가 크지 않으나, 데이터 규모가 커지면 두 요인이 각각 확대된다.
