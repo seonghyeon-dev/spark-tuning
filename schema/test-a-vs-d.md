@@ -155,6 +155,23 @@ WHERE date(ts) = timestamp '2026-03-11'
 | Output Rows | 29.9K | 29.9K | 동일 |
 | Output Data | 3.25MB | 3.25MB | 동일 |
 
+#### Trino Stage Performance 비교
+
+| Operator | 지표 | A안 (date) | D안 (hour) | 차이 |
+|----------|------|-----------|-----------|------|
+| MergeOperator | Throughput | 88.8K rows/s (10.8MB/s) | 89.0K rows/s (10.8MB/s) | 동일 |
+| MergeOperator | Output | 29.9K rows (3.62MB) | 29.9K rows (3.62MB) | 동일 |
+| MergeOperator | CPU Time | 16.1ms | 14.6ms | 1.5ms |
+| MergeOperator | Wall Time | 336ms | 335ms | 1ms |
+| MergeOperator | Blocked | 320ms | 321ms | 1ms |
+| FilterAndProject | Throughput | 61.4M rows/s (7.27GB/s) | 85.6M rows/s (10.1GB/s) | D안 39% 높음 |
+| FilterAndProject | CPU Time | 0.44ms | 0.35ms | 0.09ms |
+| FilterAndProject | Wall Time | 0.49ms | 0.35ms | 0.14ms |
+| TaskOutput | Throughput | 14.9M rows/s (1.45GB/s) | 14.9M rows/s (1.45GB/s) | 동일 |
+| TaskOutput | CPU Time | 1.98ms | 1.99ms | 동일 |
+
+> MergeOperator의 Wall Time(336ms) 중 Blocked(320ms)가 95%를 차지 — 실제 연산이 아닌 I/O 대기가 대부분이다. FilterAndProject의 throughput 차이(61.4M vs 85.6M)는 0.1ms 미만 구간의 측정 오차 수준.
+
 #### 분석
 
 **결과: 유의미한 차이 없음**
