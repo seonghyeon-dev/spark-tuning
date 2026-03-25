@@ -156,9 +156,10 @@ Iceberg가 제공하는 파티션 트랜스폼:
 
 | 항목 | 권장 |
 |------|------|
-| 파티션당 최소 데이터 | 100MB 이상 |
-| 파티션당 최적 데이터 | 수백 MB ~ 수 GB |
-| small file 위험 기준 | 파티션당 100MB 미만이 다수 발생 |
+| 파티션당 최적 데이터 | 384MB ~ 512MB |
+| small file 기준 | target의 75% 미만 (512MB 기준 **384MB 미만**) |
+
+> **small file 기준 근거**: Iceberg의 [`SizeBasedFileRewriter`](https://iceberg.apache.org/javadoc/1.4.1/org/apache/iceberg/actions/SizeBasedFileRewriter.html)는 `MIN_FILE_SIZE_DEFAULT_RATIO = 0.75`로, target file size의 75% 미만 파일을 Compaction 대상(small file)으로 판정한다. `write.target-file-size-bytes` 기본값 512MB 기준 **384MB 미만이 small file**이다. 384MB~922MB(target의 180%)가 정상 범위이며, 이 범위를 벗어난 파일은 `rewrite_data_files` 실행 시 자동으로 rewrite 대상이 된다.
 
 파티션이 지나치게 세분화되면 파일 수가 급증하여 **small file 문제**가 발생한다. 메타데이터 오버헤드 증가, 파일 열기/닫기 비용 증가로 읽기·쓰기 성능이 모두 저하된다.
 
@@ -306,13 +307,13 @@ ORDER BY par_a;
 
 > **결론**: 3번째 파티션 키로 par_b identity가 현실적인 유일한 선택지이다. par_c, par_d는 identity 사용이 불가능하며, sort_a/sort_b/sort_c는 고 Cardinality로 identity 파티션이 불가능하여 Sort Order + Data Skipping으로 최적화한다. 하위 ~190개 조합의 small file은 구조적 Skew로, 트랜스폼 변경(truncate/bucket) 외에는 해소할 수 없으며 A안 유지 시 허용 가능한 수준이다.
 
-**small file 판단 기준**
+**small file 판단 기준** (target 512MB 기준, [SizeBasedFileRewriter Javadoc](https://iceberg.apache.org/javadoc/1.4.1/org/apache/iceberg/actions/SizeBasedFileRewriter.html))
 
-| 조합별 데이터 크기 | 판단 | 조치 |
-|------------------|------|------|
-| 100MB 이상 | ✅ 정상 | 파티션 설계 유지 |
-| 10~100MB | ⚠️ 주의 | Compaction 주기를 짧게 (시간당) 운영 |
-| 10MB 미만 다수 | ❌ small file 문제 | 파티션 키 축소 또는 bucket 전환 검토 |
+| Compaction 후 파일 크기 | 판단 | 설명 |
+|------------------------|------|------|
+| 384MB ~ 922MB | ✅ 정상 | target의 75%~180% 범위 |
+| 384MB 미만 소수 | ⚠️ 허용 | 전체 파일 대비 비율이 낮으면 성능 영향 미미 |
+| 384MB 미만 다수 | ❌ small file 문제 | 파티션 키 축소 또는 bucket 전환 검토 |
 
 ### 2.5 파티션 변경 테스트 방법
 
@@ -377,7 +378,7 @@ Bucket은 **identity 파티션의 대안**이다. 별도의 최적화 기능이 
 |------|------|---------|
 | 파티션 키로 사용하려는 컬럼의 Cardinality가 수백 이상인가? | **Bucket 검토** | identity 유지 |
 | 해당 컬럼이 등가 조건(`=`)으로만 조회되는가? | **Bucket 적합** | 범위 조회 → identity 또는 truncate |
-| `day × 파티션 키` 조합별 데이터가 100MB 미만으로 small file 문제가 있는가? | **Bucket으로 파티션 수 축소** | identity 유지 |
+| `day × 파티션 키` 조합별 데이터가 384MB 미만으로 small file 문제가 있는가? | **Bucket으로 파티션 수 축소** | identity 유지 |
 
 **TABLE_A 판단**: par_a Cardinality 4 (identity 최적), par_b 조합 248개 (identity 유지, Compaction 필수). → **Bucket 불필요** ✅
 
@@ -1160,13 +1161,13 @@ distribution-mode: range
 | 항목 | 내용 |
 |------|------|
 | 프루닝 체인 | `hour(ts)`(1/24) → `par_a`(1/4) → par_b **Data Skipping** → sort Data Skipping |
-| Compaction 부담 | **최저** — 일일 파티션 조합 수가 248개 → 96개로 감소하여 small file 문제 근본적 완화. Compaction 선택적 운영 가능 |
+| Compaction 부담 | **최저** — 일일 파티션 조합 수가 248개 → 96개로 감소. 실측 384MB 미만 파일 소수(min 10.8MB 포함 2개가 128MB 미만)로 small file 문제 실질적 해소. Compaction 선택적 운영 가능 |
 | 프루닝 정밀도 | par_b는 Sort Order 1순위 + range 모드의 min/max Data Skipping으로 필터링 (파티션 프루닝이 아닌 통계적 skipping) |
 | Skew 영향 | **없음** — hour × par_a는 시간대별로 균등 분포. par_b의 구조적 Skew 문제 해소 |
 
 **A~C안 대비 핵심 변경점**
 
-- **Small file 문제 근본 해소** — 일일 파티션 조합 수 248개 → 96개 (61% 감소). A안의 구조적 원인(높은 파티션 조합 수)을 제거한다
+- **Small file 문제 실질적 해소** — 일일 파티션 조합 수 248개 → 96개 (61% 감소). 실측 Compaction 후 384MB 미만 파일 소수(min 10.8MB 포함 2개가 128MB 미만)로, A안(128MB 미만 161개, 8.1%) 대비 구조적 Skew 문제가 해소된다
 - **파티션 Skew 해소** — A안의 하위 ~190개 파티션(0.001GB 이하) 구조적 Skew가 사라짐. hour × par_a 기준 파티션당 ~8.9GB로 균등 분포
 - **시간 단위 파티션 프루닝** — 시간값 조건 포함 시 day 대비 최대 1/24 추가 scan 축소. 일 단위 조건 시에는 24개 파티션의 매니페스트 엔트리를 읽지만, 이는 메타데이터 수준이므로 읽기 성능 영향 무시 가능
 - **연간 총 파티션 수 감소** — 90,520개/년(A안) → 35,040개/년 (61% 감소)
@@ -1343,7 +1344,7 @@ Compaction 운영 부담이 과도한 경우:
   └─ C안 (bucket): 프루닝 정밀도 대폭 저하 (1/248 → 1/16), 파일 수 74% 감소
 
 파티션 구조 자체를 변경하는 경우:
-  ├─ D안 (hour+par_a): par_b를 Sort Order로 이동, small file 문제 근본 해소
+  ├─ D안 (hour+par_a): par_b를 Sort Order로 이동, small file 문제 실질적 해소
   │  → 일일 파티션 조합 수 248개 → 96개, Compaction 선택적 운영
   │  → 시간 단위 프루닝 추가, 운영 복잡도 최저
   │  → par_b 프루닝이 파티션 → Data Skipping으로 변경 (벤치마크 검증 필요)
@@ -1354,7 +1355,7 @@ Compaction 운영 부담이 과도한 경우:
      → Spark-Trino 해시 호환성 검증 필수
 ```
 
-> **단계적 접근**: 모든 안에서 Partition Evolution으로 무중단 전환이 가능하다. **A안으로 운영 시작 → Compaction 부담이 과도하면 B안(truncate) 전환**이 가장 합리적인 경로이다. B안은 A안 대비 읽기 성능 저하가 ~1.84배로 미미하면서 파일 수를 46% 줄일 수 있다. **D안은 파티션 구조를 근본적으로 변경하여 small file 문제와 Compaction 부담을 동시에 해소하는 접근**, **E안은 멀티 컬럼 해시 버킷으로 Compaction 없이 최적 파일 구조를 달성하는 접근**으로, 해시 호환성 검증 후 검토한다.
+> **단계적 접근**: 모든 안에서 Partition Evolution으로 무중단 전환이 가능하다. **A안으로 운영 시작 → Compaction 부담이 과도하면 B안(truncate) 전환**이 가장 합리적인 경로이다. B안은 A안 대비 읽기 성능 저하가 ~1.84배로 미미하면서 파일 수를 46% 줄일 수 있다. **D안은 파티션 구조를 근본적으로 변경하여 small file 문제를 실질적으로 해소하고 Compaction 부담을 최소화하는 접근**, **E안은 멀티 컬럼 해시 버킷으로 Compaction 없이 최적 파일 구조를 달성하는 접근**으로, 해시 호환성 검증 후 검토한다.
 
 ### 7.2 설계 항목별 정리
 

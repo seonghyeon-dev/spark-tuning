@@ -56,10 +56,13 @@
 | 파일 크기 avg | 5.0GB | 172.9MB | 495.7MB |
 | 파일 크기 min | 2.2GB | 0.6MB | 10.8MB |
 | 파일 크기 max | 8.9GB | 716.5MB | 721MB |
+| 128MB 미만 파일 수 | — | 161개 (8.1%) | 2개 (0.1%) |
 
+> **small file 기준**: Iceberg [`SizeBasedFileRewriter`](https://iceberg.apache.org/javadoc/1.4.1/org/apache/iceberg/actions/SizeBasedFileRewriter.html)의 `MIN_FILE_SIZE_DEFAULT_RATIO = 0.75` 기준, target 512MB의 75%인 **384MB 미만이 Compaction 대상(small file)**. 아래 분석은 128MB 미만 파일 수를 참고 지표로 함께 기재.
+>
 > - **Hive 총 크기가 큰 이유**: Hive 테이블은 수직분할 4개 테이블의 합산 데이터. Iceberg는 그 중 1개 테이블(TABLE_A)만 대상이므로 직접적인 크기 비교는 불가
-> - **A안 small file 문제**: Compaction 후에도 min 0.6MB. 데이터가 적은 par_b 파티션은 구조적 Skew로 Compaction으로 해결 불가
-> - **D안 파일 크기 균등**: avg 495.7MB로 목표(512MB)에 근접, min 10.8MB로 small file 없음
+> - **A안 small file 문제**: avg 172.9MB로 target 512MB의 34% 수준. 128MB 미만 파일만 161개(8.1%). 데이터가 적은 par_b 파티션의 구조적 Skew로 Compaction으로도 해결 불가
+> - **D안 파일 크기 균등**: avg 495.7MB로 목표(512MB)에 근접. 128MB 미만 파일은 10.8MB, 107.2MB 단 2개(0.1%)로 실질적 small file 문제 없음
 > - **Hive 파일 크기**: 파일당 2.2~8.9GB. 파티션이 날짜 1개뿐이라 par_b 등 세부 필터 시 전체 스캔 필요
 
 ---
