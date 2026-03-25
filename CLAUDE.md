@@ -66,7 +66,7 @@ Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
   - C안: bucket(16, par_b) — 파일 수 74% 감소, 프루닝 1/16
   - D안: hour(ts) + par_a — 파티션 구조 변경, par_b Sort Order 이동, Compaction 선택적
   - E안: bucket(N, hash_val) — 멀티 컬럼 해시 버킷, Spark-Trino 해시 호환성 검증 필요
-- **다음 작업**: A안 vs D안 테스트 진행 중 (test-a-vs-d.md 참조)
+- **다음 작업**: 파티션 전략별 읽기 성능 비교 테스트 진행 중 (read-performance-test.md 참조)
 
 ## 파일 구조
 
@@ -76,5 +76,5 @@ Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
 │   └── spark-tuning-guide.md      # ✅ Spark 튜닝 가이드 완성본
 └── schema/
     ├── iceberg-schema-design-guide.md  # ✅ Iceberg 스키마 설계 가이드 완성본
-    └── test-a-vs-d.md                  # 🔄 A안 vs D안 실측 비교 테스트
+    └── read-performance-test.md         # 🔄 파티션 전략별 읽기 성능 비교 테스트
 ```

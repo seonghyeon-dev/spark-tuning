@@ -11,7 +11,7 @@
 - [7. 최종 설계 방향](#7-최종-설계-방향) — 파티션 전략 비교, 설계 항목별 정리, DDL 예시
 - [8. 참고 자료](#8-참고-자료)
 
-> **A안 vs D안 테스트**: [test-a-vs-d.md](test-a-vs-d.md) 참조
+> **읽기 성능 비교 테스트**: [read-performance-test.md](read-performance-test.md) 참조
 
 ---
 
