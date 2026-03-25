@@ -1271,7 +1271,7 @@ N=128: 버킷당 ~1.7GB → 파일 ~3개/버킷  → 일일 총 ~1,536개 ✅
 ```
 A안 (identity par_b):
   248개 파티션, 심각한 Skew (하위 190개 < 0.001GB)
-  → Compaction 전: 23,789개 소파일 → Compaction 후 1,834개
+  → Compaction 전: 23,789개 small file → Compaction 후 1,834개
   → Compaction을 해야 E안의 기본 상태에 도달
 
 E안 (bucket hash_val, N=64):
@@ -1284,8 +1284,8 @@ E안 (bucket hash_val, N=64):
 
 | 항목 | A안 (Compaction 후) | A안 (Compaction 전) | E안 (N=64) |
 |------|-------------------|-------------------|-----------|
-| 프루닝 후 대상 | ~3.4GB, ~7 파일 | ~3.4GB, **~96 소파일** | ~3.3GB, ~7 파일 |
-| Data Skipping | sort_a/b/c 3단계 skipping → ~1-2 파일 | 소파일 다수 → 효과 제한 | hash_val Sort Order skipping → ~1-2 파일 |
+| 프루닝 후 대상 | ~3.4GB, ~7 파일 | ~3.4GB, **~96 small file** | ~3.3GB, ~7 파일 |
+| Data Skipping | sort_a/b/c 3단계 skipping → ~1-2 파일 | small file 다수 → 효과 제한 | hash_val Sort Order skipping → ~1-2 파일 |
 | Compaction 의존 | **필수** | — | **불필요** |
 
 **트레이드오프**

@@ -246,7 +246,7 @@ num_executors = max(num_executors, 1)
 >
 > | 구분 | 설정 | 기본값 | 적용 시점 |
 > |------|------|--------|----------|
-> | **읽기 파티션** | `spark.sql.files.maxPartitionBytes` | 128MB | `spark.read` 단계. 소파일들을 묶어 하나의 파티션으로 생성 |
+> | **읽기 파티션** | `spark.sql.files.maxPartitionBytes` | 128MB | `spark.read` 단계. small file들을 묶어 하나의 파티션으로 생성 |
 > | **셔플 파티션** | `spark.sql.shuffle.partitions` | 200 | shuffle 발생 시 파티션 수 결정 |
 >
 > 이 워크플로우에서는 Iceberg의 `write.distribution-mode=range`에 의해 파티션 키 + write ordering 기준 범위 기반 데이터 재분배가 발생하며, 벤치마크에서 **9.2GiB 규모의 shuffle이 확인**되었다 (Stage 5→7, 1.3절 참고).
@@ -296,7 +296,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 
 | 설정값 | 동작 | 결과 |
 |-------|------|------|
-| `true` | `minPartitionSize`(1MB)만 기준으로 병합 최소화 → 병렬성 최대화 | 소파일 다수 생성 가능 |
+| `true` | `minPartitionSize`(1MB)만 기준으로 병합 최소화 → 병렬성 최대화 | small file 다수 생성 가능 |
 | `false` | `advisoryPartitionSizeInBytes`(64MB) 기준으로 적극 병합 | 파티션당 ~64MB로 최적화 |
 
 **공식 문서 권장사항**
@@ -338,7 +338,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 | 항목 | 판단 |
 |------|------|
 | 성능 차이 | 23% 저하(44초→55초)는 10분 주기 배치에서 유의미 |
-| 소파일 문제 | Iceberg `rewrite_data_files` 컴팩션으로 해결 (시간당/일당 주기 운영 예정) |
+| small file 문제 | Iceberg `rewrite_data_files` 컴팩션으로 해결 (시간당/일당 주기 운영 예정) |
 | 업계 관행 | Iceberg/Delta + 컴팩션 운영 환경에서는 쓰기 성능 우선(`true`)이 일반적 |
 
 > **참고: 일반적 관행**
@@ -373,7 +373,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 | `executor-memory` | `8g` | `1g` | 📘 일반적 관행 | 코어당 2GB |
 | `num-executors` | `ceil(총크기/128MB×1.5/cores)` | `2` | ✅ 벤치마크 검증 | 24개 최적 |
 | `shuffle.partitions` | `200` (기본값) | `200` | ✅ 벤치마크 검증 | AQE 자동 조정에 맡김 |
-| `parallelismFirst` | `true` (기본값) | `true` | ✅ 벤치마크 검증 | I/O 중심 워크로드에 적합. 소파일은 컴팩션으로 해결 |
+| `parallelismFirst` | `true` (기본값) | `true` | ✅ 벤치마크 검증 | I/O 중심 워크로드에 적합. small file은 컴팩션으로 해결 |
 
 ### 4.2 벤치마크 테스트 환경
 
@@ -395,7 +395,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 |--------|------|------|
 | num-executors (16/24/32/60) | 24개에서 44초 최적 | `PARALLELISM_FACTOR=1.5` 확정 |
 | shuffle.partitions | 기본값(200) 최적 | 기본값 유지. AQE 자동 조정에 맡김 |
-| parallelismFirst (true vs false) | true(기본값)가 10초 빠름 | 기본값 유지. 소파일은 컴팩션으로 해결 |
+| parallelismFirst (true vs false) | true(기본값)가 10초 빠름 | 기본값 유지. small file은 컴팩션으로 해결 |
 
 ### 4.4 K8S 클러스터 리소스 요구사항
 
@@ -449,7 +449,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 | **advisoryPartitionSizeInBytes** | AQE 파티션 병합 시 목표 크기 (기본 64MB). 이미 초과한 파티션은 분할 불가 |
 | **write.distribution-mode** | Iceberg 쓰기 전 데이터 재분배 방식. `range`는 파티션 키 + write ordering 기준 범위 분배 |
 | **memoryOverhead** | JVM 외부 메모리 (off-heap, 네이티브 라이브러리 등). K8S Pod 메모리 = executor-memory + memoryOverhead |
-| **컴팩션** | Iceberg `rewrite_data_files` 프로시저. 소파일을 병합하여 읽기 성능 최적화 |
+| **컴팩션** | Iceberg `rewrite_data_files` 프로시저. small file을 병합하여 읽기 성능 최적화 |
 
 ---
 
