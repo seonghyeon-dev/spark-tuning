@@ -42,6 +42,7 @@
 ### 워크플로우
 
 Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
+Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일치) — 모든 전략에서 필수
 
 ### 참고 공식 문서
 
