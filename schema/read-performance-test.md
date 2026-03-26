@@ -38,30 +38,51 @@
 | Stage Performance | Operator별 throughput, CPU, Wall Time |
 | Timeline | Parallelism, Input rows/s, Physical Input Bytes |
 
+**Trino Web UI Overview 주요 메트릭 해석**
+
+| 메트릭 | 설명 | 성능 비교 시 해석 |
+|--------|------|-----------------|
+| **Elapsed Time** | 쿼리 제출부터 완료까지 총 소요시간 (wall-clock) | 사용자 체감 성능. 최종 비교 기준 |
+| **Planning Time** | 쿼리 계획 수립 소요시간 | 메타데이터 크기(파일 수)에 비례. 파일 수가 많으면 증가 |
+| **Execution Time** | Planning 이후 실제 실행 시간 | I/O + 연산 시간. Elapsed - Planning ≈ Execution |
+| **CPU Time** | 전체 Worker에서 사용한 누적 CPU 시간 | 연산 작업량 지표. 스캔 데이터가 많으면 증가 |
+| **Scheduled Time** | 태스크가 프로세서에 스케줄된 총 시간 | CPU Time / Scheduled Time = CPU 활용률 |
+| **Blocked Time** | 데이터 전송 대기 시간 (전체 스레드 합산) | Blocked >> CPU면 I/O 병목, Blocked << CPU면 연산 병목 |
+| **Physical Input Rows** | 스토리지에서 실제 읽은 행 수 | 파티션 프루닝·Data Skipping 효과 직접 반영. **핵심 비교 지표** |
+| **Physical Input Data** | 스토리지에서 전송된 압축 상태의 바이트 수 | 실제 I/O 양. 적을수록 프루닝이 잘 동작한 것 |
+| **Input Rows / Data** | Connector 최적화 후 처리된 논리적 행 수 / 크기 | Physical과 차이가 크면 압축·인코딩 효율이 높은 것 |
+| **Output Rows / Data** | 최종 결과 행 수 / 크기 | 모든 전략에서 동일해야 함 (같은 쿼리이므로) |
+| **Peak User Memory** | 단일 Worker에서 최대 사용 메모리 | 스캔 범위가 클수록 증가. 메모리 부담 비교 |
+| **Cumulative User Memory** | 메모리 사용량 × 시간 적분 (GB·s) | 지속적 메모리 부하 지표 |
+
+> **성능 비교 핵심**: 동일 쿼리 결과(Output Rows 동일)를 얻기 위해 **Physical Input Rows/Data가 얼마나 적은지**가 파티션 전략의 효과를 직접 반영한다. Physical Input이 적으면 프루닝이 잘 된 것이고, 이에 비례하여 CPU Time과 Elapsed Time도 감소한다.
+
 ---
 
 ## 2. Compaction 후 파티션 분포
 
-1일치 데이터(2026-03-18) 기준, Compaction 후 측정 결과.
+1일치 데이터(2026-03-18) 기준, `spark.sql.iceberg.advisory-partition-size = 768MB`로 Compaction 후 측정 결과.
 
 | 항목 | Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
 |------|-----------------|-----------------|-----|-----|-----|
-| 스토리지 | | HDFS (블록 128MB) | S3 (MinIO) | S3 (MinIO) | |
-| 파일 포맷 | | ORC | Parquet | Parquet | |
-| 파티션 수 | | 1 (dt=날짜) | 253 | 96 | |
-| 총 파일 수 | | 1,008 | 1,987 | 1,833 | |
-| 총 크기 | | 4.9TB | 912.6GB | 912.7GB | |
-| 파일 크기 avg | | 5.0GB | 172.9MB | 495.7MB | |
-| 파일 크기 min | | 2.2GB | 0.6MB | 10.8MB | |
-| 파일 크기 max | | 8.9GB | 716.5MB | 721MB | |
-| 128MB 미만 파일 수 | | — | 161개 (8.1%) | 2개 (0.1%) | |
+| 스토리지 | | HDFS (블록 128MB) | S3 (MinIO) | S3 (MinIO) | S3 (MinIO) |
+| 파일 포맷 | | ORC | Parquet | Parquet | Parquet |
+| 파티션 수 | | 1 (dt=날짜) | 253 | 96 | 64 |
+| 총 파일 수 | | 1,008 | 1,985 | 1,823 | 1,847 |
+| 총 크기 | | 4.9TB | 912.6GB | 912.7GB | 912.6GB |
+| 파일 크기 avg | | 5.0GB | 172.9MB | 497.9MB | 396.7MB |
+| 파일 크기 min | | 2.2GB | 0.6MB | 153.5MB | 0.8MB |
+| 파일 크기 max | | 8.9GB | 718.2MB | 691.8MB | 719.9MB |
+| 파티션당 파일 수 (max/min) | | — | 449 / 1 | 42 / 1 | 488 / 1 |
+| 파일 1개 파티션 수 | | — | 190 | 22 | 22 |
+| 그 중 384MB 미만 | | — | 182 | 2 | 18 |
 
-> **small file 기준**: Iceberg [`SizeBasedFileRewriter`](https://iceberg.apache.org/javadoc/1.4.1/org/apache/iceberg/actions/SizeBasedFileRewriter.html)의 `MIN_FILE_SIZE_DEFAULT_RATIO = 0.75` 기준, target 512MB의 75%인 **384MB 미만이 Compaction 대상(small file)**. 아래 분석은 128MB 미만 파일 수를 참고 지표로 함께 기재.
+> **small file 기준**: Iceberg [`SizeBasedFileRewriter`](https://iceberg.apache.org/javadoc/1.4.1/org/apache/iceberg/actions/SizeBasedFileRewriter.html)의 `MIN_FILE_SIZE_DEFAULT_RATIO = 0.75` 기준, **384MB 미만이 Compaction 대상(small file)**.
 >
-> - **Hive-orc 총 크기가 큰 이유**: Hive-orc 테이블은 수직분할 4개 테이블의 합산 데이터. Iceberg는 그 중 1개 테이블(TABLE_A)만 대상이므로 직접적인 크기 비교는 불가
-> - **A안 small file 문제**: avg 172.9MB로 target 512MB의 34% 수준. 128MB 미만 파일만 161개(8.1%). 데이터가 적은 par_b 파티션의 구조적 Skew로 Compaction으로도 해결 불가
-> - **B안 파일 크기 균등**: avg 495.7MB로 목표(512MB)에 근접. 128MB 미만 파일은 10.8MB, 107.2MB 단 2개(0.1%)로 실질적 small file 문제 없음
-> - **Hive-orc 파일 크기**: 파일당 2.2~8.9GB. 파티션이 날짜 1개뿐이라 par_b 등 세부 필터 시 전체 스캔 필요
+> - **Hive-orc**: 수직분할 4개 테이블의 합산 데이터(4.9TB). Iceberg는 그 중 1개 테이블(TABLE_A)만 대상이므로 직접적인 크기 비교 불가. 파티션이 날짜 1개뿐이라 세부 필터 시 전체 스캔 필요
+> - **A안**: 구조적 Skew 심각. 파일 1개 파티션 190개 중 182개가 384MB 미만 — 데이터가 적은 par_b 파티션이 원인이며, Compaction으로도 해결 불가
+> - **B안**: avg 497.9MB로 목표에 근접하고 min 153.5MB로 전 전략 중 가장 균등. 384MB 미만 파일은 단 2개로 실질적 small file 문제 없음
+> - **C안**: bucket(16)으로 par_b Skew를 분산하지만, bucket 내 데이터 편차로 min 0.8MB 발생. 384MB 미만 파일이 18개로 A안(182개)보다 대폭 개선되었으나 B안(2개)보다는 많음
 
 ---
 

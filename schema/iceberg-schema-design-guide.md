@@ -1060,13 +1060,13 @@ distribution-mode: range
 | 항목 | 내용 |
 |------|------|
 | 프루닝 체인 | `hour(ts)`(1/24) → `par_a`(1/4) → par_b **Data Skipping** → sort Data Skipping |
-| Compaction 부담 | **최저** — 일일 파티션 조합 수가 248개 → 96개로 감소. 실측 384MB 미만 파일 소수(min 10.8MB 포함 2개가 128MB 미만)로 small file 문제 실질적 해소. Compaction 부담 최저 (파티션 조합 감소로 small file 최소화) |
+| Compaction 부담 | **최저** — 일일 파티션 조합 수가 248개 → 96개로 감소. 실측 384MB 미만 파일 2개(min 153.5MB)로 small file 문제 실질적 해소 |
 | 프루닝 정밀도 | par_b는 Sort Order 1순위 + range 모드의 min/max Data Skipping으로 필터링 (파티션 프루닝이 아닌 통계적 skipping) |
 | Skew 영향 | **없음** — hour × par_a는 시간대별로 균등 분포. par_b의 구조적 Skew 문제 해소 |
 
 **다른 안 대비 핵심 변경점**
 
-- **Small file 문제 실질적 해소** — 일일 파티션 조합 수 248개 → 96개 (61% 감소). 실측 Compaction 후 384MB 미만 파일 소수(min 10.8MB 포함 2개가 128MB 미만)로, A안(128MB 미만 161개, 8.1%) 대비 구조적 Skew 문제가 해소된다
+- **Small file 문제 실질적 해소** — 일일 파티션 조합 수 248개 → 96개 (61% 감소). 실측 Compaction 후 384MB 미만 파일 2개(min 153.5MB)로, A안(384MB 미만 182개) 대비 구조적 Skew 문제가 해소된다
 - **파티션 Skew 해소** — A안의 하위 ~190개 파티션(0.001GB 이하) 구조적 Skew가 사라짐. hour × par_a 기준 파티션당 ~8.9GB로 균등 분포
 - **시간 단위 파티션 프루닝** — 시간값 조건 포함 시 day 대비 최대 1/24 추가 scan 축소. 일 단위 조건 시에는 24개 파티션의 매니페스트 엔트리를 읽지만, 이는 메타데이터 수준이므로 읽기 성능 영향 미미 (벤치마크 검증 필요)
 - **연간 총 파티션 수 감소** — 90,520개/년(A안) → 35,040개/년 (61% 감소)
