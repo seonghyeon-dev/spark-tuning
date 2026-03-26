@@ -61,9 +61,9 @@ Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
 - **산출물**: `schema/iceberg-schema-design-guide.md`
 - **상태**: 5개 전략(A~E안) 분석 완료, 읽기 성능 비교 테스트 진행 중
 - **테스트 현황** (`schema/read-performance-test.md`):
-  - Hive(as-is) vs A안 vs D안 비교 중, 다른 전략도 추가 예정
-  - 초기 테스트 결과: A안 조회 성능 우위 (par_b 파티션 프루닝 > D안 Data Skipping)
-  - D안은 파일 크기 균등 (avg 495.7MB), A안은 Compaction 후에도 Skew (min 0.6MB)
+  - Hive-orc(as-is) vs A안 vs B안 비교 중, 다른 전략도 추가 예정
+  - 초기 테스트 결과: A안 조회 성능 우위 (par_b 파티션 프루닝 > B안 Data Skipping)
+  - B안은 파일 크기 균등 (avg 495.7MB), A안은 Compaction 후에도 Skew (min 0.6MB)
 
 ## 파일 구조
 

@@ -292,7 +292,7 @@ ORDER BY par_a;
 | 50~60위 | 0.001~1GB | 소수 | ⚠️ target-file-size(512MB) 미만 포함 |
 | 60위 이후 | 0.001GB 이하 | 전부 1개 | 데이터 자체가 적은 파티션. Compaction 후에도 변하지 않음 |
 
-> **진단**: 248개 조합으로 ⚠️ 주의 구간. 상위 50개가 대부분의 데이터를 차지하여 **Skew가 존재**하며, 하위 ~190개 파티션은 데이터 자체가 적어(0.001GB 이하) Compaction 후에도 소형 파일로 유지되는 **구조적 Skew**이다. 이 Skew는 트랜스폼 변경(B안/C안)으로만 해소 가능하다.
+> **진단**: 248개 조합으로 ⚠️ 주의 구간. 상위 50개가 대부분의 데이터를 차지하여 **Skew가 존재**하며, 하위 ~190개 파티션은 데이터 자체가 적어(0.001GB 이하) Compaction 후에도 소형 파일로 유지되는 **구조적 Skew**이다. 이 Skew는 트랜스폼 변경(E안/C안)으로만 해소 가능하다.
 
 **3번째 파티션 키 후보 비교**
 
@@ -1038,7 +1038,7 @@ Compaction: 1시간 + 1일 단위 배치
 | 일일 파일 수 | Compaction 전: ~23,789개 ⚠️ → **Compaction 후: ~1,834개** ✅ |
 | Compaction 부담 | 높음 — 1시간 + 1일 단위 필수 (실측 검증 완료) |
 | 프루닝 정밀도 | **최대** — `WHERE par_b = 'x'` 시 정확히 1개 파티션만 scan |
-| Skew 영향 | 있음 — 하위 ~190개 파티션은 데이터 자체가 적어(0.001GB 이하) Compaction 후에도 소형 파일 유지. 구조적 Skew로 트랜스폼 변경(B안/C안)으로만 해소 가능 |
+| Skew 영향 | 있음 — 하위 ~190개 파티션은 데이터 자체가 적어(0.001GB 이하) Compaction 후에도 소형 파일 유지. 구조적 Skew로 트랜스폼 변경(E안/C안)으로만 해소 가능 |
 | 장점 | **읽기 성능 최대**. Compaction 실측 검증 완료 |
 | 단점 | Compaction 미운영 시 메타데이터 부하 급증. Compaction 전 쿼리 성능 저하 |
 
@@ -1046,7 +1046,209 @@ Compaction: 1시간 + 1일 단위 배치
 
 ---
 
-**B안 (차선): truncate(3, par_b) — 파티션 수 감소 + 프루닝 유지**
+**B안 (검토): hour(ts) + par_a — 파티션 구조 변경**
+
+A안/C안/E안이 par_b 트랜스폼에 집중하는 반면, B안은 **파티션 구조 자체를 변경**하는 접근이다. par_b를 파티션에서 제거하고 Sort Order 1순위로 이동하며, 시간 파티션을 `day` → `hour`로 세분화한다.
+
+```
+파티션: hour(ts), par_a
+Sort Order: par_b, sort_a, sort_b, sort_c ASC NULLS FIRST
+distribution-mode: range
+파티션 조합: 24시간 × 4 par_a = 96개/일
+```
+
+| 항목 | 내용 |
+|------|------|
+| 프루닝 체인 | `hour(ts)`(1/24) → `par_a`(1/4) → par_b **Data Skipping** → sort Data Skipping |
+| Compaction 부담 | **최저** — 일일 파티션 조합 수가 248개 → 96개로 감소. 실측 384MB 미만 파일 소수(min 10.8MB 포함 2개가 128MB 미만)로 small file 문제 실질적 해소. Compaction 선택적 운영 가능 |
+| 프루닝 정밀도 | par_b는 Sort Order 1순위 + range 모드의 min/max Data Skipping으로 필터링 (파티션 프루닝이 아닌 통계적 skipping) |
+| Skew 영향 | **없음** — hour × par_a는 시간대별로 균등 분포. par_b의 구조적 Skew 문제 해소 |
+
+**다른 안 대비 핵심 변경점**
+
+- **Small file 문제 실질적 해소** — 일일 파티션 조합 수 248개 → 96개 (61% 감소). 실측 Compaction 후 384MB 미만 파일 소수(min 10.8MB 포함 2개가 128MB 미만)로, A안(128MB 미만 161개, 8.1%) 대비 구조적 Skew 문제가 해소된다
+- **파티션 Skew 해소** — A안의 하위 ~190개 파티션(0.001GB 이하) 구조적 Skew가 사라짐. hour × par_a 기준 파티션당 ~8.9GB로 균등 분포
+- **시간 단위 파티션 프루닝** — 시간값 조건 포함 시 day 대비 최대 1/24 추가 scan 축소. 일 단위 조건 시에는 24개 파티션의 매니페스트 엔트리를 읽지만, 이는 메타데이터 수준이므로 읽기 성능 영향 미미 (벤치마크 검증 필요)
+- **연간 총 파티션 수 감소** — 90,520개/년(A안) → 35,040개/년 (61% 감소)
+- **Compaction 운영 부담 경감** — Compaction 필수(A안/C안/E안) → 선택적. range 모드의 per-batch 글로벌 정렬이 Compaction 없이도 par_b Data Skipping을 보장
+
+**트레이드오프**
+
+- **par_b 필터 방식 변경** — 파티션 프루닝(100% 보장) → Data Skipping(통계적). 다만 par_b가 Sort Order 1순위 + range 모드이므로 파일 간 값 범위 분리가 보장되어, 파티션 프루닝에 근접한 skipping 효과를 기대할 수 있다 (실측 검증 필요)
+- **Sort Order 컬럼 수 증가 (3→4)** — par_b 추가로 sort_c가 4순위로 밀림. sort_c 단독 필터의 Data Skipping 효과 소폭 감소. 단, sort_c 단독 필터 빈도가 낮다면 Sort Order에서 제거하여 3개로 유지할 수 있다
+- **시간 경계 배치 분산** — 10분 배치가 정시를 걸치는 경우(예: 12:55~13:05) 2개 시간 파티션에 쓰기 발생. 경계 시간의 파일 크기가 작아질 수 있음
+- **벤치마크 재검증 필요** — 파티션 구조와 shuffle 패턴이 변경되므로 기존 벤치마크(num-executors 24개, 44초)의 유효성 재확인 필요
+
+**par_b가 Sort Order 1순위로 유효한 근거**
+
+par_b는 Sort Order 1순위 + `range` 모드 조합에서 높은 Data Skipping 효과를 기대할 수 있다:
+
+| 조건 | par_b 상황 |
+|------|-----------|
+| Cardinality | par_a별 42~72개 (중간) — 1순위 정렬에 최적 구간 |
+| WHERE 포함 빈도 | 항상 — 모든 조회에 par_b 등가 조건 포함 |
+| range 모드 효과 | 파일 간 par_b 값 범위 분리 보장 (글로벌 정렬) → 파티션 프루닝에 근접한 skipping |
+
+```
+range 모드에서 par_b Sort Order 1순위 시 Data Skipping 동작:
+
+  배치 1 쓰기: 파일A(par_b: AAA~CCC), 파일B(par_b: DDD~FFF), 파일C(par_b: GGG~ZZZ)
+  배치 2 쓰기: 파일D(par_b: AAA~CCC), 파일E(par_b: DDD~FFF), 파일F(par_b: GGG~ZZZ)
+
+  WHERE par_b = 'BBB' → 파일A + 파일D만 읽음 (4개 파일 skip)
+  → 배치가 누적되어도 배치당 1~2개 파일만 매칭, Compaction 없이도 유효
+```
+
+**B안 적용 시 DDL 변경**
+
+```sql
+-- Partition Evolution: day(ts) → hour(ts), par_b 제거
+ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD day(ts);
+ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
+ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD hour(ts);
+
+-- Sort Order 변경: par_b를 1순위로 추가
+ALTER TABLE catalog.db.TABLE_A
+WRITE ORDERED BY
+    par_b ASC NULLS FIRST,
+    sort_a ASC NULLS FIRST,
+    sort_b ASC NULLS FIRST,
+    sort_c ASC NULLS FIRST;
+
+-- 기존 데이터 재정리
+CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
+```
+
+---
+
+**C안 (절충): bucket(16, par_b) — 파일 수 최소화**
+
+```
+파티션: day(ts), par_a, bucket(16, par_b)
+Sort Order: sort_a, sort_b, sort_c ASC NULLS FIRST
+distribution-mode: range
+Compaction: 1시간 + 1일 단위 배치
+```
+
+| 항목 | 내용 |
+|------|------|
+| 프루닝 체인 | `day(ts)` → `par_a`(1/4) → `bucket(par_b)`(1/16) → sort Data Skipping |
+| 일일 파일 수 | Compaction 전: 144 × 4 × 16 = **9,216개** ⚠️ → Compaction 후: **~1,300개** 추정 ✅ |
+| Compaction 부담 | **가장 낮음** — A안 대비 파일 수 74% 감소 |
+| 프루닝 정밀도 | 중간 — `WHERE par_b = 'x'` 시 1/16 버킷 scan (버킷당 ~15.5개 par_b 값) |
+| Skew 영향 | **최소** — 해시 분배로 데이터 균등 배분 |
+| 장점 | 파일 수 대폭 감소, Skew 해소, 운영 단순 |
+| 단점 | 프루닝 정밀도 A안 대비 **15.5배 저하** (1/248 → 1/16). 접두사/범위 조회 프루닝 불가 |
+
+**C안 적용 시 DDL 변경**
+
+```sql
+-- Partition Evolution: identity → bucket 전환
+ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
+ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD bucket(16, par_b);
+
+-- 기존 데이터 재정리
+CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
+```
+
+---
+
+**D안 (검토): day(ts) + par_a + bucket(N, hash_val) — 멀티 컬럼 해시 버킷**
+
+다른 안이 par_b 단일 컬럼에 집중하는 반면, D안은 **조회 필터 컬럼 4개(par_b, sort_a, sort_b, sort_c)를 하나의 해시 값으로 합쳐** bucket 파티셔닝하는 접근이다. Spark 적재 시 해시 컬럼을 생성하고, 조회 시 동일 해시를 계산하여 bucket 프루닝한다.
+
+```
+스키마: 기존 19개 컬럼 + hash_val (bigint, 신규)
+파티션: day(ts), par_a, bucket(N, hash_val)
+Sort Order: hash_val ASC NULLS FIRST
+distribution-mode: range
+파티션 조합: 4 par_a × N bucket = 4N개/일
+```
+
+```sql
+-- Spark 적재 시 hash_val 컬럼 생성
+SELECT *,
+    xxhash64(concat_ws('|', par_b, sort_a, sort_b, sort_c)) AS hash_val
+FROM source_avro;
+
+-- Trino 조회 시 hash_val만으로 조회 (par_b, sort_a, sort_b, sort_c 개별 조건 불필요)
+SELECT * FROM TABLE_A
+WHERE date(ts) = timestamp '2026-03-11'
+  AND par_a = 'A'
+  AND hash_val = xxhash64(to_utf8('value0' || '|' || 'value1' || '|' || 'value2' || '|' || 'value3'));
+```
+
+hash_val 하나로 par_b, sort_a, sort_b, sort_c 4개 컬럼의 필터링을 대체한다. xxhash64는 64-bit 해시이므로 실질적으로 충돌이 발생하지 않는다.
+
+| 항목 | 내용 |
+|------|------|
+| 프루닝 체인 | `day(ts)` → `par_a`(1/4) → `bucket(hash_val)`(1/N) → hash_val Sort Order Data Skipping |
+| Skew 영향 | **없음** — 해시 분배로 모든 버킷이 균등한 크기 |
+| Compaction 부담 | **최저** — N 조정으로 파일 크기를 최적화. Compaction 없이도 A안 Compaction 후와 동등한 파일 구조 |
+
+**버킷 수(N)에 따른 파일 구조** (목표 파일 크기 512MB 기준)
+
+```
+일일 데이터: ~851GB, par_a당: ~213GB
+
+N=32:  버킷당 ~6.6GB → 파일 ~13개/버킷 → 일일 총 ~1,664개 ✅
+N=64:  버킷당 ~3.3GB → 파일 ~7개/버킷  → 일일 총 ~1,792개 ✅
+N=128: 버킷당 ~1.7GB → 파일 ~3개/버킷  → 일일 총 ~1,536개 ✅
+
+→ Compaction 없이 A안 Compaction 후(1,834개)와 동등한 수준
+```
+
+**A안 대비 핵심 차이**
+
+```
+A안 (identity par_b):
+  248개 파티션, 심각한 Skew (하위 190개 < 0.001GB)
+  → Compaction 전: 23,789개 small file → Compaction 후 1,834개
+  → Compaction을 해야 D안의 기본 상태에 도달
+
+D안 (bucket hash_val, N=64):
+  256개 파티션 (4×64), 균등 분포
+  → 처음부터 ~1,792개 정상 크기 파일
+  → Compaction 불필요, Skew 없음
+```
+
+읽기 성능 비교 (WHERE hash_val = xxhash64(...) 단일 조건):
+
+| 항목 | A안 (Compaction 후) | A안 (Compaction 전) | D안 (N=64) |
+|------|-------------------|-------------------|-----------|
+| 프루닝 후 대상 | ~3.4GB, ~7 파일 | ~3.4GB, **~96 small file** | ~3.3GB, ~7 파일 |
+| Data Skipping | sort_a/b/c 3단계 skipping → ~1-2 파일 | small file 다수 → 효과 제한 | hash_val Sort Order skipping → ~1-2 파일 |
+| Compaction 의존 | **필수** | — | **불필요** |
+
+**트레이드오프**
+
+- **Spark-Trino 해시 호환성 검증 필수** — Spark `xxhash64` (기본 seed=42)와 Trino `xxhash64` (seed 미지정)의 출력이 동일해야 bucket 프루닝이 작동한다. `concat_ws`로 직렬화 방식을 통일하고, seed를 맞춘 뒤 **반드시 실측 테스트**로 동일 출력을 확인해야 한다
+- **스키마 변경** — hash_val 컬럼 추가 (bigint, row당 8 bytes). 저장 오버헤드는 무시 가능
+- **조회 쿼리 변경** — WHERE 절에서 par_b, sort_a, sort_b, sort_c 개별 조건 대신 hash_val 계산식 사용. UI/쿼리 템플릿 수정 필요
+- **개별 컬럼 단독 프루닝 불가** — hash_val은 4개 컬럼의 조합 해시이므로 par_b만으로는 해시 계산 불가. 단, 현재 조회 패턴에서 4개 컬럼이 항상 포함되므로 문제 없음
+
+**D안 적용 시 DDL 변경**
+
+```sql
+-- 1) hash_val 컬럼 추가
+ALTER TABLE catalog.db.TABLE_A ADD COLUMN hash_val bigint;
+
+-- 2) Partition Evolution
+ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
+ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD bucket(64, hash_val);
+
+-- 3) Sort Order 변경: hash_val로 정렬하여 Data Skipping 확보
+ALTER TABLE catalog.db.TABLE_A
+WRITE ORDERED BY hash_val ASC NULLS FIRST;
+
+-- 4) 기존 데이터 재정리 (hash_val 채우기 + 재파티셔닝)
+-- 주의: 기존 데이터에 hash_val이 NULL이므로 backfill 필요
+CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
+```
+
+---
+
+**E안 (차선): truncate(3, par_b) — 파티션 수 감소 + 프루닝 유지**
 
 ```
 파티션: day(ts), par_a, truncate(3, par_b)
@@ -1102,7 +1304,7 @@ WHERE par_b >= 'ABC' AND par_b < 'ABD'
 | par_b 단독 (distinct) | 150개 | **79개** | 47% 감소 |
 | 예상 일일 파일 수 (Compaction 전) | ~23,789개 | **~19,440개** | 18% 감소 |
 
-**B안 적용 시 DDL 변경**
+**E안 적용 시 DDL 변경**
 
 ```sql
 -- Partition Evolution: identity → truncate 전환
@@ -1115,222 +1317,20 @@ CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
 
 ---
 
-**C안 (절충): bucket(16, par_b) — 파일 수 최소화**
-
-```
-파티션: day(ts), par_a, bucket(16, par_b)
-Sort Order: sort_a, sort_b, sort_c ASC NULLS FIRST
-distribution-mode: range
-Compaction: 1시간 + 1일 단위 배치
-```
-
-| 항목 | 내용 |
-|------|------|
-| 프루닝 체인 | `day(ts)` → `par_a`(1/4) → `bucket(par_b)`(1/16) → sort Data Skipping |
-| 일일 파일 수 | Compaction 전: 144 × 4 × 16 = **9,216개** ⚠️ → Compaction 후: **~1,300개** 추정 ✅ |
-| Compaction 부담 | **가장 낮음** — A안 대비 파일 수 74% 감소 |
-| 프루닝 정밀도 | 중간 — `WHERE par_b = 'x'` 시 1/16 버킷 scan (버킷당 ~15.5개 par_b 값) |
-| Skew 영향 | **최소** — 해시 분배로 데이터 균등 배분 |
-| 장점 | 파일 수 대폭 감소, Skew 해소, 운영 단순 |
-| 단점 | 프루닝 정밀도 A안 대비 **15.5배 저하** (1/248 → 1/16). 접두사/범위 조회 프루닝 불가 |
-
-**C안 적용 시 DDL 변경**
-
-```sql
--- Partition Evolution: identity → bucket 전환
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
-ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD bucket(16, par_b);
-
--- 기존 데이터 재정리
-CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
-```
-
----
-
-**D안 (검토): hour(ts) + par_a — 파티션 구조 변경**
-
-A~C안이 par_b의 트랜스폼 선택에 집중하는 반면, D안은 **파티션 구조 자체를 변경**하는 접근이다. par_b를 파티션에서 제거하고 Sort Order 1순위로 이동하며, 시간 파티션을 `day` → `hour`로 세분화한다.
-
-```
-파티션: hour(ts), par_a
-Sort Order: par_b, sort_a, sort_b, sort_c ASC NULLS FIRST
-distribution-mode: range
-파티션 조합: 24시간 × 4 par_a = 96개/일
-```
-
-| 항목 | 내용 |
-|------|------|
-| 프루닝 체인 | `hour(ts)`(1/24) → `par_a`(1/4) → par_b **Data Skipping** → sort Data Skipping |
-| Compaction 부담 | **최저** — 일일 파티션 조합 수가 248개 → 96개로 감소. 실측 384MB 미만 파일 소수(min 10.8MB 포함 2개가 128MB 미만)로 small file 문제 실질적 해소. Compaction 선택적 운영 가능 |
-| 프루닝 정밀도 | par_b는 Sort Order 1순위 + range 모드의 min/max Data Skipping으로 필터링 (파티션 프루닝이 아닌 통계적 skipping) |
-| Skew 영향 | **없음** — hour × par_a는 시간대별로 균등 분포. par_b의 구조적 Skew 문제 해소 |
-
-**A~C안 대비 핵심 변경점**
-
-- **Small file 문제 실질적 해소** — 일일 파티션 조합 수 248개 → 96개 (61% 감소). 실측 Compaction 후 384MB 미만 파일 소수(min 10.8MB 포함 2개가 128MB 미만)로, A안(128MB 미만 161개, 8.1%) 대비 구조적 Skew 문제가 해소된다
-- **파티션 Skew 해소** — A안의 하위 ~190개 파티션(0.001GB 이하) 구조적 Skew가 사라짐. hour × par_a 기준 파티션당 ~8.9GB로 균등 분포
-- **시간 단위 파티션 프루닝** — 시간값 조건 포함 시 day 대비 최대 1/24 추가 scan 축소. 일 단위 조건 시에는 24개 파티션의 매니페스트 엔트리를 읽지만, 이는 메타데이터 수준이므로 읽기 성능 영향 무시 가능
-- **연간 총 파티션 수 감소** — 90,520개/년(A안) → 35,040개/년 (61% 감소)
-- **Compaction 운영 부담 경감** — 필수(A~C안) → 선택적. range 모드의 per-batch 글로벌 정렬이 Compaction 없이도 par_b Data Skipping을 보장
-
-**트레이드오프**
-
-- **par_b 필터 방식 변경** — 파티션 프루닝(100% 보장) → Data Skipping(통계적). 다만 par_b가 Sort Order 1순위 + range 모드이므로 파일 간 값 범위 분리가 보장되어, 파티션 프루닝에 근접한 skipping 효과를 기대할 수 있다 (실측 검증 필요)
-- **Sort Order 컬럼 수 증가 (3→4)** — par_b 추가로 sort_c가 4순위로 밀림. sort_c 단독 필터의 Data Skipping 효과 소폭 감소. 단, sort_c 단독 필터 빈도가 낮다면 Sort Order에서 제거하여 3개로 유지할 수 있다
-- **시간 경계 배치 분산** — 10분 배치가 정시를 걸치는 경우(예: 12:55~13:05) 2개 시간 파티션에 쓰기 발생. 경계 시간의 파일 크기가 작아질 수 있음
-- **벤치마크 재검증 필요** — 파티션 구조와 shuffle 패턴이 변경되므로 기존 벤치마크(num-executors 24개, 44초)의 유효성 재확인 필요
-
-**par_b가 Sort Order 1순위로 유효한 근거**
-
-par_b는 Sort Order 1순위 + `range` 모드 조합에서 높은 Data Skipping 효과를 기대할 수 있다:
-
-| 조건 | par_b 상황 |
-|------|-----------|
-| Cardinality | par_a별 42~72개 (중간) — 1순위 정렬에 최적 구간 |
-| WHERE 포함 빈도 | 항상 — 모든 조회에 par_b 등가 조건 포함 |
-| range 모드 효과 | 파일 간 par_b 값 범위 분리 보장 (글로벌 정렬) → 파티션 프루닝에 근접한 skipping |
-
-```
-range 모드에서 par_b Sort Order 1순위 시 Data Skipping 동작:
-
-  배치 1 쓰기: 파일A(par_b: AAA~CCC), 파일B(par_b: DDD~FFF), 파일C(par_b: GGG~ZZZ)
-  배치 2 쓰기: 파일D(par_b: AAA~CCC), 파일E(par_b: DDD~FFF), 파일F(par_b: GGG~ZZZ)
-
-  WHERE par_b = 'BBB' → 파일A + 파일D만 읽음 (4개 파일 skip)
-  → 배치가 누적되어도 배치당 1~2개 파일만 매칭, Compaction 없이도 유효
-```
-
-**D안 적용 시 DDL 변경**
-
-```sql
--- Partition Evolution: day(ts) → hour(ts), par_b 제거
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD day(ts);
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
-ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD hour(ts);
-
--- Sort Order 변경: par_b를 1순위로 추가
-ALTER TABLE catalog.db.TABLE_A
-WRITE ORDERED BY
-    par_b ASC NULLS FIRST,
-    sort_a ASC NULLS FIRST,
-    sort_b ASC NULLS FIRST,
-    sort_c ASC NULLS FIRST;
-
--- 기존 데이터 재정리
-CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
-```
-
----
-
-**E안 (검토): day(ts) + par_a + bucket(N, hash_val) — 멀티 컬럼 해시 버킷**
-
-A~D안이 par_b 단일 컬럼의 파티션 트랜스폼에 집중하는 반면, E안은 **조회 필터 컬럼 4개(par_b, sort_a, sort_b, sort_c)를 하나의 해시 값으로 합쳐** bucket 파티셔닝하는 접근이다. Spark 적재 시 해시 컬럼을 생성하고, 조회 시 동일 해시를 계산하여 bucket 프루닝한다.
-
-```
-스키마: 기존 19개 컬럼 + hash_val (bigint, 신규)
-파티션: day(ts), par_a, bucket(N, hash_val)
-Sort Order: hash_val ASC NULLS FIRST
-distribution-mode: range
-파티션 조합: 4 par_a × N bucket = 4N개/일
-```
-
-```sql
--- Spark 적재 시 hash_val 컬럼 생성
-SELECT *,
-    xxhash64(concat_ws('|', par_b, sort_a, sort_b, sort_c)) AS hash_val
-FROM source_avro;
-
--- Trino 조회 시 hash_val만으로 조회 (par_b, sort_a, sort_b, sort_c 개별 조건 불필요)
-SELECT * FROM TABLE_A
-WHERE date(ts) = timestamp '2026-03-11'
-  AND par_a = 'A'
-  AND hash_val = xxhash64(to_utf8('value0' || '|' || 'value1' || '|' || 'value2' || '|' || 'value3'));
-```
-
-hash_val 하나로 par_b, sort_a, sort_b, sort_c 4개 컬럼의 필터링을 대체한다. xxhash64는 64-bit 해시이므로 실질적으로 충돌이 발생하지 않는다.
-
-| 항목 | 내용 |
-|------|------|
-| 프루닝 체인 | `day(ts)` → `par_a`(1/4) → `bucket(hash_val)`(1/N) → hash_val Sort Order Data Skipping |
-| Skew 영향 | **없음** — 해시 분배로 모든 버킷이 균등한 크기 |
-| Compaction 부담 | **최저** — N 조정으로 파일 크기를 최적화. Compaction 없이도 A안 Compaction 후와 동등한 파일 구조 |
-
-**버킷 수(N)에 따른 파일 구조** (목표 파일 크기 512MB 기준)
-
-```
-일일 데이터: ~851GB, par_a당: ~213GB
-
-N=32:  버킷당 ~6.6GB → 파일 ~13개/버킷 → 일일 총 ~1,664개 ✅
-N=64:  버킷당 ~3.3GB → 파일 ~7개/버킷  → 일일 총 ~1,792개 ✅
-N=128: 버킷당 ~1.7GB → 파일 ~3개/버킷  → 일일 총 ~1,536개 ✅
-
-→ Compaction 없이 A안 Compaction 후(1,834개)와 동등한 수준
-```
-
-**A안 대비 핵심 차이**
-
-```
-A안 (identity par_b):
-  248개 파티션, 심각한 Skew (하위 190개 < 0.001GB)
-  → Compaction 전: 23,789개 small file → Compaction 후 1,834개
-  → Compaction을 해야 E안의 기본 상태에 도달
-
-E안 (bucket hash_val, N=64):
-  256개 파티션 (4×64), 균등 분포
-  → 처음부터 ~1,792개 정상 크기 파일
-  → Compaction 불필요, Skew 없음
-```
-
-읽기 성능 비교 (WHERE hash_val = xxhash64(...) 단일 조건):
-
-| 항목 | A안 (Compaction 후) | A안 (Compaction 전) | E안 (N=64) |
-|------|-------------------|-------------------|-----------|
-| 프루닝 후 대상 | ~3.4GB, ~7 파일 | ~3.4GB, **~96 small file** | ~3.3GB, ~7 파일 |
-| Data Skipping | sort_a/b/c 3단계 skipping → ~1-2 파일 | small file 다수 → 효과 제한 | hash_val Sort Order skipping → ~1-2 파일 |
-| Compaction 의존 | **필수** | — | **불필요** |
-
-**트레이드오프**
-
-- **Spark-Trino 해시 호환성 검증 필수** — Spark `xxhash64` (기본 seed=42)와 Trino `xxhash64` (seed 미지정)의 출력이 동일해야 bucket 프루닝이 작동한다. `concat_ws`로 직렬화 방식을 통일하고, seed를 맞춘 뒤 **반드시 실측 테스트**로 동일 출력을 확인해야 한다
-- **스키마 변경** — hash_val 컬럼 추가 (bigint, row당 8 bytes). 저장 오버헤드는 무시 가능
-- **조회 쿼리 변경** — WHERE 절에서 par_b, sort_a, sort_b, sort_c 개별 조건 대신 hash_val 계산식 사용. UI/쿼리 템플릿 수정 필요
-- **개별 컬럼 단독 프루닝 불가** — hash_val은 4개 컬럼의 조합 해시이므로 par_b만으로는 해시 계산 불가. 단, 현재 조회 패턴에서 4개 컬럼이 항상 포함되므로 문제 없음
-
-**E안 적용 시 DDL 변경**
-
-```sql
--- 1) hash_val 컬럼 추가
-ALTER TABLE catalog.db.TABLE_A ADD COLUMN hash_val bigint;
-
--- 2) Partition Evolution
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
-ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD bucket(64, hash_val);
-
--- 3) Sort Order 변경: hash_val로 정렬하여 Data Skipping 확보
-ALTER TABLE catalog.db.TABLE_A
-WRITE ORDERED BY hash_val ASC NULLS FIRST;
-
--- 4) 기존 데이터 재정리 (hash_val 채우기 + 재파티셔닝)
--- 주의: 기존 데이터에 hash_val이 NULL이므로 backfill 필요
-CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
-```
-
----
-
 **전략 비교 매트릭스**
 
-| 항목 | A안 (identity) | B안 (truncate) | C안 (bucket) | D안 (hour+par_a) | E안 (hash bucket) |
-|------|---------------|---------------|-------------|-----------------|------------------|
-| 파티션 구조 | day, par_a, par_b | day, par_a, truncate(3,par_b) | day, par_a, bucket(16,par_b) | hour, par_a | **day, par_a, bucket(N,hash_val)** |
-| Sort Order | sort_a, sort_b, sort_c | sort_a, sort_b, sort_c | sort_a, sort_b, sort_c | par_b, sort_a, sort_b, sort_c | **hash_val** |
-| 파티션 조합 수 | 248 | 135 | 64 (4×16) | 96 (24×4) | **4N** (N 조정 가능) |
-| Compaction 전 파일/일 | ~23,789 ⚠️ (실측) | ~19,440 ⚠️ | 9,216 ⚠️ | 실측 필요 | **~1,792 ✅** (N=64 기준) |
-| Compaction 후 파일/일 | 1,834 ✅ (실측) | ~1,500 ✅ | ~1,300 ✅ | 실측 필요 | Compaction 불필요 |
-| 필터 컬럼 프루닝 방식 | par_b 파티션 + sort Data Skipping | par_b 파티션 + sort Data Skipping | par_b 파티션 + sort Data Skipping | par_b Data Skipping | **hash bucket 프루닝(1/N) + hash_val Data Skipping** |
-| 운영 복잡도 | 높음 (Compaction 필수) | 높음 (Compaction 필수) | 중간 (Compaction 필수) | 낮음 (Compaction 선택적) | **낮음 (Compaction 불필요)** |
-| Skew | 있음 | 완화 | 없음 | 없음 | **없음** |
-| 시간 프루닝 세밀도 | 일 단위 | 일 단위 | 일 단위 | 시간 단위 | 일 단위 |
-| 전환 비용 | 없음 (현행) | DDL 2줄 | DDL 2줄 | DDL 3줄 + Sort Order 변경 | DDL 4줄 + 스키마 변경 + **해시 호환성 검증** |
+| 항목 | A안 (identity) | B안 (hour+par_a) | C안 (bucket) | D안 (hash bucket) | E안 (truncate) |
+|------|---------------|-----------------|-------------|------------------|---------------|
+| 파티션 구조 | day, par_a, par_b | hour, par_a | day, par_a, bucket(16,par_b) | **day, par_a, bucket(N,hash_val)** | day, par_a, truncate(3,par_b) |
+| Sort Order | sort_a, sort_b, sort_c | par_b, sort_a, sort_b, sort_c | sort_a, sort_b, sort_c | **hash_val** | sort_a, sort_b, sort_c |
+| 파티션 조합 수 | 248 | 96 (24×4) | 64 (4×16) | **4N** (N 조정 가능) | 135 |
+| Compaction 전 파일/일 | ~23,789 ⚠️ (실측) | 실측 필요 | 9,216 ⚠️ | **~1,792 ✅** (N=64 기준) | ~19,440 ⚠️ |
+| Compaction 후 파일/일 | 1,834 ✅ (실측) | 실측 필요 | ~1,300 ✅ | Compaction 불필요 | ~1,500 ✅ |
+| 필터 컬럼 프루닝 방식 | par_b 파티션 + sort Data Skipping | par_b Data Skipping | par_b 파티션 + sort Data Skipping | **hash bucket 프루닝(1/N) + hash_val Data Skipping** | par_b 파티션 + sort Data Skipping |
+| 운영 복잡도 | 높음 (Compaction 필수) | 낮음 (Compaction 선택적) | 중간 (Compaction 필수) | **낮음 (Compaction 불필요)** | 높음 (Compaction 필수) |
+| Skew | 있음 | 없음 | 없음 | **없음** | 완화 |
+| 시간 프루닝 세밀도 | 일 단위 | 시간 단위 | 일 단위 | 일 단위 | 일 단위 |
+| 전환 비용 | 없음 (현행) | DDL 3줄 + Sort Order 변경 | DDL 2줄 | DDL 4줄 + 스키마 변경 + **해시 호환성 검증** | DDL 2줄 |
 
 **결론**
 
@@ -1340,31 +1340,31 @@ A안 (권장): identity 유지 + Compaction (1시간 + 1일)
   → 읽기 성능 최대, Compaction 안정 운영이 전제
 
 Compaction 운영 부담이 과도한 경우:
-  ├─ B안 (truncate): 프루닝 정밀도 소폭 저하 (1/248 → 1/135), 파일 수 46% 감소
+  ├─ E안 (truncate): 프루닝 정밀도 소폭 저하 (1/248 → 1/135), 파일 수 46% 감소
   └─ C안 (bucket): 프루닝 정밀도 대폭 저하 (1/248 → 1/16), 파일 수 74% 감소
 
 파티션 구조 자체를 변경하는 경우:
-  ├─ D안 (hour+par_a): par_b를 Sort Order로 이동, small file 문제 실질적 해소
+  ├─ B안 (hour+par_a): par_b를 Sort Order로 이동, small file 문제 실질적 해소
   │  → 일일 파티션 조합 수 248개 → 96개, Compaction 선택적 운영
   │  → 시간 단위 프루닝 추가, 운영 복잡도 최저
   │  → par_b 프루닝이 파티션 → Data Skipping으로 변경 (벤치마크 검증 필요)
   │
-  └─ E안 (hash bucket): 4개 필터 컬럼의 해시로 bucket 파티셔닝
+  └─ D안 (hash bucket): 4개 필터 컬럼의 해시로 bucket 파티셔닝
      → Compaction 없이 처음부터 최적 파일 구조 (N=64 기준 ~1,792개/일)
      → 해시 균등 분배로 Skew 완전 해소
      → Spark-Trino 해시 호환성 검증 필수
 ```
 
-> **단계적 접근**: 모든 안에서 Partition Evolution으로 무중단 전환이 가능하다. **A안으로 운영 시작 → Compaction 부담이 과도하면 B안(truncate) 전환**이 가장 합리적인 경로이다. B안은 A안 대비 읽기 성능 저하가 ~1.84배로 미미하면서 파일 수를 46% 줄일 수 있다. **D안은 파티션 구조를 근본적으로 변경하여 small file 문제를 실질적으로 해소하고 Compaction 부담을 최소화하는 접근**, **E안은 멀티 컬럼 해시 버킷으로 Compaction 없이 최적 파일 구조를 달성하는 접근**으로, 해시 호환성 검증 후 검토한다.
+> **단계적 접근**: 모든 안에서 Partition Evolution으로 무중단 전환이 가능하다. **A안으로 운영 시작 → Compaction 부담이 과도하면 E안(truncate) 전환**이 가장 합리적인 경로이다. E안은 A안 대비 읽기 성능 저하가 ~1.84배로 미미하면서 파일 수를 46% 줄일 수 있다. **B안은 파티션 구조를 근본적으로 변경하여 small file 문제를 실질적으로 해소하고 Compaction 부담을 최소화하는 접근**, **D안은 멀티 컬럼 해시 버킷으로 Compaction 없이 최적 파일 구조를 달성하는 접근**으로, 해시 호환성 검증 후 검토한다.
 
 ### 7.2 설계 항목별 정리
 
 | 설계 항목 | 선택지 | TABLE_A 적용 | 판단 기준 |
 |----------|--------|-------------|----------|
-| 시간 파티션 | `hour`/`day`/`month` | `day(ts)` (A~C,E안), `hour(ts)` (D안) | A~C,E안: 일 단위 조회. D안: 시간 단위 프루닝 + 파티션당 크기 적정화(~8.9GB) |
+| 시간 파티션 | `hour`/`day`/`month` | `day(ts)` (A안/C~E안), `hour(ts)` (B안) | A안/C~E안: 일 단위 조회. B안: 시간 단위 프루닝 + 파티션당 크기 적정화(~8.9GB) |
 | par_a 파티션 | `identity`/`bucket` | `identity` | Cardinality 4, WHERE 항상 포함 → 프루닝 유효 |
-| par_b 파티션 | `identity`/`truncate`/`bucket`/Sort Order 이동/hash bucket | `identity` (A안 권장), Sort Order 이동 (D안), hash bucket (E안) | A~C안: 파티션 키 유지. D안: Sort Order 이동. E안: hash_val 컬럼으로 bucket (7.1절 참조) |
-| Sort Order | 사용/미사용, 컬럼 선택 | A~C안: `sort_a, sort_b, sort_c`. D안: `par_b, sort_a, sort_b, sort_c`. E안: `hash_val` | A~C안: WHERE 절 3개 필터 컬럼. D안: par_b 1순위 추가. E안: hash_val 단일 정렬로 4개 컬럼 필터링 대체 |
+| par_b 파티션 | `identity`/`truncate`/`bucket`/Sort Order 이동/hash bucket | `identity` (A안 권장), Sort Order 이동 (B안), hash bucket (D안) | A안/C안/E안: 파티션 키 유지. B안: Sort Order 이동. D안: hash_val 컬럼으로 bucket (7.1절 참조) |
+| Sort Order | 사용/미사용, 컬럼 선택 | A안/C안/E안: `sort_a, sort_b, sort_c`. B안: `par_b, sort_a, sort_b, sort_c`. D안: `hash_val` | A안/C안/E안: WHERE 절 3개 필터 컬럼. B안: par_b 1순위 추가. D안: hash_val 단일 정렬로 4개 컬럼 필터링 대체 |
 | Distribution Mode | `none`/`hash`/`range` | `range` | Sort Order 사용 시 range 필수 |
 | Z-ordering | 미적용/Compaction 시 적용 | 미적용 (2단계 검토) | sort_b, sort_c 단독 필터 빈도 추가 확인 후 결정 |
 | Column Metrics | `none`/`truncate`/`full` | 기본값 유지 + array는 `none` | 필터 대상 컬럼 통계 수집 필수 |
