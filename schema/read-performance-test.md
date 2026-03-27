@@ -95,7 +95,24 @@
 
 #### 조건 A
 
+**Hive-raw / Hive-orc 쿼리** (동일 쿼리, FROM 테이블만 다름)
+
 ```sql
+-- FROM: hive_raw.db.TABLE_A / hive_orc.db.TABLE_A
+-- (실제 쿼리 붙여넣기)
+```
+
+**A안 / C안 쿼리** (동일 쿼리, FROM 테이블만 다름 — day 필터)
+
+```sql
+-- FROM: iceberg.db.TABLE_A (A안) / iceberg.db.TABLE_A (C안)
+-- (실제 쿼리 붙여넣기)
+```
+
+**B안 쿼리** (hour 필터)
+
+```sql
+-- FROM: iceberg.db.TABLE_A (B안)
 -- (실제 쿼리 붙여넣기)
 ```
 
@@ -161,7 +178,24 @@ C안:
 
 #### 조건 B
 
+**Hive-raw / Hive-orc 쿼리** (동일 쿼리, FROM 테이블만 다름)
+
 ```sql
+-- FROM: hive_raw.db.TABLE_A / hive_orc.db.TABLE_A
+-- (실제 쿼리 붙여넣기)
+```
+
+**A안 / C안 쿼리** (동일 쿼리, FROM 테이블만 다름 — day 필터)
+
+```sql
+-- FROM: iceberg.db.TABLE_A (A안) / iceberg.db.TABLE_A (C안)
+-- (실제 쿼리 붙여넣기)
+```
+
+**B안 쿼리** (hour 필터)
+
+```sql
+-- FROM: iceberg.db.TABLE_A (B안)
 -- (실제 쿼리 붙여넣기)
 ```
 
@@ -229,7 +263,24 @@ C안:
 
 #### 조건 A
 
+**Hive-raw / Hive-orc 쿼리** (동일 쿼리, FROM 테이블만 다름)
+
 ```sql
+-- FROM: hive_raw.db.TABLE_A / hive_orc.db.TABLE_A
+-- (실제 쿼리 붙여넣기)
+```
+
+**A안 / C안 쿼리** (동일 쿼리, FROM 테이블만 다름 — day 필터)
+
+```sql
+-- FROM: iceberg.db.TABLE_A (A안) / iceberg.db.TABLE_A (C안)
+-- (실제 쿼리 붙여넣기)
+```
+
+**B안 쿼리** (hour 필터)
+
+```sql
+-- FROM: iceberg.db.TABLE_A (B안)
 -- (실제 쿼리 붙여넣기)
 ```
 
@@ -295,7 +346,24 @@ C안:
 
 #### 조건 B
 
+**Hive-raw / Hive-orc 쿼리** (동일 쿼리, FROM 테이블만 다름)
+
 ```sql
+-- FROM: hive_raw.db.TABLE_A / hive_orc.db.TABLE_A
+-- (실제 쿼리 붙여넣기)
+```
+
+**A안 / C안 쿼리** (동일 쿼리, FROM 테이블만 다름 — day 필터)
+
+```sql
+-- FROM: iceberg.db.TABLE_A (A안) / iceberg.db.TABLE_A (C안)
+-- (실제 쿼리 붙여넣기)
+```
+
+**B안 쿼리** (hour 필터)
+
+```sql
+-- FROM: iceberg.db.TABLE_A (B안)
 -- (실제 쿼리 붙여넣기)
 ```
 
