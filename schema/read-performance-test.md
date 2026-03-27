@@ -30,13 +30,11 @@
 - **ts 필터 기준**: A안과 C안은 `day(ts)` 파티션에 맞춰 day 단위, B안은 `hour(ts)` 파티션에 맞춰 hour 단위로 고정
 - **조건 A / 조건 B**: 서로 다른 데이터를 조회하기 위한 조건 변경 (par_a, par_b 등 필터값 변경)
 
-**Web UI 캡처 대상**: 각 쿼리 실행 후 아래 3개 탭을 각 테이블별로 캡처
+**Web UI 캡처 대상**: 각 쿼리 실행 후 Resource Utilization 탭을 각 테이블별로 캡처
 
 | 캡처 대상 | 비교 포인트 |
 |----------|-----------|
 | Resource Utilization | Physical Input, CPU Time, Scheduled Time |
-| Stage Performance | Operator별 throughput, CPU, Wall Time |
-| Timeline | Parallelism, Input rows/s, Physical Input Bytes |
 
 **Trino Web UI Overview 주요 메트릭 해석** ([Web UI](https://trino.io/docs/current/admin/web-interface.html) · [EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html) · [Query Management Properties](https://trino.io/docs/current/admin/properties-query-management.html))
 
@@ -220,17 +218,6 @@ C안:
 |-----------------|-----------------|-----|-----|-----|
 | (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
 
-**Web UI — Stage Performance**
-
-| Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
-|-----------------|-----------------|-----|-----|-----|
-| (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
-
-**Web UI — Timeline**
-
-| Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
-|-----------------|-----------------|-----|-----|-----|
-| (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
 
 **Elapsed Time**
 
@@ -303,17 +290,6 @@ C안:
 |-----------------|-----------------|-----|-----|-----|
 | (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
 
-**Web UI — Stage Performance**
-
-| Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
-|-----------------|-----------------|-----|-----|-----|
-| (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
-
-**Web UI — Timeline**
-
-| Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
-|-----------------|-----------------|-----|-----|-----|
-| (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
 
 **Elapsed Time**
 
@@ -388,17 +364,6 @@ C안:
 |-----------------|-----------------|-----|-----|-----|
 | (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
 
-**Web UI — Stage Performance**
-
-| Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
-|-----------------|-----------------|-----|-----|-----|
-| (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
-
-**Web UI — Timeline**
-
-| Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
-|-----------------|-----------------|-----|-----|-----|
-| (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
 
 **Elapsed Time**
 
@@ -471,17 +436,6 @@ C안:
 |-----------------|-----------------|-----|-----|-----|
 | (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
 
-**Web UI — Stage Performance**
-
-| Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
-|-----------------|-----------------|-----|-----|-----|
-| (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
-
-**Web UI — Timeline**
-
-| Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
-|-----------------|-----------------|-----|-----|-----|
-| (캡처) | (캡처) | (캡처) | (캡처) | (캡처) |
 
 **Elapsed Time**
 
