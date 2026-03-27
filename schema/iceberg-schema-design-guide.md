@@ -1107,10 +1107,12 @@ range 모드에서 par_b Sort Order 1순위 시 Data Skipping 동작:
 **B안 적용 시 DDL 변경**
 
 ```sql
--- Partition Evolution: day(ts) → hour(ts), par_b 제거
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD day(ts);
+-- Partition Evolution: day(ts),par_a,par_b → hour(ts),par_a
+-- DROP 순서: par_b → par_a → day(ts), ADD 순서: hour(ts) → par_a (파티션 순서 보장)
 ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
-ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD hour(ts);
+ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_a;
+ALTER TABLE catalog.db.TABLE_A REPLACE PARTITION FIELD day(ts) WITH hour(ts);
+ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD par_a;
 
 -- Sort Order 변경: par_b를 1순위로 추가
 ALTER TABLE catalog.db.TABLE_A
@@ -1149,8 +1151,7 @@ Compaction: A안과 동일 (1시간 + 1일 단위 배치)
 
 ```sql
 -- Partition Evolution: identity → bucket 전환
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
-ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD bucket(16, par_b);
+ALTER TABLE catalog.db.TABLE_A REPLACE PARTITION FIELD par_b WITH bucket(16, par_b);
 
 -- 기존 데이터 재정리
 CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
@@ -1238,7 +1239,7 @@ D안 (bucket hash_val, N=64):
 -- 1) hash_val 컬럼 추가
 ALTER TABLE catalog.db.TABLE_A ADD COLUMN hash_val bigint;
 
--- 2) Partition Evolution
+-- 2) Partition Evolution: par_b 제거, hash_val bucket 추가
 ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
 ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD bucket(64, hash_val);
 
@@ -1313,8 +1314,7 @@ WHERE par_b >= 'ABC' AND par_b < 'ABD'
 
 ```sql
 -- Partition Evolution: identity → truncate 전환
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
-ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD truncate(3, par_b);
+ALTER TABLE catalog.db.TABLE_A REPLACE PARTITION FIELD par_b WITH truncate(3, par_b);
 
 -- 기존 데이터 재정리
 CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
