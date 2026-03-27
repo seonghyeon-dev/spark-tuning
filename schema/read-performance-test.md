@@ -55,7 +55,78 @@
 | **Peak User Memory** | 단일 Worker에서 최대 사용 메모리 ([Memory Management](https://trino.io/docs/current/admin/properties-memory-management.html)의 `query.max-memory-per-node` 제한) | 스캔 범위가 클수록 증가. 메모리 부담 비교 |
 | **Cumulative User Memory** | 메모리 사용량 × 시간 적분 (GB·s). AVG(usage) × duration으로 근사 산출 | 지속적 메모리 부하 지표 |
 
-> **성능 비교 핵심**: 동일 쿼리 결과(Output Rows 동일)를 얻기 위해 **Physical Input Rows/Data가 얼마나 적은지**가 파티션 전략의 효과를 직접 반영한다. Physical Input이 적으면 프루닝이 잘 된 것이고, 이에 비례하여 CPU Time과 Elapsed Time도 감소한다. ([EXPLAIN ANALYZE 참고](https://trino.io/docs/current/sql/explain-analyze.html))
+> **성능 비교 핵심**: 동일 쿼리 결과(Output Rows 동일)를 얻기 위해 **Physical Input Rows/Data가 얼마나 적은지**가 파티션 전략의 효과를 직접 반영한다. Physical Input이 적으면 프루닝이 잘 된 것이고, 이에 비례하여 CPU Time과 Elapsed Time도 감소한다.
+
+**EXPLAIN ANALYZE 결과 해석 가이드** ([공식 문서](https://trino.io/docs/current/sql/explain-analyze.html))
+
+EXPLAIN ANALYZE는 쿼리를 실제 실행한 뒤 분산 실행 계획과 각 단계별 비용을 출력한다. 출력 구조는 다음과 같다:
+
+```
+Trino version: 4xx
+Queued: 374.17us, Analysis: 190.96ms, Planning: 179.03ms, Execution: 3.06s
+                                        ↑                    ↑              ↑
+                                   쿼리 분석 시간      실행 계획 수립     실제 실행 시간
+
+Fragment 1 [SINGLE]
+    CPU: 22.58ms, Scheduled: 96.72ms, Blocked: 46.21s (Input: 23.06s, Output: 0.00ns)
+    Input: 1000 rows (37.11kB); per task: avg 1000.00 std.dev. 0.00
+        ↓
+    - Output[...] => [column_list]
+        - Aggregate(FINAL)[...] => [column_list]
+            CPU: 8.00ms (3.51%), Scheduled: 63.00ms (15.11%), ...
+            - LocalExchange => [column_list]
+                - RemoteSource[2] => [column_list]
+
+Fragment 2 [HASH]
+    CPU: ..., Scheduled: ..., Blocked: ...
+    Input: 818058 rows (...)
+        - Aggregate(PARTIAL)[...] => [column_list]
+            - ScanFilterProject[table = ..., filterPredicate = ...]
+                CPU: ..., Scheduled: ..., ...
+                Input avg.: 818058.00 rows, Input std.dev.: 0.00%
+                Filtered: 45.46%
+                Physical input: 4.51MB
+```
+
+**헤더 (Queued / Analysis / Planning / Execution)**
+
+| 항목 | 설명 |
+|------|------|
+| Queued | 실행 큐 대기 시간 |
+| Analysis | SQL 구문 분석 및 의미 검증 시간 |
+| Planning | 실행 계획 수립 시간 (메타데이터 읽기 포함) |
+| Execution | 실제 실행 시간 (Planning 이후) |
+
+**Fragment 헤더**
+
+| 항목 | 설명 | 해석 |
+|------|------|------|
+| Fragment N [TYPE] | 분산 실행 단계. 번호가 클수록 먼저 실행됨 (데이터 소스가 마지막 Fragment) | [SINGLE]: 1개 노드, [HASH]: 해시 분배, [SOURCE]: 데이터 소스 |
+| CPU | 해당 Fragment에서 사용한 실제 CPU 시간 | 연산 비용 |
+| Scheduled | 프로세서에 스케줄된 총 시간 (CPU + context switch 대기) | CPU 대비 크면 자원 경합 발생 |
+| Blocked | 데이터 전송 대기 시간 (Input: 수신 대기, Output: 송신 대기) | Blocked >> CPU면 I/O 병목 |
+| Input | Fragment에 입력된 행 수 / 크기 | 스캔 범위 지표 |
+| per task: avg / std.dev. | 태스크당 평균 입력 행 수와 표준편차 | std.dev.가 크면 데이터 Skew |
+
+**주요 Operator**
+
+| Operator | 설명 | 성능 비교 시 주목점 |
+|----------|------|-------------------|
+| **ScanFilterProject** | 테이블 스캔 + 필터 + 프로젝션을 합친 연산자 | `Physical input`: 스토리지에서 읽은 실제 데이터 크기, `Filtered`: 필터로 제거된 행 비율 |
+| **Aggregate (PARTIAL/FINAL)** | 부분/최종 집계 연산 | PARTIAL은 Worker별, FINAL은 Coordinator에서 실행 |
+| **LocalExchange** | Worker 내에서 데이터 재분배 | 로컬 셔플 비용 |
+| **RemoteSource** | 다른 Fragment에서 데이터 수신 | Fragment 간 네트워크 전송 |
+
+**ScanFilterProject 핵심 지표**
+
+| 지표 | 설명 | 파티션 전략 비교 시 해석 |
+|------|------|----------------------|
+| **Physical input** | 스토리지에서 실제 읽은 바이트 수 | **핵심 지표**. 파티션 프루닝/Data Skipping이 잘 되면 감소 |
+| **Filtered** | 스캔 후 필터로 제거된 행 비율 (%) | 높으면 불필요한 데이터를 많이 읽은 것. 프루닝이 잘 되면 낮아짐 |
+| **Input avg. / std.dev.** | 태스크당 평균 입력 행 수와 표준편차 | std.dev.가 높으면 데이터 Skew. 파티션 간 데이터 편차 확인 |
+| **CPU / Scheduled (%)** | 전체 쿼리 대비 이 연산자의 비용 비율 | 스캔이 차지하는 비율이 높으면 I/O 바운드 |
+
+> **비교 방법**: 동일 쿼리를 각 전략 테이블에서 실행한 뒤, ScanFilterProject의 `Physical input`과 `Filtered` 비율을 비교한다. Physical input이 적고 Filtered가 낮을수록 해당 전략의 파티션 프루닝/Data Skipping이 효과적이다. `Input std.dev.`가 높은 전략은 Skew 문제가 있음을 의미한다.
 
 ---
 
