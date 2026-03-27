@@ -38,24 +38,24 @@
 | Stage Performance | Operator별 throughput, CPU, Wall Time |
 | Timeline | Parallelism, Input rows/s, Physical Input Bytes |
 
-**Trino Web UI Overview 주요 메트릭 해석**
+**Trino Web UI Overview 주요 메트릭 해석** ([Web UI](https://trino.io/docs/current/admin/web-interface.html) · [EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html) · [Query Management Properties](https://trino.io/docs/current/admin/properties-query-management.html))
 
 | 메트릭 | 설명 | 성능 비교 시 해석 |
 |--------|------|-----------------|
-| **Elapsed Time** | 쿼리 제출부터 완료까지 총 소요시간 (wall-clock) | 사용자 체감 성능. 최종 비교 기준 |
-| **Planning Time** | 쿼리 계획 수립 소요시간 | 메타데이터 크기(파일 수)에 비례. 파일 수가 많으면 증가 |
-| **Execution Time** | Planning 이후 실제 실행 시간 | I/O + 연산 시간. Elapsed - Planning ≈ Execution |
-| **CPU Time** | 전체 Worker에서 사용한 누적 CPU 시간 | 연산 작업량 지표. 스캔 데이터가 많으면 증가 |
-| **Scheduled Time** | 태스크가 프로세서에 스케줄된 총 시간 | CPU Time / Scheduled Time = CPU 활용률 |
-| **Blocked Time** | 데이터 전송 대기 시간 (전체 스레드 합산) | Blocked >> CPU면 I/O 병목, Blocked << CPU면 연산 병목 |
-| **Physical Input Rows** | 스토리지에서 실제 읽은 행 수 | 파티션 프루닝·Data Skipping 효과 직접 반영. **핵심 비교 지표** |
-| **Physical Input Data** | 스토리지에서 전송된 압축 상태의 바이트 수 | 실제 I/O 양. 적을수록 프루닝이 잘 동작한 것 |
+| **Elapsed Time** | 쿼리 제출부터 완료까지 총 소요시간 (wall-clock). Planning + Execution + 대기시간 포함 | 사용자 체감 성능. 최종 비교 기준 |
+| **Planning Time** | 쿼리 계획 수립 소요시간. [`query.max-planning-time`](https://trino.io/docs/current/admin/properties-query-management.html) 참조 | 메타데이터 크기(파일 수)에 비례. 파일 수가 많으면 증가 |
+| **Execution Time** | Planning 이후 실제 실행 시간. 분석·계획·대기시간 제외 ([`query.max-execution-time`](https://trino.io/docs/current/admin/properties-query-management.html) 참조) | I/O + 연산 시간 |
+| **CPU Time** | 전체 Worker에서 사용한 누적 CPU 시간 ([EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)의 Fragment별 CPU time 합산) | 연산 작업량 지표. 스캔 데이터가 많으면 증가 |
+| **Scheduled Time** | 태스크가 프로세서에 스케줄된 총 시간. CPU 사용 + context switch 대기 포함 ([EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)의 scheduled time) | CPU Time / Scheduled Time = CPU 활용률 |
+| **Blocked Time** | Stage 간 데이터 전송 대기 시간 (Input/Output blocking 합산, 전체 스레드 누적) | Blocked >> CPU면 I/O 병목, Blocked << CPU면 연산 병목 |
+| **Physical Input Rows** | 스토리지에서 실제 읽은 행 수 ([EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)의 Physical input rows) | 파티션 프루닝·Data Skipping 효과 직접 반영. **핵심 비교 지표** |
+| **Physical Input Data** | 스토리지에서 전송된 바이트 수 (압축 상태) | 실제 I/O 양. 적을수록 프루닝이 잘 동작한 것 |
 | **Input Rows / Data** | Connector 최적화 후 처리된 논리적 행 수 / 크기 | Physical과 차이가 크면 압축·인코딩 효율이 높은 것 |
 | **Output Rows / Data** | 최종 결과 행 수 / 크기 | 모든 전략에서 동일해야 함 (같은 쿼리이므로) |
-| **Peak User Memory** | 단일 Worker에서 최대 사용 메모리 | 스캔 범위가 클수록 증가. 메모리 부담 비교 |
-| **Cumulative User Memory** | 메모리 사용량 × 시간 적분 (GB·s) | 지속적 메모리 부하 지표 |
+| **Peak User Memory** | 단일 Worker에서 최대 사용 메모리 ([Memory Management](https://trino.io/docs/current/admin/properties-memory-management.html)의 `query.max-memory-per-node` 제한) | 스캔 범위가 클수록 증가. 메모리 부담 비교 |
+| **Cumulative User Memory** | 메모리 사용량 × 시간 적분 (GB·s). AVG(usage) × duration으로 근사 산출 | 지속적 메모리 부하 지표 |
 
-> **성능 비교 핵심**: 동일 쿼리 결과(Output Rows 동일)를 얻기 위해 **Physical Input Rows/Data가 얼마나 적은지**가 파티션 전략의 효과를 직접 반영한다. Physical Input이 적으면 프루닝이 잘 된 것이고, 이에 비례하여 CPU Time과 Elapsed Time도 감소한다.
+> **성능 비교 핵심**: 동일 쿼리 결과(Output Rows 동일)를 얻기 위해 **Physical Input Rows/Data가 얼마나 적은지**가 파티션 전략의 효과를 직접 반영한다. Physical Input이 적으면 프루닝이 잘 된 것이고, 이에 비례하여 CPU Time과 Elapsed Time도 감소한다. ([EXPLAIN ANALYZE 참고](https://trino.io/docs/current/sql/explain-analyze.html))
 
 ---
 
