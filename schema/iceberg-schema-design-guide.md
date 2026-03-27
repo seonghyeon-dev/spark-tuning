@@ -317,39 +317,45 @@ ORDER BY par_a;
 
 ### 2.5 파티션 변경 테스트 방법
 
-> 참고: [Iceberg Partition Evolution](https://iceberg.apache.org/docs/latest/evolution/#partition-evolution) · [rewrite_data_files Procedure](https://iceberg.apache.org/docs/latest/spark-procedures/#rewrite_data_files)
+> 참고: [Iceberg Partition Evolution](https://iceberg.apache.org/docs/latest/evolution/#partition-evolution) · [Spark DDL](https://iceberg.apache.org/docs/latest/spark-ddl/) · [rewrite_data_files Procedure](https://iceberg.apache.org/docs/latest/spark-procedures/#rewrite_data_files)
 
-MinIO 스토리지 용량 제한으로 인해 새 테이블을 생성하지 않고, **기존 테이블의 파티션 설정을 변경하여 테스트**를 진행한다. 이것이 가능한 이유는 Iceberg의 **Partition Evolution** 기능 때문이다.
+MinIO 스토리지 용량 제한으로 인해 새 테이블을 생성하지 않고, **기존 테이블의 파티션/Sort Order 설정을 변경하여 테스트**를 진행한다. Iceberg의 **Partition Evolution**과 **Sort Order Evolution**은 메타데이터만 변경하는 연산으로, 기존 데이터 파일에 영향을 주지 않는다. 변경 후 Compaction(`rewrite_data_files`)을 실행하면 기존 데이터도 새 구조로 재정리된다.
 
-**왜 새 테이블이 필요 없는가?**
+**파티션 변경 DDL**
 
-Iceberg의 Partition Evolution은 메타데이터만 변경한다. 기존 데이터 파일은 그대로 유지되며, 이후 적재되는 데이터부터 새 파티션 구조가 적용된다. Compaction(`rewrite_data_files`)을 실행하면 기존 데이터도 새 파티션 구조로 재정리된다.
+```sql
+-- 방법 1: DROP + ADD (별도 연산)
+ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
+ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD truncate(3, par_b);
 
+-- 방법 2: REPLACE (단일 atomic 연산, 권장)
+ALTER TABLE catalog.db.TABLE_A REPLACE PARTITION FIELD par_b WITH truncate(3, par_b);
 ```
-[기존 상태]
-  테이블: identity(par_b), 248개 파티션, 23,789개 파일
-      ↓
-[1단계: ALTER TABLE] — 메타데이터만 변경, 기존 파일 유지
-  ALTER TABLE ... DROP PARTITION FIELD par_b;
-  ALTER TABLE ... ADD PARTITION FIELD truncate(3, par_b);
-      ↓
-[2단계: Compaction] — 기존 데이터를 새 파티션 구조로 재정리
-  CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
-      ↓
-[결과]
-  테이블: truncate(3, par_b), 135개 파티션, 재정리된 파일
+
+> `REPLACE PARTITION FIELD`는 DROP + ADD를 단일 메타데이터 업데이트로 수행하므로 더 안전하다. 단, 트랜스폼 유형이 완전히 다른 경우(예: identity → hour 시간 파티션 변경)에는 DROP + ADD를 사용한다.
+
+**Sort Order 변경 DDL**
+
+```sql
+-- Sort Order 변경 (기존 설정을 덮어쓴다)
+ALTER TABLE catalog.db.TABLE_A WRITE ORDERED BY sort_a ASC NULLS FIRST, sort_b ASC NULLS FIRST, sort_c ASC NULLS FIRST;
+
+-- B안 전환 시: par_b를 Sort Order 1순위로 추가
+ALTER TABLE catalog.db.TABLE_A WRITE ORDERED BY par_b ASC NULLS FIRST, sort_a ASC NULLS FIRST, sort_b ASC NULLS FIRST, sort_c ASC NULLS FIRST;
 ```
+
+> Sort Order 변경은 이후 쓰기/Compaction에만 적용된다. 기존 데이터의 물리적 정렬은 변경되지 않으며, Compaction 실행 시 새 Sort Order로 재정렬된다.
 
 **테스트 절차**
 
 ```sql
--- 1) 현재 파티션 구조의 파일/크기 현황 기록 (기준값)
+-- 1) 현재 파일/크기 현황 기록 (기준값)
 SELECT partition, COUNT(*) AS files, SUM(file_size_in_bytes)/1024/1024 AS size_mb
 FROM catalog.db.TABLE_A.files GROUP BY partition ORDER BY size_mb DESC;
 
--- 2) 파티션 트랜스폼 변경 (예: identity → truncate)
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
-ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD truncate(3, par_b);
+-- 2) 파티션/Sort Order 변경 (예: A안 → C안)
+ALTER TABLE catalog.db.TABLE_A REPLACE PARTITION FIELD par_b WITH bucket(16, par_b);
+-- Sort Order는 A안/C안 동일(sort_a, sort_b, sort_c)이므로 변경 불필요
 
 -- 3) 기존 데이터 재정리 (Compaction)
 CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
@@ -359,8 +365,7 @@ SELECT partition, COUNT(*) AS files, SUM(file_size_in_bytes)/1024/1024 AS size_m
 FROM catalog.db.TABLE_A.files GROUP BY partition ORDER BY size_mb DESC;
 
 -- 5) 테스트 완료 후 원복 (필요 시)
-ALTER TABLE catalog.db.TABLE_A DROP PARTITION FIELD par_b;
-ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD par_b;
+ALTER TABLE catalog.db.TABLE_A REPLACE PARTITION FIELD par_b WITH par_b;
 CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
 ```
 

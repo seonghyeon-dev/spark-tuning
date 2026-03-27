@@ -15,10 +15,10 @@
 
 | 항목 | Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
 |------|-----------------|-----------------|-----|-----|-----|
-| 포맷 | | Hive | Iceberg | Iceberg | Iceberg |
-| 파티션 | | (현행 설정) | `day(ts)`, `par_a`, `par_b` | `hour(ts)`, `par_a` | `day(ts)`, `par_a`, `bucket(16, par_b)` |
-| Sort Order | | — | `sort_a`, `sort_b`, `sort_c` | `par_b`, `sort_a`, `sort_b`, `sort_c` | `sort_a`, `sort_b`, `sort_c` |
-| distribution-mode | | — | `range` | `range` | `range` |
+| 포맷 | Hive (TextFile/CSV) | Hive (ORC) | Iceberg (Parquet) | Iceberg (Parquet) | Iceberg (Parquet) |
+| 파티션 | DT(날짜), sort_b | DT(날짜) | `day(ts)`, `par_a`, `par_b` | `hour(ts)`, `par_a` | `day(ts)`, `par_a`, `bucket(16, par_b)` |
+| Sort Order | — | — | `sort_a`, `sort_b`, `sort_c` | `par_b`, `sort_a`, `sort_b`, `sort_c` | `sort_a`, `sort_b`, `sort_c` |
+| distribution-mode | — | — | `range` | `range` | `range` |
 
 **공통 조건**
 
@@ -59,27 +59,30 @@
 
 ---
 
-## 2. Compaction 후 파티션 분포
+## 2. 파티션 분포
 
-1일치 데이터(2026-03-18) 기준, `spark.sql.iceberg.advisory-partition-size = 768MB`로 Compaction 후 측정 결과.
+1일치 데이터(2026-03-18) 기준. Iceberg는 `spark.sql.iceberg.advisory-partition-size = 768MB`로 Compaction 후 측정.
+
+> **데이터 보관 현황**: Hive-raw는 10일치, Hive-orc는 3개월치 운영 중. A안/B안/C안은 1일치 테스트 데이터만 존재. 아래 통계는 모두 **1일치 기준**.
 
 | 항목 | Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
 |------|-----------------|-----------------|-----|-----|-----|
-| 스토리지 | | HDFS (블록 128MB) | S3 (MinIO) | S3 (MinIO) | S3 (MinIO) |
-| 파일 포맷 | | ORC | Parquet | Parquet | Parquet |
-| 파티션 수 | | 1 (dt=날짜) | 253 | 96 | 64 |
-| 총 파일 수 | | 1,008 | 1,985 | 1,823 | 1,847 |
-| 총 크기 | | 4.9TB | 912.6GB | 912.7GB | 912.6GB |
-| 파일 크기 avg | | 5.0GB | 172.9MB | 497.9MB | 396.7MB |
-| 파일 크기 min | | 2.2GB | 0.6MB | 153.5MB | 0.8MB |
-| 파일 크기 max | | 8.9GB | 718.2MB | 691.8MB | 719.9MB |
-| 파티션당 파일 수 (max/min) | | — | 449 / 1 | 42 / 1 | 488 / 1 |
-| 파일 1개 파티션 수 | | — | 190 | 22 | 22 |
-| 그 중 384MB 미만 | | — | 182 | 2 | 18 |
+| 스토리지 | HDFS (블록 128MB) | HDFS (블록 128MB) | S3 (MinIO) | S3 (MinIO) | S3 (MinIO) |
+| 파일 포맷 | TextFile (CSV) | ORC | Parquet | Parquet | Parquet |
+| 파티션 | DT(날짜), sort_b | DT(날짜) | day(ts), par_a, par_b | hour(ts), par_a | day(ts), par_a, bucket(16, par_b) |
+| 총 파일 수 | 758,856 | 1,009 | 1,985 | 1,823 | 1,847 |
+| 총 크기 | 15.3TB | 4.9TB | 912.6GB | 912.7GB | 912.6GB |
+| 파일 크기 avg | 21.2MB | 5.0GB | 172.9MB | 497.9MB | 396.7MB |
+| 파일 크기 min | 5.0MB | 2.2GB | 0.6MB | 153.5MB | 0.8MB |
+| 파일 크기 max | 7,408.9MB | 8.9GB | 718.2MB | 691.8MB | 719.9MB |
+| 파티션당 파일 수 (max/min) | — | — | 449 / 1 | 42 / 1 | 488 / 1 |
+| 파일 1개 파티션 수 | — | — | 190 | 22 | 22 |
+| 그 중 384MB 미만 | — | — | 182 | 2 | 18 |
 
 > **small file 기준**: Iceberg [`SizeBasedFileRewriter`](https://iceberg.apache.org/javadoc/1.4.1/org/apache/iceberg/actions/SizeBasedFileRewriter.html)의 `MIN_FILE_SIZE_DEFAULT_RATIO = 0.75` 기준, **384MB 미만이 Compaction 대상(small file)**.
 >
-> - **Hive-orc**: 수직분할 4개 테이블의 합산 데이터(4.9TB). Iceberg는 그 중 1개 테이블(TABLE_A)만 대상이므로 직접적인 크기 비교 불가. 파티션이 날짜 1개뿐이라 세부 필터 시 전체 스캔 필요
+> - **Hive-raw**: TextFile(CSV), 압축 없음. sort_b 파티션(Cardinality 25,820)으로 파일이 극도로 세분화되어 1일 758,856개. 10일치 보관
+> - **Hive-orc**: ORC 압축으로 4.9TB. 수직분할 4개 테이블의 합산 데이터이므로 Iceberg(TABLE_A 1개)와 직접적인 크기 비교 불가. 파티션이 날짜 1개뿐이라 세부 필터 시 전체 스캔 필요. 3개월치 보관
 > - **A안**: 구조적 Skew 심각. 파일 1개 파티션 190개 중 182개가 384MB 미만 — 데이터가 적은 par_b 파티션이 원인이며, Compaction으로도 해결 불가
 > - **B안**: avg 497.9MB로 목표에 근접하고 min 153.5MB로 전 전략 중 가장 균등. 384MB 미만 파일은 단 2개로 실질적 small file 문제 없음
 > - **C안**: bucket(16)으로 par_b Skew를 분산하지만, bucket 내 데이터 편차로 min 0.8MB 발생. 384MB 미만 파일이 18개로 A안(182개)보다 대폭 개선되었으나 B안(2개)보다는 많음
