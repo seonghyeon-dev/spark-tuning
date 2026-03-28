@@ -50,7 +50,7 @@
 | **Physical Input Data** | 스토리지에서 전송된 바이트 수 (압축 상태) | 실제 I/O 양. 적을수록 프루닝이 잘 동작한 것 |
 | **Input Rows / Data** | Connector 최적화 후 처리된 논리적 행 수 / 크기 | Physical과 차이가 크면 압축·인코딩 효율이 높은 것 |
 | **Output Rows / Data** | 최종 결과 행 수 / 크기 | 모든 전략에서 동일해야 함 (같은 쿼리이므로) |
-| **Peak User Memory** | 단일 Worker에서 최대 사용 메모리 ([Memory Management](https://trino.io/docs/current/admin/properties-memory-management.html)의 `query.max-memory-per-node` 제한) | 스캔 범위가 클수록 증가. 메모리 부담 비교 |
+| **Peak User Memory** | 단일 Worker에서 최대 사용 메모리 ([Resource Management](https://trino.io/docs/current/admin/properties-resource-management.html)의 `query.max-memory-per-node` 제한) | 스캔 범위가 클수록 증가. 메모리 부담 비교 |
 | **Cumulative User Memory** | 메모리 사용량 × 시간 적분 (GB·s). AVG(usage) × duration으로 근사 산출 | 지속적 메모리 부하 지표 |
 
 > **성능 비교 핵심**: 동일 쿼리 결과(Output Rows 동일)를 얻기 위해 **Physical Input Rows/Data가 얼마나 적은지**가 파티션 전략의 효과를 직접 반영한다. Physical Input이 적으면 프루닝이 잘 된 것이고, 이에 비례하여 CPU Time과 Elapsed Time도 감소한다.
