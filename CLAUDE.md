@@ -34,7 +34,8 @@
 ### 대상 테이블 (TABLE_A)
 
 - 컬럼 수: 19개 (timestamp_ntz, string, double, integer, array<integer>, array<double>, array<string>)
-- 파티션 / Sort Order: 테스트 결과에 따라 변동 가능
+- 파티션: `hour(ts)`, `par_a` (B안 — 읽기 성능 테스트 최우수)
+- Sort Order: `sort_a`, `sort_c`
 - array 타입 컬럼 8개: `write.metadata.metrics.column.*` = `none`
 - `write.distribution-mode`: `range`
 - 조회 패턴: ts, par_a, par_b, sort_a, sort_b, sort_c — **6개 모두 필수**
@@ -57,14 +58,15 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 - **상태**: 7개 설정 확정, 벤치마크 검증 완료
 - **대기**: 파티션/Sort Order 최종 확정 후 벤치마크 재검증
 
-## 작업 2: Iceberg 스키마 설계 — 테스트 진행 중
+## 작업 2: Iceberg 스키마 설계 — B안 확정, 문서 리팩토링 완료
 
 - **산출물**: `schema/iceberg-schema-design-guide.md`
-- **상태**: 5개 전략(A~E안) 분석 완료, 읽기 성능 비교 테스트 진행 중
-- **테스트 현황** (`schema/read-performance-test.md`):
-  - Hive-orc(as-is) vs A안 vs B안 비교 중, 다른 전략도 추가 예정
-  - 초기 테스트 결과: A안 조회 성능 우위 (par_b 파티션 프루닝 > B안 Data Skipping)
-  - B안은 파일 크기 균등 (avg 495.7MB), A안은 Compaction 후에도 Skew (min 0.6MB)
+- **상태**: B안 확정 (`hour(ts)`, `par_a` / `sort_a`, `sort_c`), 전체 문서 B안 기준으로 리팩토링 완료
+- **읽기 성능 테스트 결과** (`schema/read-performance-test.md`):
+  - Hive-raw, Hive-orc, A안, B안, C안 5개 전략 비교 완료
+  - **B안이 4개 테스트 케이스 전부 1위** (A안 대비 5~31% 빠름)
+  - 초기 가설(A안 identity 프루닝 > B안 Data Skipping)은 실측에서 부정됨
+- **Sort Order**: `sort_a`, `sort_c`
 
 ## 파일 구조
 

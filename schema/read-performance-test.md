@@ -17,7 +17,7 @@
 |------|-----------------|-----------------|-----|-----|-----|
 | 포맷 | Hive (TextFile/CSV) | Hive (ORC) | Iceberg (Parquet) | Iceberg (Parquet) | Iceberg (Parquet) |
 | 파티션 | DT(날짜), sort_b | DT(날짜) | `day(ts)`, `par_a`, `par_b` | `hour(ts)`, `par_a` | `day(ts)`, `par_a`, `bucket(16, par_b)` |
-| Sort Order | — | — | `sort_a`, `sort_b`, `sort_c` | `par_b`, `sort_a`, `sort_b`, `sort_c` | `sort_a`, `sort_b`, `sort_c` |
+| Sort Order | — | — | `sort_a`, `sort_b`, `sort_c` | `sort_a`, `par_b`, `sort_b`, `sort_c` | `sort_a`, `sort_b`, `sort_c` |
 | distribution-mode | — | — | `range` | `range` | `range` |
 
 **공통 조건**
@@ -53,7 +53,11 @@
 | **Peak User Memory** | 단일 Worker에서 최대 사용 메모리 ([Resource Management](https://trino.io/docs/current/admin/properties-resource-management.html)의 `query.max-memory-per-node` 제한) | 스캔 범위가 클수록 증가. 메모리 부담 비교 |
 | **Cumulative User Memory** | 메모리 사용량 × 시간 적분 (GB·s). AVG(usage) × duration으로 근사 산출 | 지속적 메모리 부하 지표 |
 
-> **성능 비교 핵심**: 동일 쿼리 결과(Output Rows 동일)를 얻기 위해 **Physical Input Rows/Data가 얼마나 적은지**가 파티션 전략의 효과를 직접 반영한다. Physical Input이 적으면 프루닝이 잘 된 것이고, 이에 비례하여 CPU Time과 Elapsed Time도 감소한다.
+> **성능 비교 핵심**: Physical Input Rows와 Physical Input Data는 다른 것을 측정한다.
+> - **Physical Input Rows**: 프루닝 후 실제 읽은 행 수. **프루닝 효과의 직접 지표**. 적을수록 좋다.
+> - **Physical Input Data**: 스토리지에서 읽은 바이트. 파일 구조(identity partition vs Sort Order Data Skipping)에 따라 같은 Rows에도 Data가 달라질 수 있다. identity partition은 파일 내 유효 데이터만 포함하여 Data가 낮고, Sort Order Data Skipping은 Row Group 단위 읽기로 인접 데이터도 함께 읽어 Data가 높아질 수 있다.
+>
+> Elapsed Time은 Physical Input 외에도 **파일 수(Planning 오버헤드)**, **파일 크기 균등성(I/O 패턴)** 을 종합한 결과이다.
 
 **EXPLAIN ANALYZE 결과 해석 가이드** ([공식 문서](https://trino.io/docs/current/sql/explain-analyze.html))
 
@@ -139,6 +143,7 @@ Fragment 2 [HASH]
 | 스토리지 | HDFS (블록 128MB) | HDFS (블록 128MB) | S3 (MinIO) | S3 (MinIO) | S3 (MinIO) |
 | 파일 포맷 | TextFile (CSV) | ORC | Parquet | Parquet | Parquet |
 | 파티션 | DT(날짜), sort_b | DT(날짜) | day(ts), par_a, par_b | hour(ts), par_a | day(ts), par_a, bucket(16, par_b) |
+| 총 파티션 수 | 27,750 | 1 | 253 | 96 | 64 |
 | 총 파일 수 | 758,856 | 1,009 | 1,985 | 1,823 | 1,847 |
 | 총 크기 | 15.3TB | 4.9TB | 912.6GB | 912.7GB | 912.6GB |
 | 파일 크기 avg | 21.2MB | 5.0GB | 172.9MB | 497.9MB | 396.7MB |
