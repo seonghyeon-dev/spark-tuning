@@ -61,16 +61,7 @@ Airflow DAG
 
 ### 1.2 이 문서의 범위
 
-**다루는 것**
-- Spark Job의 리소스 설정 (`driver-cores`, `driver-memory`, `executor-cores`, `executor-memory`, `num-executors`)
-- Spark SQL 성능 설정 (`spark.sql.shuffle.partitions`, `spark.sql.adaptive.coalescePartitions.parallelismFirst`)
-- 각 설정의 공식 문서 기반 설명, 기본값, 권장값, 근거
-- K8S 환경 리소스 요구사항
-
-**다루지 않는 것**
-- Airflow DAG 로직 및 get_jobs Task 구현 상세
-- Iceberg 테이블 파티셔닝/정렬 전략의 설계 근거 (별도 결정 예정)
-- 애플리케이션 코드 (avro read / Iceberg write 로직)
+Spark Job의 리소스 설정 (`driver-cores`, `driver-memory`, `executor-cores`, `executor-memory`, `num-executors`)과 Spark SQL 성능 설정 (`spark.sql.shuffle.partitions`, `spark.sql.adaptive.coalescePartitions.parallelismFirst`)의 공식 문서 기반 설명, 기본값, 권장값, 근거를 다룬다.
 
 ### 1.3 대상 Iceberg 테이블 스키마
 
