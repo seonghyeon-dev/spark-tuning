@@ -84,7 +84,7 @@ Trino에서 [`TIMESTAMP '2026-03-18'`은 `TIMESTAMP '2026-03-18 00:00:00.000000'
 
 **`ts = DATE '2026-03-18'`**
 
-ts는 `timestamp_ntz` 타입이고 `DATE '2026-03-18'`은 `date` 타입이다. 타입이 다르므로 Trino가 비교를 위해 DATE를 `TIMESTAMP '2026-03-18 00:00:00.000000'`으로 변환한다. 변환 후에는 위와 동일한 자정 정밀 매칭 문제로 결과가 없다.
+ts는 `timestamp_ntz` 타입이고 `DATE '2026-03-18'`은 `date` 타입이다. Trino는 비교 시 [DATE를 TIMESTAMP로 암묵적 변환(implicit cast)](https://trino.io/docs/current/functions/comparison.html)하며, 이때 시간 부분은 0으로 채워진다. 즉 `DATE '2026-03-18'`이 `TIMESTAMP '2026-03-18 00:00:00.000000'`으로 변환되어 위와 동일한 자정 정밀 매칭 문제로 결과가 없다.
 
 **해결**: [`date()`](https://trino.io/docs/current/functions/datetime.html) 함수 또는 범위 조건을 사용한다.
 
@@ -293,7 +293,7 @@ FROM TABLE_A
 WHERE ...;
 ```
 
-TABLE_A는 [Parquet](https://parquet.apache.org/) 포맷으로 저장되어 있다. Parquet는 **컬럼 단위로 데이터를 저장**하는 포맷이므로, SELECT에 명시된 컬럼의 데이터만 스토리지에서 읽는다. `SELECT *`는 19개 컬럼 전체를 읽지만, 필요한 컬럼만 명시하면 **읽는 데이터량이 컬럼 수에 비례하여 감소**한다 (예: 4개 컬럼 SELECT 시 약 4/19 수준).
+Trino는 SELECT 절에 명시된 컬럼만 스토리지에서 읽는 [Projection Pushdown](https://trino.io/docs/current/optimizer/pushdown.html)을 수행한다. TABLE_A는 컬럼 단위로 데이터를 저장하는 Parquet 포맷이므로, `SELECT *`는 19개 컬럼 전체를 읽지만 필요한 컬럼만 명시하면 해당 컬럼의 데이터만 스토리지에서 읽어 **I/O가 감소**한다.
 
 ---
 
