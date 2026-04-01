@@ -134,7 +134,7 @@ WHERE date_trunc('day', ts) = TIMESTAMP '2026-03-11 00:00:00'
 
 ![Constant Folding](images/constant-folding.png)
 
-> Trino는 쿼리 계획 시점에 날짜/시간 표현식을 **구체적인 timestamp 값으로 변환**(Constant Folding)한다. 위 예시에서 `CURRENT_DATE - INTERVAL '7' DAY`가 `2023-03-06 00:00:00.000000`으로 변환되어 Iceberg의 Partition Pruning에 전달된다. `date(ts)`, `date_trunc()` 등도 동일한 방식으로 변환된다.
+> Trino는 쿼리 계획 시점에 `CURRENT_DATE` 같은 상수 표현식을 **구체적인 timestamp 값으로 변환**(Constant Folding)한다. 위 예시에서 `CURRENT_DATE - INTERVAL '7' DAY`가 `2023-03-06 00:00:00.000000`으로 변환되어 Iceberg의 Partition Pruning에 전달된다. `date(ts) = DATE '...'`, `date_trunc('day', ts) = TIMESTAMP '...'` 등의 날짜 함수 조건은 Predicate Unwrapping이라는 별도 최적화로 timestamp 범위 조건으로 변환된다.
 
 > 날짜 조건은 해당일의 24개 시간 파티션을 모두 스캔한다. 이는 정상 동작이며 Partition Pruning이 작동하는 것이다 (전체 날짜를 스캔하는 것이 아니라 해당일만 스캔).
 
@@ -302,11 +302,11 @@ Trino는 SELECT 절에 명시된 컬럼만 스토리지에서 읽는 [Projection
 
 ```sql
 -- ❌ 결과 없음
-WHERE ts = TIMESTAMP '2026-03-11'
+WHERE ts = TIMESTAMP '2026-03-18'
 WHERE ts = DATE '2026-03-18'
 
 -- ✅ 올바른 패턴
-WHERE date(ts) = DATE '2026-03-11'
+WHERE date(ts) = DATE '2026-03-18'
 ```
 
 > 원인과 해결 방법은 [3.1절](#31-ts에-등가-비교를-직접-사용하면-안-되는-이유) 참조.
