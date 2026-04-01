@@ -76,14 +76,17 @@ WHERE ts = DATE '2026-03-18'
 WHERE ts = TIMESTAMP '2026-03-18'
 ```
 
-위 두 조건 모두 결과가 조회되지 않는다.
+위 두 조건 모두 결과가 조회되지 않는다. 원인은 다음과 같다.
 
-| 조건 | 실제 비교 대상 | 결과 없는 이유 |
-|------|-------------|--------------|
-| `ts = DATE '2026-03-18'` | `DATE`와 `timestamp_ntz`는 타입이 다르다. Trino가 DATE를 TIMESTAMP로 변환하면 `2026-03-18 00:00:00.000000`이 되어 아래와 동일한 문제가 발생한다 | 타입 불일치 또는 자정 정밀 매칭 |
-| `ts = TIMESTAMP '2026-03-18'` | `TIMESTAMP '2026-03-18'`은 `TIMESTAMP '2026-03-18 00:00:00.000000'`이다. ts 값이 **정확히 자정(마이크로초 단위)**인 행만 매칭한다. 데이터가 하루 중 다양한 시각에 분포하므로 자정 정밀 매칭에 해당하는 행이 없다 | 자정 정밀 매칭 |
+**`ts = TIMESTAMP '2026-03-18'`**
 
-**해결**: `date()` 함수 또는 범위 조건을 사용한다.
+Trino에서 [`TIMESTAMP '2026-03-18'`은 `TIMESTAMP '2026-03-18 00:00:00.000000'`과 동일](https://trino.io/docs/current/functions/datetime.html)하다. 즉 ts 값이 **2026-03-18 자정(00:00:00.000000)에 마이크로초 단위로 정확히 일치하는 행**만 매칭한다. 실제 데이터는 하루 중 다양한 시각(10:15:32, 14:22:01 등)에 분포하므로 자정에 정확히 일치하는 행이 없어 결과가 없다.
+
+**`ts = DATE '2026-03-18'`**
+
+ts는 `timestamp_ntz` 타입이고 `DATE '2026-03-18'`은 `date` 타입이다. 타입이 다르므로 Trino가 비교를 위해 DATE를 `TIMESTAMP '2026-03-18 00:00:00.000000'`으로 변환한다. 변환 후에는 위와 동일한 자정 정밀 매칭 문제로 결과가 없다.
+
+**해결**: [`date()`](https://trino.io/docs/current/functions/datetime.html) 함수 또는 범위 조건을 사용한다.
 
 ```sql
 -- ✅ 날짜 조회
@@ -131,7 +134,7 @@ WHERE date(ts) BETWEEN DATE '2026-03-11' AND DATE '2026-03-12'
 WHERE date(ts) IN (DATE '2026-03-11', DATE '2026-03-15')
 ```
 
-모두 Partition Pruning이 작동한다. 범위에 포함된 날짜의 시간 파티션만 스캔한다.
+모두 Trino가 내부적으로 timestamp 범위 조건으로 변환하여 [Partition Pruning이 작동](https://trino.io/blog/2023/04/11/date-predicates.html)한다. 범위에 포함된 날짜의 시간 파티션만 스캔한다.
 
 ### 3.4 시간 필터 — 등가 조건
 
@@ -150,7 +153,7 @@ WHERE ts >= TIMESTAMP '2026-03-11 10:00:00'
 
 ### 3.5 시간 필터 — 범위 조건
 
-여러 시간대를 조회할 때 사용한다.
+여러 시간대를 연속으로 조회할 때 사용한다.
 
 ```sql
 -- 08시~12시 (5개 시간 파티션 스캔: 08, 09, 10, 11, 12)
@@ -162,7 +165,22 @@ WHERE ts BETWEEN TIMESTAMP '2026-03-11 08:00:00'
               AND TIMESTAMP '2026-03-11 12:59:59'
 ```
 
-### 3.6 ts 필터 패턴 요약
+### 3.6 시간 필터 — 비연속 조건
+
+연속되지 않는 특정 시간대를 조회할 때 사용한다.
+
+```sql
+-- 10시, 14시, 18시 (3개 시간 파티션만 스캔)
+WHERE date_trunc('hour', ts) IN (
+    TIMESTAMP '2026-03-11 10:00:00',
+    TIMESTAMP '2026-03-11 14:00:00',
+    TIMESTAMP '2026-03-11 18:00:00'
+)
+```
+
+[`date_trunc('hour', ts)`](https://trino.io/docs/current/functions/datetime.html)는 ts의 분/초를 버리고 시간 단위로 잘라내므로, IN 절의 각 시간에 해당하는 파티션만 스캔한다.
+
+### 3.7 ts 필터 패턴 요약
 
 | 상황 | 권장 패턴 | Partition Pruning | 스캔 범위 |
 |------|----------|-------------------|----------|
@@ -183,7 +201,7 @@ WHERE ts BETWEEN TIMESTAMP '2026-03-11 08:00:00'
 | 컬럼 | 최적화 단계 | 포함 시 효과 | 빠뜨릴 때 영향 |
 |------|-----------|------------|--------------|
 | ts | Partition Pruning | 해당 시간/날짜의 파티션만 스캔. 날짜 조건 시 24개 시간 파티션, 시간 조건 시 1개 파티션만 읽음 | **전체 날짜 스캔** — 모든 시간 파티션의 데이터를 읽음 |
-| par_a | Partition Pruning | 해당 값의 파티션만 스캔. par_a Cardinality가 4이므로 **스캔 대상이 1/4로 축소** | **4배 스캔** — 모든 par_a 값의 파티션을 읽음 |
+| par_a | Partition Pruning | 해당 값의 파티션만 스캔. par_a는 4개 값(A/B/C/D)이나 **데이터 분포가 균등하지 않다** (실측: B 43.4%, C 43.1%, A 12.4%, D 1.0%). par_a = 'D' 조건 시 전체의 1%만 스캔하고, par_a = 'B' 조건 시 43.4%를 스캔 | par_a 조건 없으면 **4개 파티션 전체를 읽어** 스캔량이 크게 증가 |
 | sort_a | Data Skipping | 파일마다 저장된 sort_a의 min/max 통계를 WHERE 값과 비교하여, 조건에 해당하지 않는 파일을 읽지 않고 건너뜀. Sort Order **1순위**이므로 파일별 값 범위가 가장 잘 분리되어 있어 **건너뛰는 파일 수가 가장 많다** | **Data Skipping 무효화** — 파티션 내 모든 파일을 읽음. Sort Order 1순위를 빠뜨리면 2순위(sort_c)의 Data Skipping 효과도 크게 감소 |
 | sort_c | Data Skipping | sort_a로 1차 필터링된 파일들 중에서 sort_c의 min/max 통계로 **추가 파일을 건너뜀**. Sort Order **2순위**이므로 1순위(sort_a)만큼 파일 범위가 명확하게 분리되지는 않으나, 추가 건너뛰기 효과를 제공 | sort_c 단독 누락 시 영향은 sort_a 누락보다 작음. 1순위 sort_a의 Data Skipping은 유지됨 |
 
@@ -311,7 +329,7 @@ WHERE date(ts) = DATE '2026-03-11'
 
 > ts는 `hour(ts)` [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **존재하는 모든 날짜의 데이터를 읽는다.**
 
-### 6.3 par_a 조건 누락 — 4배 스캔
+### 6.3 par_a 조건 누락 — 전체 파티션 스캔
 
 ```sql
 -- ❌ par_a 조건 없음 → 모든 par_a 파티션을 읽음
@@ -326,7 +344,7 @@ WHERE date(ts) = DATE '2026-03-11'
   AND sort_c = 'value3';
 ```
 
-> par_a는 identity [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)의 대상이다. par_a Cardinality가 4이므로, 조건을 빠뜨리면 **4개 파티션을 모두 읽어 스캔량이 4배로 증가**한다.
+> par_a는 identity [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)의 대상이다. 조건을 빠뜨리면 **4개 par_a 파티션(A/B/C/D)을 모두 읽는다.** par_a별 데이터 분포가 균등하지 않으므로 (B 43.4%, C 43.1%, A 12.4%, D 1.0%), 조회 대상 par_a 값에 따라 스캔량 차이가 크다.
 
 ### 6.4 sort_a/sort_c 조건 누락 — Data Skipping 무효화
 
