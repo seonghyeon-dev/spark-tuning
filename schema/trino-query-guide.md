@@ -1,7 +1,5 @@
 # TABLE_A Trino 쿼리 가이드
 
-> 참고: [Iceberg Partitioning](https://iceberg.apache.org/docs/latest/partitioning/) · [Trino Date Predicates](https://trino.io/blog/2023/04/11/date-predicates.html) · [Trino Date/Time Functions](https://trino.io/docs/current/functions/datetime.html) · [EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)
-
 ### 목차
 
 - [1. 이 문서의 목적](#1-이-문서의-목적) — 대상 독자, 범위
