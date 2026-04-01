@@ -130,6 +130,12 @@ WHERE date_trunc('day', ts) = TIMESTAMP '2026-03-11 00:00:00'
 
 세 방식 모두 Trino가 내부적으로 timestamp 범위 조건으로 변환하여 **Partition Pruning이 동일하게 작동**한다 ([Trino 블로그: Just the right time date predicates with Iceberg](https://trino.io/blog/2023/04/11/date-predicates.html)). `date()`는 [`CAST(x AS date)`의 alias](https://trino.io/docs/current/functions/datetime.html)이므로 방법 1과 2는 완전히 동일하다. 성능 차이가 없으므로 가장 간결한 `date(ts)`를 권장한다.
 
+**Constant Folding** (이미지 출처: [Trino Blog — Date Predicates](https://trino.io/blog/2023/04/11/date-predicates.html))
+
+![Constant Folding](images/constant-folding.png)
+
+> Trino는 쿼리 계획 시점에 날짜/시간 표현식을 **구체적인 timestamp 값으로 변환**(Constant Folding)한다. 위 예시에서 `CURRENT_DATE - INTERVAL '7' DAY`가 `2023-03-06 00:00:00.000000`으로 변환되어 Iceberg의 Partition Pruning에 전달된다. `date(ts)`, `date_trunc()` 등도 동일한 방식으로 변환된다.
+
 > 날짜 조건은 해당일의 24개 시간 파티션을 모두 스캔한다. 이는 정상 동작이며 Partition Pruning이 작동하는 것이다 (전체 날짜를 스캔하는 것이 아니라 해당일만 스캔).
 
 ### 3.3 날짜 필터 — 범위 조건
