@@ -173,11 +173,9 @@ WHERE ts >= TIMESTAMP '2026-03-11 10:00:00'
 -- 08시~12시 (5개 시간 파티션 스캔: 08, 09, 10, 11, 12)
 WHERE ts >= TIMESTAMP '2026-03-11 08:00:00'
   AND ts <  TIMESTAMP '2026-03-11 13:00:00'
-
--- BETWEEN (주의: 양쪽 끝 포함)
-WHERE ts BETWEEN TIMESTAMP '2026-03-11 08:00:00'
-              AND TIMESTAMP '2026-03-11 12:59:59'
 ```
+
+> 시간 범위 조건은 `>=` + `<` 패턴을 권장한다. `BETWEEN`은 양쪽 끝을 포함하므로 끝 시각을 정확히 지정하기 어렵다 (예: `12:59:59`로 지정하면 `12:59:59.000001~12:59:59.999999` 구간의 데이터가 누락된다).
 
 ### 3.6 시간 필터 — 비연속 조건
 
@@ -192,7 +190,7 @@ WHERE date_trunc('hour', ts) IN (
 )
 ```
 
-[`date_trunc('hour', ts)`](https://trino.io/docs/current/functions/datetime.html)는 ts의 분/초를 버리고 시간 단위로 잘라내므로, IN 절의 각 시간에 해당하는 파티션만 스캔한다.
+IN 절의 각 시간에 해당하는 파티션만 스캔한다.
 
 ### 3.7 ts 필터 패턴 요약
 
@@ -254,10 +252,12 @@ WHERE date_trunc('hour', ts) = TIMESTAMP '2026-03-11 10:00:00'
   AND sort_c = 'value3';
 ```
 
-### 5.3 IN 절
+### 5.3 기타 패턴
+
+ts 필터의 다양한 패턴(날짜 범위, 시간 범위, IN 절, 비연속 시간 등)은 [3절](#3-ts-컬럼-필터링-방법)을 참조하여 WHERE 절을 구성한다. 아래는 par_a IN 절 예시이다.
 
 ```sql
--- par_a 복수 값
+-- par_a 복수 값 조회
 SELECT *
 FROM TABLE_A
 WHERE date(ts) = DATE '2026-03-11'
@@ -266,34 +266,7 @@ WHERE date(ts) = DATE '2026-03-11'
   AND sort_c = 'value3';
 ```
 
-Partition Pruning: IN 절의 각 값에 대해 해당 파티션만 읽는다.
-
-### 5.4 날짜 범위
-
-```sql
--- 3일간 조회
-SELECT *
-FROM TABLE_A
-WHERE date(ts) BETWEEN DATE '2026-03-11' AND DATE '2026-03-13'
-  AND par_a = 'A'
-  AND sort_a = 'value1'
-  AND sort_c = 'value3';
-```
-
-### 5.5 시간 범위
-
-```sql
--- 08시~12시 조회
-SELECT *
-FROM TABLE_A
-WHERE ts >= TIMESTAMP '2026-03-11 08:00:00'
-  AND ts <  TIMESTAMP '2026-03-11 13:00:00'
-  AND par_a = 'A'
-  AND sort_a = 'value1'
-  AND sort_c = 'value3';
-```
-
-### 5.6 SELECT 절 권장사항
+### 5.4 SELECT 절 권장사항
 
 ```sql
 -- 권장: 필요한 컬럼만 명시
@@ -330,7 +303,7 @@ WHERE ts = DATE '2026-03-18'
 WHERE date(ts) = DATE '2026-03-11'
 ```
 
-> `ts = TIMESTAMP '2026-03-11'`은 `ts = TIMESTAMP '2026-03-11 00:00:00.000000'`과 동일하다. 자정(마이크로초 단위)에 정확히 일치하는 행만 매칭하므로 결과가 없다. `ts = DATE '...'`도 타입 변환 후 동일한 문제가 발생한다. 상세 설명은 [3.1절](#31-ts에-등가-비교를-직접-사용하면-안-되는-이유) 참조.
+> 원인과 해결 방법은 [3.1절](#31-ts에-등가-비교를-직접-사용하면-안-되는-이유) 참조.
 
 ### 6.2 ts 조건 누락 — 전체 날짜 스캔
 
@@ -364,7 +337,7 @@ WHERE date(ts) = DATE '2026-03-11'
   AND sort_c = 'value3';
 ```
 
-> par_a는 identity [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)의 대상이다. 조건을 빠뜨리면 **4개 par_a 파티션(A/B/C/D)을 모두 읽는다.** par_a별 데이터 분포가 균등하지 않으므로 (B 43.4%, C 43.1%, A 12.4%, D 1.0%), 조회 대상 par_a 값에 따라 스캔량 차이가 크다.
+> par_a는 identity [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)의 대상이다. 조건을 빠뜨리면 **4개 par_a 파티션(A/B/C/D)을 모두 읽는다.** 데이터 분포와 스캔량 영향은 [4.1절](#41-필수-컬럼-partition-pruning--data-skipping) 참조.
 
 ### 6.4 sort_a/sort_c 조건 누락 — Data Skipping 무효화
 
