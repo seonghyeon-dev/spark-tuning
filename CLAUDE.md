@@ -38,7 +38,8 @@
 - Sort Order: `sort_a`, `sort_c`
 - array 타입 컬럼 8개: `write.metadata.metrics.column.*` = `none`
 - `write.distribution-mode`: `range`
-- 조회 패턴: ts, par_a, par_b, sort_a, sort_b, sort_c — **6개 모두 필수**
+- 조회 패턴: ts, par_a, sort_a, sort_c — **WHERE 필수 4개** (Partition Pruning/Data Skipping 대상). par_b, sort_b는 선택 (Row-level Filter만)
+- par_a 분포 (실측, 2026-03-18 기준): B 43.4%, C 43.1%, A 12.4%, D 1.0% — 균등 분포 아님
 
 ### 워크플로우
 
@@ -67,6 +68,13 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
   - **B안이 4개 테스트 케이스 전부 1위** (A안 대비 5~31% 빠름)
   - 초기 가설(A안 identity 프루닝 > B안 Data Skipping)은 실측에서 부정됨
 - **Sort Order**: `sort_a`, `sort_c`
+
+## 작업 3: Trino 쿼리 가이드 — 완료
+
+- **산출물**: `schema/trino-query-guide.md`
+- **상태**: 완료
+- **대상 독자**: Trino 쿼리 사용자 (Partition Pruning/Data Skipping 비전문가)
+- **핵심 내용**: ts 필터링 방법(date, date_trunc, 범위 조건), WHERE 필수 컬럼, 잘못된 쿼리 패턴
 
 ## 파일 구조
 
