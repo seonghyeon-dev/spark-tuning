@@ -76,5 +76,6 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 │   └── spark-tuning-guide.md          # Spark 튜닝 가이드
 └── schema/
     ├── iceberg-schema-design-guide.md  # Iceberg 스키마 설계 가이드
-    └── read-performance-test.md        # 파티션 전략별 읽기 성능 비교 테스트
+    ├── read-performance-test.md        # 파티션 전략별 읽기 성능 비교 테스트
+    └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
 ```
