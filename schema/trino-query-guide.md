@@ -102,7 +102,7 @@ Trino에서 [`TIMESTAMP '2026-03-18'`은 `TIMESTAMP '2026-03-18 00:00:00.000000'
 
 ts는 `timestamp_ntz` 타입이고 `DATE '2026-03-18'`은 `date` 타입이다. Trino는 비교 시 [DATE를 TIMESTAMP로 암묵적 변환(implicit cast)](https://trino.io/docs/current/functions/comparison.html)하며, 이때 시간 부분은 0으로 채워진다. 즉 `DATE '2026-03-18'`이 `TIMESTAMP '2026-03-18 00:00:00.000000'`으로 변환되어 위와 동일한 자정 정밀 매칭 문제로 결과가 없다.
 
-**해결**: [`date()`](https://trino.io/docs/current/functions/datetime.html) 함수 또는 범위 조건을 사용한다.
+**해결**: `date()` 함수 또는 범위 조건을 사용한다.
 
 ```sql
 -- ✅ 날짜 조회
@@ -130,9 +130,9 @@ WHERE CAST(ts AS DATE) = DATE '2026-03-11'
 WHERE date_trunc('day', ts) = TIMESTAMP '2026-03-11 00:00:00'
 ```
 
-세 방식 모두 Trino가 내부적으로 timestamp 범위 조건으로 변환하여 **Partition Pruning이 동일하게 작동**한다 ([Trino 블로그: Just the right time date predicates with Iceberg](https://trino.io/blog/2023/04/11/date-predicates.html)). `date()`는 [`CAST(x AS date)`의 alias](https://trino.io/docs/current/functions/datetime.html)이므로 방법 1과 2는 완전히 동일하다. 성능 차이가 없으므로 가장 간결한 `date(ts)`를 권장한다.
+세 방식 모두 Trino가 내부적으로 timestamp 범위 조건으로 변환하여 **Partition Pruning이 동일하게 작동**한다. `date()`는 `CAST(x AS date)`의 alias이므로 방법 1과 2는 완전히 동일하다. 성능 차이가 없으므로 가장 간결한 `date(ts)`를 권장한다.
 
-**Constant Folding** (이미지 출처: [Trino Blog — Date Predicates](https://trino.io/blog/2023/04/11/date-predicates.html))
+**Constant Folding**
 
 ![Constant Folding](images/constant-folding.png)
 
@@ -156,7 +156,7 @@ WHERE date(ts) BETWEEN DATE '2026-03-11' AND DATE '2026-03-12'
 WHERE date(ts) IN (DATE '2026-03-11', DATE '2026-03-15')
 ```
 
-모두 Trino가 내부적으로 timestamp 범위 조건으로 변환하여 [Partition Pruning이 작동](https://trino.io/blog/2023/04/11/date-predicates.html)한다. 범위에 포함된 날짜의 시간 파티션만 스캔한다.
+모두 Trino가 내부적으로 timestamp 범위 조건으로 변환하여 Partition Pruning이 작동한다. 범위에 포함된 날짜의 시간 파티션만 스캔한다.
 
 ### 3.4 시간 필터 — 등가 조건
 
@@ -171,7 +171,7 @@ WHERE ts >= TIMESTAMP '2026-03-11 10:00:00'
   AND ts <  TIMESTAMP '2026-03-11 11:00:00'
 ```
 
-[`date_trunc('hour', ts)`](https://trino.io/docs/current/functions/datetime.html)는 ts의 분/초를 버리고 시간 단위로 잘라낸다. Trino가 이를 범위 조건으로 변환하여 Partition Pruning이 작동한다 ([Trino 블로그](https://trino.io/blog/2023/04/11/date-predicates.html)).
+`date_trunc('hour', ts)`는 ts의 분/초를 버리고 시간 단위로 잘라낸다. Trino가 이를 범위 조건으로 변환하여 Partition Pruning이 작동한다.
 
 ### 3.5 시간 필터 — 범위 조건
 
@@ -328,7 +328,7 @@ WHERE date(ts) = DATE '2026-03-11'
   AND sort_c = 'value3';
 ```
 
-> ts는 `hour(ts)` [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **존재하는 모든 날짜의 데이터를 읽는다.**
+> ts는 `hour(ts)` Partition Pruning의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **존재하는 모든 날짜의 데이터를 읽는다.**
 
 ### 6.3 par_a 조건 누락 — 전체 파티션 스캔
 
@@ -345,7 +345,7 @@ WHERE date(ts) = DATE '2026-03-11'
   AND sort_c = 'value3';
 ```
 
-> par_a는 identity [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)의 대상이다. 조건을 빠뜨리면 **4개 par_a 파티션(A/B/C/D)을 모두 읽는다.** 데이터 분포와 스캔량 영향은 [4.1절](#41-필수-컬럼-partition-pruning--data-skipping) 참조.
+> par_a는 identity Partition Pruning의 대상이다. 조건을 빠뜨리면 **4개 par_a 파티션(A/B/C/D)을 모두 읽는다.** 데이터 분포와 스캔량 영향은 [4.1절](#41-필수-컬럼-partition-pruning--data-skipping) 참조.
 
 ### 6.4 sort_a/sort_c 조건 누락 — Data Skipping 무효화
 
@@ -373,9 +373,9 @@ WHERE UPPER(par_a) = 'A'
 WHERE par_a = 'A'
 ```
 
-> 파티션 컬럼(`par_a`)에 함수를 적용하면, Iceberg가 WHERE 값을 파티션 값과 매칭할 수 없어 [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)이 무효화된다. 원본 값으로 비교해야 한다.
+> 파티션 컬럼(`par_a`)에 함수를 적용하면, Iceberg가 WHERE 값을 파티션 값과 매칭할 수 없어 Partition Pruning이 무효화된다. 원본 값으로 비교해야 한다.
 >
-> 단, `ts` 컬럼의 `date()`, `date_trunc()`는 예외이다. Trino가 이 함수들을 **timestamp 범위 조건으로 자동 변환**하여 Partition Pruning이 정상 작동한다 ([Trino 블로그](https://trino.io/blog/2023/04/11/date-predicates.html)).
+> 단, `ts` 컬럼의 `date()`, `date_trunc()`는 예외이다. Trino가 이 함수들을 **timestamp 범위 조건으로 자동 변환**하여 Partition Pruning이 정상 작동한다.
 
 ---
 
@@ -393,7 +393,7 @@ WHERE date(ts) = DATE '2026-03-11'
   AND sort_c = 'value3';
 ```
 
-**확인할 지표 2가지** ([EXPLAIN ANALYZE 공식 문서](https://trino.io/docs/current/sql/explain-analyze.html))
+**확인할 지표 2가지**
 
 | 지표 | 의미 | 좋은 상태 |
 |------|------|----------|
