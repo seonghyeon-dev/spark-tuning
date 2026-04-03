@@ -230,7 +230,7 @@ IN 절의 각 시간에 해당하는 파티션만 스캔한다.
 | 컬럼 | 최적화 단계 | 효과 |
 |------|-----------|------|
 | par_b | Row-level Filter | 파티션/Sort Order에 포함되지 않으므로 **파티션/파일 단위 건너뛰기는 발생하지 않는다**. 파일을 읽은 후 행 단위로 조건에 맞는 행만 반환 |
-| sort_b | Row-level Filter | 동일. Sort Order 적용 여부 미정 |
+| sort_b | Row-level Filter | 동일. Sort Order에 포함되지 않음 |
 
 ---
 
