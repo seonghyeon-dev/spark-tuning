@@ -35,10 +35,11 @@
 
 - 컬럼 수: 19개 (timestamp_ntz, string, double, integer, array<integer>, array<double>, array<string>)
 - 파티션: `hour(ts)`, `par_a` (B안 — 읽기 성능 테스트 최우수)
-- Sort Order: `sort_a`, `sort_c`
+- Sort Order: 미확정 (테스트 결과 조합 간 성능 차이 없음 — 섹션 5 참조)
+- Bloom Filter: 효과 없음, 설정 불필요 (테스트 확인)
 - array 타입 컬럼 8개: `write.metadata.metrics.column.*` = `none`
 - `write.distribution-mode`: `range`
-- 조회 패턴: ts, par_a, sort_a, sort_c — **WHERE 필수 4개** (Partition Pruning/Data Skipping 대상). par_b, sort_b는 선택 (Row-level Filter만)
+- 조회 패턴: 클라이언트에서 6개 컬럼(ts, par_a, par_b, sort_b, sort_a, sort_c) **전부 WHERE에 항상 포함**. 성능 최적화 역할(Partition Pruning/Data Skipping/Row-level Filter)은 Sort Order 확정 후 결정
 - par_a 분포 (실측, 2026-03-18 기준): B 43.4%, C 43.1%, A 12.4%, D 1.0% — 균등 분포 아님
 
 ### 워크플로우
@@ -59,15 +60,15 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 - **상태**: 7개 설정 확정, 벤치마크 검증 완료
 - **대기**: 파티션/Sort Order 최종 확정 후 벤치마크 재검증
 
-## 작업 2: Iceberg 스키마 설계 — B안 확정, 문서 리팩토링 완료
+## 작업 2: Iceberg 스키마 설계 — B안 확정, Sort Order/Bloom Filter 테스트 완료
 
 - **산출물**: `schema/iceberg-schema-design-guide.md`
-- **상태**: B안 확정 (`hour(ts)`, `par_a` / `sort_a`, `sort_c`), 전체 문서 B안 기준으로 리팩토링 완료
+- **상태**: B안 확정 (`hour(ts)`, `par_a`), Sort Order/Bloom Filter 테스트 완료
 - **읽기 성능 테스트 결과** (`schema/read-performance-test.md`):
-  - Hive-raw, Hive-orc, A안, B안, C안 5개 전략 비교 완료
-  - **B안이 4개 테스트 케이스 전부 1위** (A안 대비 5~31% 빠름)
-  - 초기 가설(A안 identity 프루닝 > B안 Data Skipping)은 실측에서 부정됨
-- **Sort Order**: `sort_a`, `sort_c`
+  - 섹션 1~4: Hive-raw, Hive-orc, A안, B안, C안 5개 전략 비교 완료. **B안이 4개 테스트 케이스 전부 1위** (A안 대비 5~31% 빠름)
+  - 섹션 5: Sort Order/Bloom Filter 설정별 비교. 4개 조합 모두 동일 성능, Bloom Filter 효과 없음
+- **Sort Order**: 미확정 (조합 간 성능 차이 없음)
+- **Bloom Filter**: 설정 불필요 (테스트 확인)
 
 ## 작업 3: Trino 쿼리 가이드 — 완료
 

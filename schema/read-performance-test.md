@@ -6,6 +6,7 @@
 - [2. Compaction 후 파티션 분포](#2-compaction-후-파티션-분포) — 전략별 파일/파티션 분포 비교
 - [3. 테스트 결과](#3-테스트-결과) — 쿼리별 EXPLAIN ANALYZE, Web UI 캡처
 - [4. 종합 분석](#4-종합-분석) — 결과 요약, 결론
+- [5. Sort Order / Bloom Filter 설정별 읽기 성능 비교](#5-sort-order--bloom-filter-설정별-읽기-성능-비교) — B안 기준 설정 조합 테스트
 
 ---
 
@@ -244,3 +245,81 @@ C안:
 ## 4. 종합 분석
 
 (테스트 결과 공유 시 작성)
+
+---
+
+## 5. Sort Order / Bloom Filter 설정별 읽기 성능 비교
+
+B안 파티션(`hour(ts)`, `par_a`) 확정 후, 나머지 4개 컬럼(`par_b`, `sort_b`, `sort_a`, `sort_c`)의 Sort Order / Bloom Filter 배치에 따른 읽기 성능 비교.
+
+### 5.1 테스트 개요
+
+- 파티션: `hour(ts)`, `par_a` (확정)
+- WHERE: 6개 컬럼 전부 등가 조건 (`ts`, `par_a`, `par_b`, `sort_b`, `sort_a`, `sort_c`)
+- 쿼리에 CROSS JOIN UNNEST 포함
+
+**테스트 대상 파티션 정보**
+
+| 항목 | 값 |
+|------|-----|
+| 행 수 | 1,587,646 |
+| 파일 수 | 40개 |
+| 파일 크기 | min 424.3MB / avg 517.6MB / max 624.0MB |
+
+**테이블 설정**
+
+| 안 | Sort Order | Bloom Filter |
+|----|-----------|-------------|
+| B안 | sort_a, sort_c | 없음 |
+| B-1안 | sort_b, sort_c | 없음 |
+| B-2안 | par_b, sort_a | sort_c |
+| B-3안 | par_b, sort_b | sort_a, sort_c |
+| 비교군 | 없음 | 없음 |
+
+### 5.2 컬럼별 카디널리티
+
+| 기준 | par_b | sort_b | sort_a | sort_c |
+|------|-------|--------|--------|--------|
+| 하루 전체 | 164 | 27,667 | 34,252 | 613,615 |
+| hour(ts) | 71 | 1,418 | 1,418 | 31,335 |
+| hour+par_a | 35 | 623 | 623 | 13,929 |
+| hour+par_a+par_b | - | 253 | 253 | 6,009 |
+| hour+par_a+sort_b | 1 | - | 1 | 25 |
+| hour+par_a+sort_a | 1 | 1 | - | 25 |
+| hour+par_a+par_b+sort_b/sort_a | - | - | - | 25 |
+
+### 5.3 테스트 결과
+
+| 안 | Physical Input Rows | Physical Input Data | Elapsed Time |
+|----|-------------------|-------------------|-------------|
+| B안 | 8.56k | 55.2MB | ~650ms |
+| B-1안 | 8.56k | 55.2MB | ~650ms |
+| B-2안 | 8.56k | 55.2MB | ~650ms |
+| B-3안 | 8.56k | 55.2MB | ~650ms |
+| 비교군 (Sort/Bloom 없음) | 9.74k | 55.7MB | ~1.1s |
+
+### 5.4 종합 분석
+
+**1. Sort Order 설정 간 차이 없음**
+
+B안~B-3안 모두 Physical Input과 소요시간이 동일하다. 6개 컬럼 전부 등가 조건으로 필터링하는 쿼리에서는 어떤 Sort Order 조합이든 같은 결과를 낸다.
+
+**2. Sort Order 미설정 시 성능 저하**
+
+| | Sort Order 있음 | Sort Order 없음 |
+|---|---|---|
+| Physical Input Rows | 8.56k | 9.74k |
+| Elapsed Time | ~650ms | ~1.1s |
+
+Sort Order가 없으면 파일별 min/max 범위가 넓어져 후보 파일이 증가하고, S3 요청 횟수가 늘어나 소요시간이 증가한다.
+
+**3. Bloom Filter 효과 없음**
+
+Bloom Filter는 쓰기/읽기 모두 정상 설정된 상태이다(`write.parquet.bloom-filter-enabled.column` 설정 완료, Trino 475 `parquet.use-bloom-filter = true` 기본 활성화).
+
+sort_c는 Sort Order에 포함되지 않아 파일 내에서 정렬되지 않고 값이 뒤섞여 있다. 파일당 행 수(39,691)가 sort_c 카디널리티(13,929)보다 크므로 각 파일에 sort_c 대부분의 값이 포함된다. Bloom Filter가 "이 값이 이 Row Group에 없음"을 판단할 수 없어 건너뛸 Row Group이 없다.
+
+### 5.5 결론
+
+- **Sort Order**: 필수. 미설정 대비 소요시간 40% 감소. 컬럼 조합은 성능에 영향 없음
+- **Bloom Filter**: 이 테이블에서는 효과 없음. 설정 불필요
