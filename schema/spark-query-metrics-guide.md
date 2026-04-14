@@ -94,3 +94,32 @@ M개 Task가 병렬로 읽기 (file splits read)
 | Peak Memory | X | O |
 
 **Data Skipping 효과를 정량적으로 비교하려면 Spark History Server가, 실행 엔진 레벨의 리소스 사용 상세를 보려면 Trino Web UI가 적합하다.**
+
+## Spark 메트릭을 Trino 운영 환경의 측정 도구로 활용하기
+
+실제 운영 환경에서는 사용자가 Trino로만 쿼리를 실행한다. 그런데 Trino Web UI에서는 Iceberg 레벨의 Data Skipping 효과(skipped data files, result data files 등)를 직접 확인할 수 없다.
+
+이 문제를 해결하기 위해 **동일한 쿼리를 Spark SQL로 변환하여 실행하고, Spark History Server에서 메트릭을 확인하는 방식**으로 측정할 수 있다.
+
+### 이 방식이 유효한 이유
+
+Data Skipping은 Spark이나 Trino 같은 실행 엔진이 자체적으로 수행하는 것이 아니라, **Iceberg 라이브러리 레벨**에서 동작한다. 구체적으로:
+
+1. 엔진(Spark/Trino)이 WHERE 조건을 Iceberg 라이브러리에 전달
+2. Iceberg 라이브러리가 manifest → data file 메타데이터(파티션 값, 컬럼 min/max)를 확인
+3. 조건에 맞지 않는 파일을 스킵하고, 읽을 파일 목록만 엔진에 반환
+
+이 과정은 **동일한 Iceberg 라이브러리 코드**가 처리하므로, 같은 테이블 + 같은 WHERE 조건이면 스킵되는 파일 수도 동일하다. 따라서 Spark에서 측정한 skipped data files, result data files, total data file size 수치는 Trino에서도 그대로 적용된다.
+
+### 역할 구분
+
+| 역할 | 엔진 |
+|------|------|
+| 실제 운영 (사용자 쿼리) | Trino |
+| 파티션/Bucket 전략별 Data Skipping 효과 측정 | Spark (측정 도구) |
+
+### 주의 사항
+
+Spark 메트릭으로 확인할 수 있는 것은 **Iceberg 레벨의 파일 스킵 효과**이다. Trino 실행 시의 **전체 쿼리 응답 시간**은 Trino 엔진의 실행 최적화(Worker 분산, 메모리 관리 등)에도 영향을 받으므로, 최종 응답 시간 비교는 반드시 Trino에서 직접 측정해야 한다.
+
+다만 "어떤 파티션/Bucket 전략이 불필요한 파일 읽기를 가장 많이 줄이는가"를 비교하는 목적이라면, Spark 메트릭만으로 충분하다.
