@@ -44,7 +44,7 @@
 
 ### 워크플로우
 
-Airflow DAG → avro read → Iceberg append (10분 주기 배치, ~8GB)
+Airflow DAG → avro read → Iceberg append (현재 약 5분 주기, 5분치 ≈ Job History 200 rows. 벤치마크는 10분 주기 ~8GB 기준)
 Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일치) — 모든 전략에서 필수
 
 ### 참고 공식 문서
@@ -83,8 +83,8 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 - **상태**: 설계 확정 (DAG 구현 대기)
 - **배경**: append DAG의 Oracle 조회 기간(최근 1일 — Job History 날짜 파티셔닝 제약)에서 밀려난 WAIT 데이터와, `get_jobs`가 조회하지 않는 FAILED 데이터가 영구 잔류하는 문제
 - **핵심 설계**:
-  - 재처리 DAG (1일 주기, 00:00 KST): D-1 파티션 FAILED + D-2 파티션 WAIT/FAILED 회수. 단일 Spark job, 총 크기 상한 16GB
-  - D-3 이상 잔류는 알림 → 수동 처리 (재처리 DAG의 `target_dt` params로 UI 수동 실행)
+  - 재처리 DAG (1일 주기, 01:00 KST — Job History 지연 적재 대비 1시간 버퍼): D-1 파티션 FAILED + D-2 파티션 WAIT/FAILED 회수. 단일 Spark job, 상한 row 1,000 / 총 크기 16GB (러프 설정, 재검증 필요)
+  - D-3 이상 잔류·상한 초과 이월은 알림 → 수동 처리 (재처리 DAG의 `target_dt` + `start_time`/`end_time` params로 UI 수동 실행)
   - 중복 적재 방지: Spark write 시 snapshot summary에 batch_id 기록(영수증), FAILED 재적재 전 `.snapshots` 확인 → 커밋된 건 DONE 정정
   - batch_id 저장: Job History의 `stat_desc` CLOB 컬럼 재사용 (구 Airflow log URL 용도, 현재 미사용)
   - Compaction: 직접 실행하지 않고 기존 Compaction DAG trigger — daily: `target_dt`, hourly: `start_time`/`end_time` conf 전달. `max_active_runs=1`로 동시 실행 직렬화
