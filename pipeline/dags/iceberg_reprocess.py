@@ -24,23 +24,28 @@ from airflow.utils.trigger_rule import TriggerRule
 KST = pendulum.timezone("Asia/Seoul")
 
 
-# TODO: append DAG이 사용하는 IcebergTable Enum을 그대로 import해서 아래 자리표시자를 제거.
-#       append DAG의 `for table in IcebergTable:` 생성 loop와 동일한 순회 방식을 쓴다 (단일 소스).
-# from <append_dag_공통_모듈> import IcebergTable
-class IcebergTable(str, Enum):
-    """자리표시자 — 실제로는 append DAG의 IcebergTable을 import해서 교체한다."""
+# TODO: append DAG이 사용하는 iceberg.py의 hourly/daily Enum 클래스를 그대로 import해서
+#       아래 자리표시자를 제거 (클래스명은 iceberg.py의 실제 정의에 맞출 것 — 단일 소스).
+# from <공통 모듈>.iceberg import HourlyIcebergTable, DailyIcebergTable
+class HourlyIcebergTable(str, Enum):
+    """자리표시자 — 첫 파티션이 hour인 테이블 그룹 (실제 iceberg.py 정의로 교체)."""
 
     # TABLE_A = "table_a"
+
+
+class DailyIcebergTable(str, Enum):
+    """자리표시자 — 첫 파티션이 day인 테이블 그룹 (실제 iceberg.py 정의로 교체)."""
+
     # TABLE_B = "table_b"
 
 
-def table_group(table: IcebergTable) -> str:
-    """테이블의 Compaction 그룹 반환: 'hourly'(첫 파티션 hour) | 'daily'(첫 파티션 day).
+# append DAG과 동일한 순회 방식. hourly/daily 분류는 소속 Enum 클래스로 결정된다.
+ALL_TABLES = [*HourlyIcebergTable, *DailyIcebergTable]
 
-    TODO: IcebergTable Enum에 그룹 속성이 있으면 그대로 반환하고,
-          없으면 hourly/daily Compaction DAG의 테이블 분류와 동일한 매핑을 연결한다.
-    """
-    raise NotImplementedError
+
+def table_group(table) -> str:
+    """테이블의 Compaction 그룹: 소속 Enum 클래스가 곧 분류다."""
+    return "hourly" if isinstance(table, HourlyIcebergTable) else "daily"
 
 ROW_LIMIT = 1000              # 테이블당 조회 상한 (설계 5.4 — 러프 설정, 재검증 필요)
 SIZE_LIMIT_MB = 16 * 1024     # 테이블당 크기 상한 16GB (설계 5.4 — 러프 설정, 재검증 필요)
@@ -114,11 +119,11 @@ def mark_status_by_job_ids(job_ids: list[str], status: str) -> None:
     max_active_runs=1,      # loop 회차 순차 실행 보장
     params={
         # UI 수동 실행: 1개/여러 개/전체 multi-select (설계 5.1)
-        # 선택지·기본값 모두 IcebergTable Enum에서 생성 — 하드코딩 목록 없음
+        # 선택지·기본값 모두 iceberg.py Enum에서 생성 — 하드코딩 목록 없음
         "tables": Param(
-            default=[t.value for t in IcebergTable],
+            default=[t.value for t in ALL_TABLES],
             type="array",
-            items={"type": "string", "enum": [t.value for t in IcebergTable]},
+            items={"type": "string", "enum": [t.value for t in ALL_TABLES]},
         ),
         # 수동: 대상 날짜(YYYYMMDD). 그저께 이전만 허용 — task에서 검증
         "target_dt": Param(None, type=["null", "string"]),
@@ -147,7 +152,7 @@ def iceberg_reprocess():
                 zombies,
             )
 
-    def build_table_group(table: IcebergTable) -> TaskGroup:
+    def build_table_group(table) -> TaskGroup:   # table: HourlyIcebergTable | DailyIcebergTable
         tbl = table.value                    # SQL 바인딩·task id·params 비교는 문자열 값 사용
         with TaskGroup(group_id=f"reprocess_{tbl}") as group:
 
@@ -287,7 +292,7 @@ def iceberg_reprocess():
         """Spark가 성공한 테이블의 meta만 수집."""
         dag_run = context["dag_run"]
         metas = []
-        for t in IcebergTable:
+        for t in ALL_TABLES:
             ti = dag_run.get_task_instance(f"reprocess_{t.value}.append_data")
             if ti and ti.state == "success":
                 meta = context["ti"].xcom_pull(
@@ -360,10 +365,10 @@ def iceberg_reprocess():
         },
     )
 
-    # 테이블별 그룹 순차 연결 — append DAG과 동일한 IcebergTable 순회 (단일 소스)
+    # 테이블별 그룹 순차 연결 — append DAG과 동일한 Enum 순회 (단일 소스)
     # (앞 테이블 실패에도 다음 그룹은 all_done으로 계속)
     prev = check_zombie_jobs()
-    for _table in IcebergTable:
+    for _table in ALL_TABLES:
         g = build_table_group(_table)
         prev >> g
         prev = g
