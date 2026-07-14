@@ -79,8 +79,8 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 
 ## 작업 4: 재처리(Reprocessing) DAG 설계 — 설계 완료
 
-- **산출물**: `pipeline/reprocessing-dag-design.md`
-- **상태**: 설계 확정 (DAG 구현 대기)
+- **산출물**: `pipeline/reprocessing-dag-design.md` (설계), `pipeline/dags/iceberg_reprocess.py` (구현 스켈레톤 — 기존 인프라 연결 지점은 TODO 표시)
+- **상태**: 설계 확정, 구현 스켈레톤 작성 (기존 인프라 연결 대기)
 - **배경**: append DAG의 Oracle 조회 기간(최근 1일 rolling — Job History `ts` 날짜 키 파티셔닝 제약)에서 밀려난 WAIT 데이터와, `get_jobs`가 조회하지 않는 FAILED 데이터가 영구 잔류하는 문제
 - **시스템 구조**: Iceberg 테이블 20개+ (hourly/daily 그룹), append DAG은 py 1개에서 테이블별 동적 생성(약 5분 주기, `ts` string `YYYYMMDDHHmmSSsss` 기준 ORDER BY ASC, ROWNUM 200), Compaction DAG은 hourly/daily 각 1개(내부 테이블별 task 순차)
 - **핵심 설계**:
@@ -104,5 +104,7 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 │   ├── read-performance-test.md        # 파티션 전략별 읽기 성능 비교 테스트
 │   └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
 └── pipeline/
-    └── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
+    ├── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
+    └── dags/
+        └── iceberg_reprocess.py        # 재처리 DAG 구현 스켈레톤
 ```
