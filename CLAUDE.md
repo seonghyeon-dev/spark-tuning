@@ -77,14 +77,30 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 - **대상 독자**: Trino 쿼리 사용자 (Partition Pruning/Data Skipping 비전문가)
 - **핵심 내용**: ts 필터링 방법(date, date_trunc, 범위 조건), WHERE 필수 컬럼, 잘못된 쿼리 패턴
 
+## 작업 4: 재처리(Reprocessing) DAG 설계 — 설계 완료
+
+- **산출물**: `pipeline/reprocessing-dag-design.md`
+- **상태**: 설계 확정 (DAG 구현 대기)
+- **배경**: append DAG의 Oracle 조회 기간(최근 1일 — Job History 날짜 파티셔닝 제약)에서 밀려난 WAIT 데이터와, `get_jobs`가 조회하지 않는 FAILED 데이터가 영구 잔류하는 문제
+- **핵심 설계**:
+  - 재처리 DAG (1일 주기, 00:00 KST): D-0~D-1 파티션 FAILED + D-2 파티션 WAIT/FAILED 회수. 단일 Spark job, 총 크기 상한 16GB
+  - D-3 이상 잔류는 알림 → 수동 처리 (재처리 DAG의 `target_dt` params로 UI 수동 실행)
+  - 중복 적재 방지: Spark write 시 snapshot summary에 batch_id 기록(영수증), FAILED 재적재 전 `.snapshots` 확인 → 커밋된 건 DONE 정정
+  - batch_id 저장: Job History의 `stat_desc` CLOB 컬럼 재사용 (구 Airflow log URL 용도, 현재 미사용)
+  - Compaction: 직접 실행하지 않고 기존 Compaction DAG trigger — daily: `target_dt`, hourly: `start_time`/`end_time` conf 전달. `max_active_runs=1`로 동시 실행 직렬화
+  - 좀비 IN_PROGRESS(2시간 초과): 탐지 + 알림만, 자동 복구 안 함
+- **전제**: Iceberg snapshot 보존 3일 > 재처리 lookback 2일 유지 필수
+
 ## 파일 구조
 
 ```
 ├── CLAUDE.md
 ├── tuning/
 │   └── spark-tuning-guide.md          # Spark 튜닝 가이드
-└── schema/
-    ├── iceberg-schema-design-guide.md  # Iceberg 스키마 설계 가이드
-    ├── read-performance-test.md        # 파티션 전략별 읽기 성능 비교 테스트
-    └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
+├── schema/
+│   ├── iceberg-schema-design-guide.md  # Iceberg 스키마 설계 가이드
+│   ├── read-performance-test.md        # 파티션 전략별 읽기 성능 비교 테스트
+│   └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
+└── pipeline/
+    └── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
 ```
