@@ -12,6 +12,7 @@
 """
 
 import math
+from enum import Enum
 
 import pendulum
 from airflow.models.param import Param
@@ -22,12 +23,24 @@ from airflow.utils.trigger_rule import TriggerRule
 
 KST = pendulum.timezone("Asia/Seoul")
 
-# TODO: append DAG과 동일한 테이블 설정 소스를 사용할 것.
-#       group은 Compaction DAG 분류와 일치해야 한다 (첫 파티션 hour → hourly, day → daily).
-TABLES = {
-    # "TABLE_A": {"group": "hourly"},
-    # "TABLE_B": {"group": "daily"},
-}
+
+# TODO: append DAG이 사용하는 IcebergTable Enum을 그대로 import해서 아래 자리표시자를 제거.
+#       append DAG의 `for table in IcebergTable:` 생성 loop와 동일한 순회 방식을 쓴다 (단일 소스).
+# from <append_dag_공통_모듈> import IcebergTable
+class IcebergTable(str, Enum):
+    """자리표시자 — 실제로는 append DAG의 IcebergTable을 import해서 교체한다."""
+
+    # TABLE_A = "table_a"
+    # TABLE_B = "table_b"
+
+
+def table_group(table: IcebergTable) -> str:
+    """테이블의 Compaction 그룹 반환: 'hourly'(첫 파티션 hour) | 'daily'(첫 파티션 day).
+
+    TODO: IcebergTable Enum에 그룹 속성이 있으면 그대로 반환하고,
+          없으면 hourly/daily Compaction DAG의 테이블 분류와 동일한 매핑을 연결한다.
+    """
+    raise NotImplementedError
 
 ROW_LIMIT = 1000              # 테이블당 조회 상한 (설계 5.4 — 러프 설정, 재검증 필요)
 SIZE_LIMIT_MB = 16 * 1024     # 테이블당 크기 상한 16GB (설계 5.4 — 러프 설정, 재검증 필요)
@@ -100,8 +113,13 @@ def mark_status_by_job_ids(job_ids: list[str], status: str) -> None:
     catchup=False,
     max_active_runs=1,      # loop 회차 순차 실행 보장
     params={
-        # UI 수동 실행: 1개/여러 개/전체 선택 (설계 5.1)
-        "tables": Param(list(TABLES), type="array"),
+        # UI 수동 실행: 1개/여러 개/전체 multi-select (설계 5.1)
+        # 선택지·기본값 모두 IcebergTable Enum에서 생성 — 하드코딩 목록 없음
+        "tables": Param(
+            default=[t.value for t in IcebergTable],
+            type="array",
+            items={"type": "string", "enum": [t.value for t in IcebergTable]},
+        ),
         # 수동: 대상 날짜(YYYYMMDD). 그저께 이전만 허용 — task에서 검증
         "target_dt": Param(None, type=["null", "string"]),
         # 수동: ts 범위 축소 (YYYYMMDDHHmmSSsss)
@@ -129,7 +147,8 @@ def iceberg_reprocess():
                 zombies,
             )
 
-    def build_table_group(tbl: str) -> TaskGroup:
+    def build_table_group(table: IcebergTable) -> TaskGroup:
+        tbl = table.value                    # SQL 바인딩·task id·params 비교는 문자열 값 사용
         with TaskGroup(group_id=f"reprocess_{tbl}") as group:
 
             @task.short_circuit(
@@ -225,8 +244,8 @@ def iceberg_reprocess():
                 context["ti"].xcom_push(
                     key="meta",
                     value={
-                        "table": tbl,
-                        "group": TABLES[tbl]["group"],
+                        "table": tbl,                      # XCom은 JSON 직렬화 — Enum이 아닌 문자열 값 저장
+                        "group": table_group(table),
                         "batch_id": batch_id,
                         "job_ids": [j["job_id"] for j in picked],
                         "leftover": leftover,
@@ -268,11 +287,11 @@ def iceberg_reprocess():
         """Spark가 성공한 테이블의 meta만 수집."""
         dag_run = context["dag_run"]
         metas = []
-        for tbl in TABLES:
-            ti = dag_run.get_task_instance(f"reprocess_{tbl}.append_data")
+        for t in IcebergTable:
+            ti = dag_run.get_task_instance(f"reprocess_{t.value}.append_data")
             if ti and ti.state == "success":
                 meta = context["ti"].xcom_pull(
-                    task_ids=f"reprocess_{tbl}.get_table_jobs", key="meta"
+                    task_ids=f"reprocess_{t.value}.get_table_jobs", key="meta"
                 )
                 if meta:
                     metas.append(meta)
@@ -341,10 +360,11 @@ def iceberg_reprocess():
         },
     )
 
-    # 테이블별 그룹 순차 연결 (앞 테이블 실패에도 다음 그룹은 all_done으로 계속)
+    # 테이블별 그룹 순차 연결 — append DAG과 동일한 IcebergTable 순회 (단일 소스)
+    # (앞 테이블 실패에도 다음 그룹은 all_done으로 계속)
     prev = check_zombie_jobs()
-    for _tbl in TABLES:
-        g = build_table_group(_tbl)
+    for _table in IcebergTable:
+        g = build_table_group(_table)
         prev >> g
         prev = g
     prev >> trigger_compaction() >> check_loop() >> retrigger
