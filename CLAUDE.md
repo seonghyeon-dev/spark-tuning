@@ -81,15 +81,17 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 
 - **산출물**: `pipeline/reprocessing-dag-design.md`
 - **상태**: 설계 확정 (DAG 구현 대기)
-- **배경**: append DAG의 Oracle 조회 기간(최근 1일 — Job History 날짜 파티셔닝 제약)에서 밀려난 WAIT 데이터와, `get_jobs`가 조회하지 않는 FAILED 데이터가 영구 잔류하는 문제
+- **배경**: append DAG의 Oracle 조회 기간(최근 1일 rolling — Job History `ts` 날짜 키 파티셔닝 제약)에서 밀려난 WAIT 데이터와, `get_jobs`가 조회하지 않는 FAILED 데이터가 영구 잔류하는 문제
+- **시스템 구조**: Iceberg 테이블 20개+ (hourly/daily 그룹), append DAG은 py 1개에서 테이블별 동적 생성(약 5분 주기, `ts` string `YYYYMMDDHHmmSSsss` 기준 ORDER BY ASC, ROWNUM 200), Compaction DAG은 hourly/daily 각 1개(내부 테이블별 task 순차)
 - **핵심 설계**:
-  - 재처리 DAG (1일 주기, 01:00 KST — Job History 지연 적재 대비 1시간 버퍼): D-1 파티션 FAILED + D-2 파티션 WAIT/FAILED 회수. 단일 Spark job, 상한 row 1,000 / 총 크기 16GB (러프 설정, 재검증 필요)
-  - D-3 이상 잔류·상한 초과 이월은 알림 → 수동 처리 (재처리 DAG의 `target_dt` + `start_time`/`end_time` params로 UI 수동 실행)
-  - 중복 적재 방지: Spark write 시 snapshot summary에 batch_id 기록(영수증), FAILED 재적재 전 `.snapshots` 확인 → 커밋된 건 DONE 정정
-  - batch_id 저장: Job History의 `stat_desc` CLOB 컬럼 재사용 (구 Airflow log URL 용도, 현재 미사용)
-  - Compaction: 직접 실행하지 않고 기존 Compaction DAG trigger — daily: `target_dt`, hourly: `start_time`/`end_time` conf 전달. `max_active_runs=1`로 동시 실행 직렬화
+  - 재처리 DAG **1개** (1일 주기, 01:00 KST), 테이블별 TaskGroup 순차 실행 (Compaction DAG 패턴)
+  - 조회 범위 경계로 경합 원천 차단: FAILED는 전날+그저께 전체, WAIT는 전날 01:00 이전만 (append 하한 = 실행시각-24h ≥ 전날 01:00이므로 절대 안 겹침). 잠금/선점/pool 불필요
+  - 상한: 테이블당 row 1,000 / 16GB (러프 설정, 재검증 필요). 초과 시 자기 자신 재trigger loop (상한 10회, `max_active_runs=1`로 순차)
+  - 중복 적재 방지: snapshot summary에 batch_id 기록(영수증), FAILED 재적재 전 `.snapshots` 확인 → 커밋된 건 DONE 정정. batch_id는 `stat_desc` CLOB 재사용 — **WHERE 조건 사용 금지** (값 기록/읽기만)
+  - Compaction: 기존 DAG trigger — daily `target_dt`, hourly `start_time`/`end_time` + 양쪽 `tables` multi-select params. daily 스케줄 00:35 → **02:00 이동** (재처리 적재 전날분 자연 커버 + 자정 지연 적재분 구멍 해소), hourly `15 * * * *` 유지
+  - 수동 실행: `tables`(multi-select) + `target_dt` + `start_time`/`end_time` params
   - 좀비 IN_PROGRESS(2시간 초과): 탐지 + 알림만, 자동 복구 안 함
-- **전제**: Iceberg snapshot 보존 3일 > 재처리 lookback 2일 유지 필수
+- **전제**: Iceberg snapshot 보존 3일 > 재처리 조회 범위 2일 유지 필수. Compaction DAG 변경(02:00, tables params)은 재처리 DAG 배포 전 적용
 
 ## 파일 구조
 
