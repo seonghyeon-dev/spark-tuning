@@ -8,7 +8,19 @@
 구조: 단일 DAG, 테이블별 TaskGroup 순차 실행 (Compaction DAG과 동일 패턴).
       잔여분이 남으면 자기 자신을 재trigger (loop, 상한 10회).
 
-기존 append DAG 인프라를 재사용해야 하는 지점은 전부 `TODO:`로 표시했다.
+── 기존 구현 연결 지점 ─────────────────────────────────────────────
+이미 구현되어 있는 것들이므로 연결만 하면 된다. 코드 내 `TODO(연결):` 태그와
+1:1로 대응한다 (grep "TODO(연결)" 으로 전체 확인 가능).
+
+  1. iceberg.py의 hourly/daily Enum import (자리표시자 클래스 2개 교체)
+  2. Compaction DAG id 상수 2건
+  3. Oracle 조회/실행     — oracle_fetch / oracle_execute
+  4. 영수증 snapshot 조회 — snapshot_exists
+  5. avro 경로 목록 S3 업로드 — upload_path_list_to_s3
+  6. 알림 채널            — send_alert
+  7. Spark 실행           — append_data의 SparkKubernetesOperator 템플릿
+  8. Compaction trigger   — trigger_dag_run 호출 + conf 날짜/시간 형식 확인
+────────────────────────────────────────────────────────────────────
 """
 
 import math
@@ -24,7 +36,7 @@ from airflow.utils.trigger_rule import TriggerRule
 KST = pendulum.timezone("Asia/Seoul")
 
 
-# TODO: append DAG이 사용하는 iceberg.py의 hourly/daily Enum 클래스를 그대로 import해서
+# TODO(연결): append DAG이 사용하는 iceberg.py의 hourly/daily Enum 클래스를 그대로 import해서
 #       아래 자리표시자를 제거 (클래스명은 iceberg.py의 실제 정의에 맞출 것 — 단일 소스).
 # from <공통 모듈>.iceberg import HourlyIcebergTable, DailyIcebergTable
 class HourlyIcebergTable(str, Enum):
@@ -53,8 +65,8 @@ MAX_EXECUTORS = 24            # 벤치마크 검증 상한 (spark-tuning-guide.m
 MAX_LOOP = 10                 # 자기 재trigger 상한 (설계 5.5)
 ZOMBIE_HOURS = 2              # 좀비 IN_PROGRESS 판정 임계 (설계 8.2)
 
-DAILY_COMPACTION_DAG_ID = "daily_compaction_dag"    # TODO: 실제 DAG id
-HOURLY_COMPACTION_DAG_ID = "hourly_compaction_dag"  # TODO: 실제 DAG id
+DAILY_COMPACTION_DAG_ID = "daily_compaction_dag"    # TODO(연결): 실제 DAG id
+HOURLY_COMPACTION_DAG_ID = "hourly_compaction_dag"  # TODO(연결): 실제 DAG id
 
 
 def ts_str(dt: pendulum.DateTime) -> str:
@@ -63,23 +75,23 @@ def ts_str(dt: pendulum.DateTime) -> str:
 
 
 # ---------------------------------------------------------------------------
-# TODO: 아래 헬퍼들은 기존 append DAG의 구현을 재사용해서 연결한다.
+# TODO(연결): 아래 헬퍼들은 기존 append DAG의 구현을 재사용해서 연결한다.
 # ---------------------------------------------------------------------------
 
 def oracle_fetch(sql: str, **binds) -> list[dict]:
-    """TODO: 기존 Oracle 커넥션/Hook 재사용."""
+    """TODO(연결): 기존 Oracle 커넥션/Hook 재사용."""
     raise NotImplementedError
 
 
 def oracle_execute(sql: str, **binds) -> None:
-    """TODO: 기존 Oracle 커넥션/Hook 재사용 (autocommit 또는 명시 commit)."""
+    """TODO(연결): 기존 Oracle 커넥션/Hook 재사용 (autocommit 또는 명시 commit)."""
     raise NotImplementedError
 
 
 def snapshot_exists(table: str, batch_id: str) -> bool:
     """영수증 확인 (설계 4.2): 해당 테이블 snapshot summary에 batch_id 존재 여부.
 
-    TODO: Trino/Spark 중 기존 조회 경로 재사용.
+    TODO(연결): Trino/Spark 중 기존 조회 경로 재사용.
       SELECT snapshot_id FROM <catalog>.<db>.<table>.snapshots
        WHERE element_at(summary, 'batch_id') = :batch_id
     """
@@ -87,12 +99,12 @@ def snapshot_exists(table: str, batch_id: str) -> bool:
 
 
 def upload_path_list_to_s3(table: str, jobs: list[dict], batch_id: str) -> None:
-    """TODO: 기존 get_jobs의 avro 경로 목록 텍스트 파일 S3 업로드 로직 재사용."""
+    """TODO(연결): 기존 get_jobs의 avro 경로 목록 텍스트 파일 S3 업로드 로직 재사용."""
     raise NotImplementedError
 
 
 def send_alert(message: str, detail=None) -> None:
-    """TODO: 기존 알림 채널 재사용."""
+    """TODO(연결): 기존 알림 채널 재사용."""
     raise NotImplementedError
 
 
@@ -265,9 +277,9 @@ def iceberg_reprocess():
                 upload_path_list_to_s3(tbl, picked, batch_id)
                 return True
 
-            # TODO: 기존 append DAG의 SparkKubernetesOperator 템플릿 재사용.
+            # TODO(연결): 기존 append DAG의 SparkKubernetesOperator 템플릿 재사용.
             #       Spark 코드에는 .option("snapshot-property.batch_id", batch_id) 적용 (설계 4.2)
-            append_data = SparkKubernetesOperator(  # noqa: F821  TODO: import/템플릿 연결
+            append_data = SparkKubernetesOperator(  # noqa: F821  TODO(연결): import/템플릿 연결
                 task_id="append_data",
                 retries=2,                          # 일시적 오류 1차 방어 (설계 3.3)
                 retry_delay=pendulum.duration(minutes=5),
@@ -309,7 +321,7 @@ def iceberg_reprocess():
         조건 없이 적재분 전부 trigger — tables 필터로 비용 최소, 중복은 no-op.
         daily: 적재 날짜별로 테이블을 묶어 target_dt+tables 전달.
         hourly: 적재 ts 범위(min~max)를 테이블별로 모아 start/end+tables 전달.
-        TODO: 날짜/시간 형식은 기존 Compaction DAG의 UI params 형식과 일치시킬 것.
+        TODO(연결): 날짜/시간 형식은 기존 Compaction DAG의 UI params 형식과 일치시킬 것.
         """
         metas = _collect_metas(context)
 
@@ -326,7 +338,7 @@ def iceberg_reprocess():
                 hourly_max = max(hourly_max or m["ts_max"], m["ts_max"])
 
         for target_dt, tables in daily_targets.items():
-            trigger_dag_run(  # noqa: F821  TODO: TriggerDagRunOperator 또는 API 호출로 구현
+            trigger_dag_run(  # noqa: F821  TODO(연결): TriggerDagRunOperator 또는 API 호출로 구현
                 DAILY_COMPACTION_DAG_ID,
                 conf={"target_dt": target_dt, "tables": tables},
             )
