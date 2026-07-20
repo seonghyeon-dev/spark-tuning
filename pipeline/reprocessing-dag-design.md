@@ -235,8 +235,10 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 ### 5.2 Task 구성
 
 ```
-check_zombie_jobs                          # 좀비 IN_PROGRESS 탐지 → 알림 (전체 테이블 일괄)
-      │
+check_zombie_jobs                          # 좀비 IN_PROGRESS 탐지 → 알림 (독립 실행)
+                                           # 관측용 — 본 파이프라인과 의존 없음.
+                                           # 알림 실패가 재처리 본류를 막지 않도록 분리
+
 prepare_run                                # params 검증·정규화 1회 → XCom (get_time 패턴)
       │                                    # ts 경계 계산, 수동 범위 검증, date-time → ts 변환
 ┌─ TaskGroup: TABLE_A ──────────────────────────────────────────┐
