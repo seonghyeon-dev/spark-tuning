@@ -25,6 +25,7 @@
 
 import math
 from enum import Enum
+from pathlib import Path
 
 import pendulum
 from airflow.models.param import Param
@@ -34,6 +35,8 @@ from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
 KST = pendulum.timezone("Asia/Seoul")
+
+DAG_ID = Path(__file__).stem  # 조직 컨벤션: dag_id는 파일명에서 파생 (단일 소스)
 
 
 # TODO(연결): append DAG이 사용하는 iceberg.py의 hourly/daily Enum 클래스를 그대로 import해서
@@ -124,7 +127,7 @@ def mark_status_by_job_ids(job_ids: list[str], status: str) -> None:
 # ---------------------------------------------------------------------------
 
 @dag(
-    dag_id="iceberg_reprocess",
+    dag_id=DAG_ID,
     schedule="0 1 * * *",   # 01:00 KST — 전날 데이터 안정화 버퍼 (설계 5.1)
     start_date=pendulum.datetime(2026, 7, 1, tz=KST),
     catchup=False,
@@ -145,7 +148,7 @@ def mark_status_by_job_ids(job_ids: list[str], status: str) -> None:
     },
     tags=["iceberg", "reprocess"],
 )
-def iceberg_reprocess():
+def dag():  # 조직 컨벤션: 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 담당
 
     @task
     def check_zombie_jobs():
@@ -369,7 +372,7 @@ def iceberg_reprocess():
 
     retrigger = TriggerDagRunOperator(
         task_id="retrigger_self",
-        trigger_dag_id="iceberg_reprocess",
+        trigger_dag_id=DAG_ID,  # 자기 자신 재trigger — 파일명 기반 dag_id 재사용
         conf={
             "loop_count": "{{ (dag_run.conf.get('loop_count', 0) | int) + 1 }}",
             # 경계 기준일 고정 전달 — 회차가 자정을 넘겨도 ts 경계 유지 (설계 5.5)
@@ -387,4 +390,4 @@ def iceberg_reprocess():
     prev >> trigger_compaction() >> check_loop() >> retrigger
 
 
-iceberg_reprocess()
+dag()
