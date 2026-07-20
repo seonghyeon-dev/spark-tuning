@@ -191,6 +191,10 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 ```
 
 > **stat_desc 사용 제약 (중요)**: stat_desc는 CLOB이므로 **Oracle WHERE 조건으로 사용하는 것은 금지**한다 (등호 비교·인덱스 불가). 허용되는 사용은 두 가지뿐이다 — ① UPDATE 시 값 기록 ② SELECT 결과에서 개별 row의 값 읽기. 영수증 확인은 "row에서 batch_id를 읽어 → Iceberg `.snapshots`를 조회"하는 방향이므로 이 제약에 걸리지 않는다.
+>
+> **판단 근거와 전제**: Iceberg commit은 원자적(all-or-nothing)이므로 snapshot에 batch_id가 존재한다 = 그 배치의 커밋이 완전히 성공했다는 뜻이며, "일부만 적재된" 중간 상태는 존재하지 않는다. 단 이 판단은 **배치 전체가 Spark job 1회의 단일 append 커밋**일 때만 성립한다 (현재 append job 구조는 충족 — job 내부 다중 커밋 구조로 변경 시 성립하지 않음).
+>
+> **task retry 중복 방어 (권장)**: Spark task의 Airflow `retries`는 같은 batch_id로 재실행된다. attempt 1이 커밋 성공 후 거짓 실패하면 attempt 2가 같은 데이터를 중복 append할 수 있다. 방어책으로 **Spark job 시작 시 자기 batch_id의 snapshot 존재를 확인하고, 있으면 즉시 성공 종료**하는 로직을 권장한다 (조회 1회 비용).
 
 ### 4.3 구현 비용 및 성능
 
@@ -227,7 +231,7 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 |-------|--------|------|
 | `tables` | 전체 테이블 | 처리 대상 테이블 multi-select — 1개/여러 개/전체 선택 가능. 정기 실행은 기본값(전체). 선택지·기본값은 append DAG과 동일한 **`iceberg.py`의 hourly/daily Enum 클래스**에서 생성 (`Param(type="array", items={"enum": [...]})`) — hourly/daily 분류는 소속 Enum 클래스로 결정되고, 테이블 추가/제거 시 Enum 한 곳만 수정하면 append/재처리가 함께 반영되는 단일 소스 |
 | `target_dt` | 없음 | 지정 시 해당 날짜의 WAIT+FAILED 전체를 대상으로. **그저께 이전 날짜만 허용** — 전날/당일을 지정하면 WAIT 조회가 append 조회 범위와 겹치므로 task가 검증 후 실패 처리한다 |
-| `start_time` / `end_time` | 없음 | `ts` 범위 축소 (`YYYYMMDDHHmmSSsss`). 잔류량이 많은 날 쪼개서 실행할 때 사용 |
+| `start_time` / `end_time` | 없음 | `ts` 범위 축소. 기존 DAG과 동일한 **date-time 형식**으로 입력받아 내부에서 ts 문자열(`YYYYMMDDHHmmSSsss`)로 변환. 잔류량이 많은 날 쪼개서 실행할 때 사용 |
 
 ### 5.2 Task 구성
 
