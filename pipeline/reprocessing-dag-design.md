@@ -238,8 +238,10 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 ```
 check_zombie_jobs                          # 좀비 IN_PROGRESS 탐지 → 알림 (전체 테이블 일괄)
       │
+prepare_run                                # params 검증·정규화 1회 → XCom (get_time 패턴)
+      │                                    # ts 경계 계산, target_dt 검증, date-time → ts 변환
 ┌─ TaskGroup: TABLE_A ──────────────────────────────────────────┐
-│  get_table_jobs      # params.tables 포함 여부 확인 → 조회     │
+│  get_table_jobs      # 정규화 XCom 값 기반 조회                │
 │      │               # + 영수증 확인 + 상한 적용 + 마킹         │
 │      │               # 대상 0건이면 그룹 내 후속 skip           │
 │  append_data         # SparkKubernetesOperator (기존 job 재사용)│
@@ -260,10 +262,13 @@ check_loop          [all_done]             # 상한 채운 테이블 존재 시 
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
 - **상태 update의 대상 식별은 XCom의 job_id 목록으로만**: `stat_desc`(batch_id)는 CLOB이라 WHERE 조건 사용 금지 (섹션 4.2 제약). update_success/update_failure는 get_table_jobs가 XCom에 남긴 job_id 목록으로 UPDATE한다
+- **params는 prepare_run에서만 읽는다**: 기존 append DAG의 get_time 패턴과 동일. 검증·형식 변환(`ts` 경계 계산, `target_dt` 그저께 이전 검증, date-time → ts 문자열 변환)을 첫 task에서 1회 수행하고, 이후 task들은 정규화된 XCom 값만 소비한다. 잘못된 입력은 파이프라인 중간이 아닌 첫 task에서 즉시 실패하고, TaskGroup 템플릿이 DAG params에 결합되지 않아 재사용이 가능해진다
 
 ### 5.3 get_table_jobs 처리 순서 (테이블별)
 
-1. **실행 대상 확인** — `params.tables`에 자기 테이블이 없으면 즉시 skip
+선행 task `prepare_run`이 params 검증과 `ts` 경계 계산을 1회 수행해 XCom으로 내려보내며(수동 `target_dt` 검증, date-time → ts 문자열 변환 포함), get_table_jobs는 정규화된 값만 사용한다.
+
+1. **실행 대상 확인** — 정규화된 `tables` 목록에 자기 테이블이 없으면 즉시 skip
 2. **대상 조회** — `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한:
 
 ```sql
@@ -279,7 +284,7 @@ SELECT * FROM (
      ORDER BY ts ASC                -- append와 동일, 오래된 것부터
 ) WHERE ROWNUM <= 1000
 ```
-   - 수동 실행(`target_dt` 지정) 시: **그저께 이전 날짜인지 먼저 검증**(전날/당일이면 실패 처리) 후 해당 날짜 00:00~24:00의 WAIT+FAILED 전체 (`start_time`/`end_time` 지정 시 그 범위로 축소)
+   - 수동 실행 시: prepare_run이 검증한 `target_dt` 날짜의 WAIT+FAILED 전체 (`start_time`/`end_time` 지정 시 기본 경계 안쪽으로만 축소)
    - 조회 직후 **필터 적용 전 조회 건수로 잔여분 여부를 기록** (1,000건을 채웠으면 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 영수증/크기 상한으로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
 3. **영수증 확인** — FAILED row에서 읽은 stat_desc(batch_id)별로 `.snapshots` 조회 → 이미 커밋된 batch의 row는 DONE 정정 후 대상에서 제외 (섹션 4)
 4. **크기 상한 적용** — 총 avro 크기 16GB 초과분은 잘라냄. 잘린 건도 잔여분으로 기록 (loop 회차 또는 다음날 회수)
