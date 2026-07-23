@@ -253,10 +253,11 @@ prepare_run                                # params 검증·정규화 1회 → X
 ┌─ TaskGroup: TABLE_B ─┐ ... (테이블 수만큼 순차)
 └──────────────────────┘
       │
-trigger_compaction  [all_done]             # 적재 결과 집계 → Compaction DAG trigger (섹션 6)
-      │
-check_loop          [all_done]             # 상한 채운 테이블 존재 시 자기 자신 재trigger (5.5)
+compaction_targets [all_done] → trigger_compaction  # 집계 → TriggerDagRunOperator.expand (섹션 6)
+next_loop          [all_done] → retrigger_self       # 잔여분 판단 → 자기 재trigger (0/1건, 5.5)
 ```
+
+> Compaction/재trigger는 대상 개수가 가변(Compaction 여러 건, loop 0/1건)이므로, 집계 task가 `TriggerDagRunOperator` kwargs 목록을 만들고 **dynamic task mapping(`expand_kwargs`)** 으로 trigger한다. 빈 목록이면 mapped operator는 skip된다.
 
 - **기존 ConvertFileTaskGroup 재사용**: append DAG이 쓰는 TaskGroup 템플릿(get_jobs → Spark append → update_success/update_failure)을 그대로 재사용하고, **조회 task(get_jobs)만 재처리용으로 주입**한다. 템플릿에 재처리 로직을 추가하지 않는다 — 재처리와 append의 차이는 조회 범위·상한·영수증 확인뿐이고 이후 단계는 동일하기 때문
 - **테이블별 순차 실행**: Spark job(최대 24 executor)이 테이블 수만큼 동시에 뜨면 K8S가 감당하지 못한다. Compaction DAG과 동일하게 순차 — 잔여분 없는 테이블은 조회 후 즉시 skip이라 빠르다
