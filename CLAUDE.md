@@ -18,7 +18,7 @@
 
 ### 기술 스택
 
-- Spark 4.1.1, Iceberg 1.10.1, Airflow 3.1.7
+- Spark 4.1.1, Iceberg 1.10.1, Airflow 3.2.2
 - Kubernetes 클러스터 (Spark Pod 실행 환경)
 - S3 (MinIO) 스토리지 — Iceberg 테이블
 - Trino — 조회 엔진 (DBeaver JDBC 드라이버로 실행)
