@@ -105,6 +105,8 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 │   └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
 └── pipeline/
     ├── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
-    └── dags/
-        └── iceberg_reprocess.py        # 재처리 DAG 구현 스켈레톤
+    ├── dags/
+    │   └── iceberg_reprocess.py        # 재처리 DAG 구현 스켈레톤
+    └── examples/
+        └── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
 ```

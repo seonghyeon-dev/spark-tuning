@@ -378,7 +378,7 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 | 대상 | 변경 | 내용 |
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 2건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 |
-| ConvertFileTaskGroup | `get_jobs_builder` 옵션 인자 추가 | `__init__(..., get_jobs_builder=None)` 인자와 분기 하나 추가: 미지정이면 기존 인라인 get_jobs 경로(**코드·closure 전부 그대로 — append 동작 완전 동일**), 지정이면 `get_jobs_builder(self, _update_jobs)` 호출로 외부 조회 task를 그룹 안에 생성. `__init__` 지역값(설정, logger, `_update_jobs`)을 옮기지 않으므로 closure 파손 위험 없음 |
+| ConvertFileTaskGroup | `get_jobs_builder` 옵션 인자 추가 | `__init__(..., get_jobs_builder=None)` 인자와 분기 하나 추가: 미지정이면 기존 인라인 get_jobs 경로(**코드·closure 전부 그대로 — append 동작 완전 동일**), 지정이면 `get_jobs_builder(self, _update_jobs)` 호출로 외부 조회 task를 그룹 안에 생성. `__init__` 지역값(설정, logger, `_update_jobs`)을 옮기지 않으므로 closure 파손 위험 없음. **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
 | daily Compaction DAG | 스케줄 + params | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체) |
 | hourly Compaction DAG | params | params에 `tables` multi-select 추가 (기본 전체). 스케줄 변경 없음 |
 
