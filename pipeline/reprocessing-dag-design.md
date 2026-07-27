@@ -298,7 +298,7 @@ SELECT * FROM (
    - **담긴 게 0건인데 조회 결과나 잔여분 신호가 있으면 알림** — ① 선두 job 하나가 16GB 초과(매일 반복 skip될 데이터) ② 조회분이 전부 영수증 정정으로 소진(DB에 더 남았는데 meta가 없어 loop 신호 유실). 정상적인 빈 조회는 무음 skip
 5. **XCom(meta) 기록** — job_id 목록(conn별 dict)·batch_id·잔여분 여부·적재 ts 범위를 **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, meta가 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. meta가 먼저 있으면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task의 `WHERE status='IN_PROGRESS'` 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
 6. **IN_PROGRESS 마킹** — 원천 DB별로 `WHERE job_id = :job_id AND status IN ('WAIT','FAILED')` UPDATE를 **executemany**로 일괄 실행 + `stat_desc = 새 batch_id` 기록. IN 절에 placeholder를 건수만큼 펼치지 않는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고, IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며(ROW_LIMIT 상향 시에도 안전), 라운드트립이 1회다
-   - **반영 건수 검증**: 요청 건수와 다르면 조회 이후 그 row의 상태가 바뀐 것(설계상 조회 범위가 겹치지 않으므로 발생하면 안 됨) → 알림 후 task 실패. 선점하지 못한 row를 Spark에 넘기면 중복 적재가 되기 때문. meta는 이미 기록됐으므로 선점된 row만 update_failure가 회수하고, 나머지는 원래 상태로 남아 다음 회차에 처리된다
+   - `status IN ('WAIT','FAILED')` 조건은 만약의 이중 실행에 대한 방어선이다. 반영 건수를 검증하지는 않는다 — 조회~UPDATE 사이에 상태를 바꿀 주체가 없기 때문(append는 조회 경계가 겹치지 않고, 재처리는 `max_active_runs=1`, 같은 run 내 테이블은 `table_name`으로 분리). 발생하지 않는 조건 때문에 하드 실패 경로를 만들면 오히려 정상 재처리가 막힐 위험만 생긴다
 7. **Spark 입력 준비** — avro 경로 목록 S3 업로드(양쪽 DB 분을 합쳐 1개 파일), num_executors 산정 (append DAG과 동일 산정식: `ceil(총크기/128MB × 1.5 / 4)`, 상한 24)
 
 ### 5.4 처리 상한
