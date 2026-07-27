@@ -259,7 +259,11 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 
 > Compaction/재trigger는 대상 개수가 가변(Compaction 여러 건, loop 0/1건)이므로, 집계 task가 `TriggerDagRunOperator` kwargs 목록을 만들고 **dynamic task mapping(`expand_kwargs`)** 으로 trigger한다. 빈 목록이면 mapped operator는 skip된다.
 
-- **기존 ConvertFileTaskGroup 재사용 (`get_jobs_builder` 주입)**: append DAG의 TaskGroup 템플릿(get_jobs → Spark append → update_success/update_failure)을 그대로 쓰되, **재처리용 조회 task를 만들어 주는 builder 함수를 생성자 옵션 인자로 주입**한다. "get_jobs를 메서드로 추출 후 상속 override" 방식은 기각 — 인라인 get_jobs가 `__init__` 지역값들(설정값, logger, `_update_jobs` 등)을 closure로 사용하고 있어 메서드로 옮기면 참조가 전부 끊긴다. 주입 방식은 부모 `__init__`에 `get_jobs_builder=None` 인자와 분기 하나만 추가하고 **기존 코드는 자리 이동이 없다**: 미지정이면 기존 인라인 경로(append — closure 전부 유지, 동작 동일), 지정이면 `get_jobs_builder(self, _update_jobs)` 호출로 재처리 조회 task를 그룹 안에 생성 (섹션 7). builder 구현 주의: builder는 그룹 컨텍스트 밖에서 호출되므로 task 데코레이터에 `task_group=group` 명시 필수 (누락 시 dag 레벨 생성 → 테이블 간 task_id 충돌)
+- **기존 ConvertFileTaskGroup 재사용 (`get_jobs_builder` 주입 + `self.ctx` 노출)**: append DAG의 TaskGroup 템플릿(get_jobs → Spark append → update_success/update_failure)을 그대로 쓰되, **재처리용 조회 task를 만들어 주는 builder 함수를 생성자 옵션 인자로 주입**한다.
+  - 기각한 대안 ①: "get_jobs를 메서드로 추출 후 상속 override" — 인라인 get_jobs가 `__init__` 지역값들(설정값, logger, `_update_jobs` 등)을 closure로 사용하고 있어 메서드로 옮기면 참조가 전부 끊긴다
+  - 기각한 대안 ②: "필요한 헬퍼를 builder 파라미터로 전달" — `__init__` 지역 함수가 여러 개이고 앞으로도 늘 수 있어, 헬퍼가 추가될 때마다 builder 시그니처가 깨진다
+  - **채택**: 부모 `__init__`에 ⓐ 지역 함수/설정값을 `self.ctx`(SimpleNamespace)로 노출하는 한 줄과 ⓑ `get_jobs_builder=None` 인자·분기를 추가한다. **기존 코드는 자리 이동이 없다** — 미지정이면 기존 인라인 경로(append: closure 전부 유지, 동작 동일), 지정이면 `get_jobs_builder(self)` 호출(**인자는 그룹 하나뿐**)로 재처리 조회 task를 그룹 안에 생성 (섹션 7). builder는 부모 헬퍼가 필요하면 `group.ctx.update_jobs(...)`, `group.ctx.logger` 처럼 골라 쓰므로, 헬퍼가 늘어도 ⓐ에 항목 한 줄만 추가되고 builder 시그니처는 그대로다
+  - builder 구현 주의: builder는 그룹 컨텍스트 밖에서 호출되므로 task 데코레이터에 `task_group=group` 명시 필수 (누락 시 dag 레벨 생성 → 테이블 간 task_id 충돌)
 - **테이블별 순차 실행**: Spark job(최대 24 executor)이 테이블 수만큼 동시에 뜨면 K8S가 감당하지 못한다. Compaction DAG과 동일하게 순차 — 잔여분 없는 테이블은 조회 후 즉시 skip이라 빠르다
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
@@ -381,7 +385,7 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 | 대상 | 변경 | 내용 |
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 2건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 |
-| ConvertFileTaskGroup | `get_jobs_builder` 옵션 인자 추가 | `__init__(..., get_jobs_builder=None)` 인자와 분기 하나 추가: 미지정이면 기존 인라인 get_jobs 경로(**코드·closure 전부 그대로 — append 동작 완전 동일**), 지정이면 `get_jobs_builder(self, _update_jobs)` 호출로 외부 조회 task를 그룹 안에 생성. `__init__` 지역값(설정, logger, `_update_jobs`)을 옮기지 않으므로 closure 파손 위험 없음. **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
+| ConvertFileTaskGroup | `self.ctx` 노출 + `get_jobs_builder` 옵션 인자 추가 (3줄) | ① `__init__` 지역 함수/설정값을 `self.ctx = SimpleNamespace(update_jobs=_update_jobs, logger=logger, ...)`로 노출 ② `__init__(..., get_jobs_builder=None)` 인자 추가 ③ get_jobs 생성부를 분기로 감싸기 — 미지정이면 기존 인라인 경로(**코드·closure 전부 그대로, append 동작 완전 동일**), 지정이면 `get_jobs_builder(self)` 호출. 지역값을 옮기지 않으므로 closure 파손 없고, 헬퍼가 늘어도 ①에 한 줄만 추가된다. **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
 | daily Compaction DAG | 스케줄 + params | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체) |
 | hourly Compaction DAG | params | params에 `tables` multi-select 추가 (기본 전체). 스케줄 변경 없음 |
 
