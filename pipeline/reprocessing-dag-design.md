@@ -190,7 +190,7 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
    → 결과 없음: 진짜 실패 → 정상 재적재
 ```
 
-> **stat_desc 사용 제약 (중요)**: stat_desc는 CLOB이므로 **Oracle WHERE 조건으로 사용하는 것은 금지**한다 (등호 비교·인덱스 불가). 허용되는 사용은 두 가지뿐이다 — ① UPDATE 시 값 기록 ② SELECT 결과에서 개별 row의 값 읽기. 영수증 확인은 "row에서 batch_id를 읽어 → Iceberg `.snapshots`를 조회"하는 방향이므로 이 제약에 걸리지 않는다.
+> **stat_desc 사용 제약 (중요)**: stat_desc는 CLOB이므로 **Oracle WHERE 조건으로 사용하는 것은 금지**한다 (등호 비교·인덱스 불가). 허용되는 사용은 두 가지뿐이다 — ① UPDATE 시 값 기록 ② SELECT 결과에서 개별 row의 값 읽기. 읽을 때는 **`DBMS_LOB.SUBSTR(stat_desc, 4000, 1)`로 VARCHAR2 변환해서 조회**해야 한다 — 그냥 조회하면 드라이버가 LOB 객체를 돌려주어 문자열 비교·set 연산이 되지 않고 영수증 확인이 오작동한다. 영수증 확인은 "row에서 batch_id를 읽어 → Iceberg `.snapshots`를 조회"하는 방향이므로 이 제약에 걸리지 않는다.
 >
 > **판단 근거와 전제**: Iceberg commit은 원자적(all-or-nothing)이므로 snapshot에 batch_id가 존재한다 = 그 배치의 커밋이 완전히 성공했다는 뜻이며, "일부만 적재된" 중간 상태는 존재하지 않는다. 단 이 판단은 **배치 전체가 Spark job 1회의 단일 append 커밋**일 때만 성립한다 (현재 append job 구조는 충족 — job 내부 다중 커밋 구조로 변경 시 성립하지 않음).
 >
@@ -278,9 +278,11 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 2. **대상 조회** — **Oracle DB 2개에 동일 쿼리를 반복**(append의 conn_list loop 패턴)하고 결과를 `{conn_id: rows}` dict로 보관한다 (상태 UPDATE가 이 키로 원천 DB를 찾아가므로 row에 출처를 태깅할 필요가 없다). 크기 상한을 적용할 때만 `(row, conn_id)` 쌍으로 펼쳐 전체 `ts` 오름차순 정렬한다. `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한(**DB당** 적용):
 
 ```sql
--- conn_list의 DB 2개에 각각 실행 (결과는 conn_id 태깅 후 ts 기준 병합 정렬)
+-- conn_list의 DB 2개에 각각 실행 (결과는 {conn_id: rows}로 보관)
 SELECT * FROM (
-    SELECT job_id, status, stat_desc, ts, avro_path, file_size_mb
+    SELECT job_id, status,
+           DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc,  -- CLOB → VARCHAR2 (아래 주의)
+           ts, avro_path, file_size_mb
       FROM JOB_HISTORY
      WHERE table_name = :tbl
        AND ts >= :ts_from           -- 그저께 00:00  '20260702000000000'
