@@ -318,6 +318,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
 # 자기 조회 task를 그룹 안에 만들어 넣는다.
 #
 # TODO(연결): 부모 import + __init__에 get_jobs_builder 옵션 인자 추가.
+#             변경 예시 전체: pipeline/examples/convert_file_taskgroup_example.py
 
 def build_reprocess_get_jobs(table, run_cfg):
     """ConvertFileTaskGroup(get_jobs_builder=...)에 넘길 builder 생성.
