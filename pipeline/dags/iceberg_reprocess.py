@@ -142,42 +142,57 @@ def _rows(conn_id: str, sql: str, binds: dict, columns: tuple[str, ...]) -> list
     return [dict(zip(columns, r)) for r in records]
 
 
-def _in_binds(values: list) -> tuple[str, dict]:
-    """Oracle IN절용 placeholder 동적 확장.
+def _execute_many(conn_id: str, sql: str, rows: list[dict]) -> int:
+    """고정 SQL을 바인딩 배열로 일괄 실행하고 반영 건수를 반환한다.
 
-    Oracle은 IN (:ids)에 파이썬 list를 통째로 바인딩할 수 없어서,
-    값 개수만큼 개별 placeholder를 만들어 바인딩한다.
+    IN 절에 placeholder를 건수만큼 펼치는 방식 대신 executemany를 쓰는 이유:
+      - SQL이 건수와 무관하게 고정 → Oracle이 parse 1회 후 커서를 재사용
+        (동적 IN 절은 건수가 바뀔 때마다 다른 SQL이 되어 hard parse가 반복됨)
+      - IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않음 — ROW_LIMIT을 올려도 안전
+      - 바인딩 배열을 한 번에 보내므로 라운드트립 1회
 
-    예) values=['J1', 'J2', 'J3']
-        → (":id0, :id1, :id2", {"id0": "J1", "id1": "J2", "id2": "J3"})
-        사용: f"... WHERE job_id IN ({clause})" + parameters=binds
+    OracleHook.run()은 executemany를 노출하지 않으므로 커서를 직접 쓴다.
+    get_conn()은 autocommit이 아니므로 commit도 명시한다.
     """
-    binds = {f"id{i}": v for i, v in enumerate(values)}
-    return ", ".join(f":{k}" for k in binds), binds
+    if not rows:
+        return 0
+    hook = OracleHook(oracle_conn_id=conn_id)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.executemany(sql, rows)
+        affected = cur.rowcount
+        conn.commit()
+    return affected
 
 
-def _mark_done(conn_id: str, job_ids: list[str]) -> None:
+MARK_DONE_SQL = """
+UPDATE JOB_HISTORY SET status = 'DONE'
+ WHERE job_id = :job_id AND status = 'FAILED'
+"""
+
+CLAIM_SQL = """
+UPDATE JOB_HISTORY SET status = 'IN_PROGRESS', stat_desc = :batch_id
+ WHERE job_id = :job_id AND status IN ('WAIT', 'FAILED')
+"""
+
+
+def _mark_done(conn_id: str, job_ids: list[str]) -> int:
     """영수증으로 커밋이 확인된 FAILED row를 DONE으로 정정 (설계 4.2).
-    해당 DB에 정정할 게 없으면 아무것도 하지 않는다."""
-    if not job_ids:
-        return
-    clause, binds = _in_binds(job_ids)
-    OracleHook(oracle_conn_id=conn_id).run(
-        f"UPDATE JOB_HISTORY SET status = 'DONE' "
-        f"WHERE job_id IN ({clause}) AND status = 'FAILED'",
-        parameters=binds,
-    )
+
+    반영 건수를 돌려준다 (조회 후 상태가 바뀐 row는 WHERE에서 빠져 건수가 줄 수 있다).
+    """
+    return _execute_many(conn_id, MARK_DONE_SQL,
+                         [{"job_id": jid} for jid in job_ids])
 
 
-def _claim_jobs(conn_id: str, job_ids: list[str], batch_id: str) -> None:
+def _claim_jobs(conn_id: str, job_ids: list[str], batch_id: str) -> int:
     """원자적 IN_PROGRESS 전환 + batch_id(영수증) 기록 (설계 5.3).
-    stat_desc(CLOB)는 값 기록만 — WHERE 조건 사용 금지 (설계 4.2)."""
-    clause, binds = _in_binds(job_ids)
-    OracleHook(oracle_conn_id=conn_id).run(
-        f"UPDATE JOB_HISTORY SET status = 'IN_PROGRESS', stat_desc = :batch_id "
-        f"WHERE job_id IN ({clause}) AND status IN ('WAIT', 'FAILED')",
-        parameters={"batch_id": batch_id, **binds},
-    )
+
+    stat_desc(CLOB)는 값 기록만 — WHERE 조건 사용 금지 (설계 4.2).
+    `status IN ('WAIT','FAILED')` 조건이 있으므로 이미 다른 주체가 가져간 row는
+    반영되지 않는다. 반영 건수를 돌려준다.
+    """
+    return _execute_many(conn_id, CLAIM_SQL,
+                         [{"batch_id": batch_id, "job_id": jid} for jid in job_ids])
 
 
 # --- 기존 구현 연결 스텁 ------------------------------------------------------
@@ -322,8 +337,21 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         "num_executors": min(max(math.ceil(total_mb / 128 * 1.5 / 4), 1), MAX_EXECUTORS),
     })
 
-    for conn_id, ids in picked_ids.items():  # 마킹은 원천 DB별로
-        _claim_jobs(conn_id, ids, batch_id)
+    # 마킹은 원천 DB별로. 반영 건수가 요청 건수와 다르면 = 조회 이후 누군가 그 row의
+    # 상태를 바꿨다는 뜻(설계상 조회 범위가 겹치지 않으므로 발생하면 안 되는 상황).
+    # 선점하지 못한 row를 그대로 Spark에 넘기면 중복 적재가 되므로 여기서 중단한다.
+    # (meta는 이미 기록됐으므로 update_failure가 선점된 row만 FAILED로 회수하고,
+    #  선점 못 한 row는 WAIT/FAILED 상태 그대로 남아 다음 회차에 정상 처리된다)
+    for conn_id, ids in picked_ids.items():
+        claimed = _claim_jobs(conn_id, ids, batch_id)
+        if claimed != len(ids):
+            send_alert(
+                f"재처리 {table_name}({conn_id}): 선점 실패 — 요청 {len(ids)}건 중 "
+                f"{claimed}건만 반영됨. 조회 범위 경합 여부 확인 필요"
+            )
+            raise RuntimeError(
+                f"{table_name}({conn_id}) 선점 건수 불일치: {claimed}/{len(ids)}"
+            )
 
     upload_path_list_to_s3(table_name, picked_rows, batch_id)
     return True
