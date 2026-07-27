@@ -8,7 +8,7 @@
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.2.2, Oracle DB |
 | 시간대 기준 | **KST (Asia/Seoul)** — 모든 날짜/시간 계산에 적용 |
-| 최종 수정일 | 2026-07-14 |
+| 최종 수정일 | 2026-07-27 |
 
 ### 목차
 
@@ -81,12 +81,12 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 
 **핵심 규칙**: append는 항상 "실행 시각-24시간 이후"만 조회한다. 재처리의 WAIT 조회 상한을 **전날 01:00**(= 재처리 스케줄 시각 - 24시간)으로 잡으면, 재처리가 01:00 이후에 도는 한 append의 조회 하한은 항상 전날 01:00 이상이므로 **두 범위는 절대 겹치지 않는다.** FAILED는 append가 아예 조회하지 않으므로 겹침 걱정 없이 전날·그저께 전체를 잡는다.
 
-14일 01:00 실행 기준 (`ts`는 `YYYYMMDDHHmmSSsss` 문자열 비교):
+10일 01:00 실행 기준 (`ts`는 `YYYYMMDDHHmmSSsss` 문자열 비교):
 
 | 대상 | ts 범위 | 이유 |
 |------|---------|------|
-| FAILED | `20260712000000000` ≤ ts < `20260714000000000` (그저께 00:00 ~ 전날 끝) | append는 FAILED를 조회하지 않으므로 전 구간 안전 |
-| WAIT | `20260712000000000` ≤ ts < `20260713010000000` (그저께 00:00 ~ 전날 01:00) | 전날 01:00 이후는 append가 아직 조회 가능한 영역 |
+| FAILED | `20260708000000000` ≤ ts < `20260710000000000` (그저께 00:00 ~ 전날 끝) | append는 FAILED를 조회하지 않으므로 전 구간 안전 |
+| WAIT | `20260708000000000` ≤ ts < `20260709010000000` (그저께 00:00 ~ 전날 01:00) | 전날 01:00 이후는 append가 아직 조회 가능한 영역 |
 | 그저께 이전 | 조회 안 함 | **알림 → 수동 처리** (섹션 8) |
 
 > **경계값은 실행 시각이 아니라 그 날의 01:00 고정값으로 계산한다.** 재실행이나 loop 회차가 늦게 돌아도 경계가 append 조회 하한보다 항상 과거이므로 안전이 유지된다.
@@ -98,12 +98,12 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 **잔류 데이터 회수 타임라인**:
 
 ```
-[FAILED] 13일 15:00 배치 실패 → 14일 01:00 재처리가 회수 (최대 하루 지연)
+[FAILED] 9일 15:00 배치 실패 → 10일 01:00 재처리가 회수 (최대 하루 지연)
 
-[WAIT]   13일 08:00 생성 후 계속 미처리
-         14일 01:00  재처리: WAIT 상한이 13일 01:00 → 대상 아님 (아직 append 담당)
-         14일 08:00  생성 24시간 경과 → append 조회 범위 이탈
-         15일 01:00  재처리: WAIT 범위 [13일 00:00 ~ 14일 01:00) → 회수 ✅ (최대 약 2일 지연)
+[WAIT]   9일 08:00 생성 후 계속 미처리
+         10일 01:00  재처리: WAIT 상한이 9일 01:00 → 대상 아님 (아직 append 담당)
+         10일 08:00  생성 24시간 경과 → append 조회 범위 이탈
+         11일 01:00  재처리: WAIT 범위 [9일 00:00 ~ 10일 01:00) → 회수 ✅ (최대 약 2일 지연)
 ```
 
 append가 `ORDER BY ts ASC`(오래된 것부터)로 소화하므로, 조회 범위 안의 WAIT가 하루 종일 안 집히는 상황 자체가 append 처리량 이상 신호다 — 이 경우는 잔류 알림(섹션 8.1)으로 드러난다.
@@ -163,9 +163,9 @@ FAILED ───────────────────┘        │
 Airflow의 "task 실패" 판정이 항상 "데이터 미적재"를 의미하지 않는다. Iceberg commit은 성공했으나 직후 Driver Pod 종료 오류, Operator-Pod 통신 단절, task timeout 등으로 Airflow가 실패로 판정하는 경우(**거짓 실패**)가 있다. 이 상태에서 FAILED 건을 기계적으로 재적재하면 **같은 데이터가 두 번 들어간다.**
 
 ```
-13일 09:00  Spark job이 Iceberg commit 성공 (데이터 적재됨)
+9일 09:00  Spark job이 Iceberg commit 성공 (데이터 적재됨)
             → 직후 Pod 통신 오류 → Airflow는 실패 판정 → FAILED 기록
-14일 01:00  재처리 DAG이 FAILED를 재적재 → 중복!
+10일 01:00  재처리 DAG이 FAILED를 재적재 → 중복!
 ```
 
 ### 4.2 동작 방식
@@ -242,7 +242,7 @@ check_zombie_jobs                          # 좀비 IN_PROGRESS 탐지 → 알�
 prepare_run                                # params 검증·정규화 1회 → XCom (get_time 패턴)
       │                                    # ts 경계 계산, 수동 범위 검증, date-time → ts 변환
 ┌─ ConvertFileTaskGroup: TABLE_A (기존 append DAG 템플릿 재사용) ─┐
-│  get_jobs            # ← 재처리용 조회 task만 주입             │
+│  get_jobs            # ← ReprocessTaskGroup(상속)이 override   │
 │      │               # (범위·상한·영수증 확인. 대상 0건→skip)  │
 │  append_data         # 템플릿 제공 (Spark append)              │
 │      ├── update_success  [all_success]  # 템플릿 제공          │
@@ -275,16 +275,16 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 
 ```sql
 SELECT * FROM (
-    SELECT job_id, status, stat_desc, avro_path, file_size_mb
+    SELECT job_id, status, stat_desc, ts, avro_path, file_size_mb
       FROM JOB_HISTORY
      WHERE table_name = :tbl
-       AND ts >= :d2_start          -- 그저께 00:00  '20260712000000000'
-       AND ts <  :d1_end            -- 전날 끝       '20260714000000000'
+       AND ts >= :ts_from           -- 그저께 00:00  '20260708000000000'
+       AND ts <  :ts_to             -- 전날 끝       '20260710000000000'
        AND ( status = 'FAILED'                                   -- FAILED: 전 구간
              OR (status = 'WAIT' AND ts < :wait_bound)           -- WAIT: 전날 01:00 이전만
            )
      ORDER BY ts ASC                -- append와 동일, 오래된 것부터
-) WHERE ROWNUM <= 1000
+) WHERE ROWNUM <= :row_limit        -- 1,000 (ts는 meta의 적재 범위 기록용으로 함께 조회)
 ```
    - 수동 실행 시: prepare_run이 검증한 `start_time`~`end_time` 범위의 WAIT+FAILED 전체
    - 조회 직후 **필터 적용 전 조회 건수로 잔여분 여부를 기록** (1,000건을 채웠으면 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 영수증/크기 상한으로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
@@ -444,7 +444,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | 2 | 상태 UPDATE는 XCom의 `job_ids` 목록으로만. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 |
 | 3 | 잔여분 판정은 필터 적용 전 조회 건수(ROW_LIMIT 도달) + 크기 상한 이월 기준 | 5.3 |
 | 4 | IN_PROGRESS 마킹 직후 XCom 먼저 기록, S3 업로드는 그 다음 | 5.3 |
-| 5 | loop 재trigger 조건 = 잔여분 존재 AND 해당 테이블 Spark 성공. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |
+| 5 | loop 재trigger 조건 = 잔여분(상한 초과 이월) 있는 테이블 존재. 지속 실패는 MAX_LOOP(10회) 상한으로 유한 종료. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |
 | 6 | 수동 `start_time`/`end_time`은 함께 지정 + `end_time ≤ 전날 00:00` (전날/당일 거부) — prepare_run에서 검증 | 5.1 |
 | 7 | Compaction trigger는 적재분 전부, `tables` 필터 포함. 날짜/시간 형식은 기존 Compaction DAG params 형식과 일치 확인 | 6.3 |
 
@@ -455,7 +455,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 -- 3~7일 전을 하루 단위 ts 범위로 반복 조회 (Partition Pruning 유지)
 SELECT table_name, status, COUNT(*) AS cnt, SUM(file_size_mb) AS total_mb
   FROM JOB_HISTORY
- WHERE ts >= :day_start AND ts < :day_end      -- 예: '20260711000000000' ~ '20260712000000000'
+ WHERE ts >= :day_start AND ts < :day_end      -- 예: '20260707000000000' ~ '20260708000000000'
    AND status IN ('WAIT', 'FAILED')
  GROUP BY table_name, status;
 -- 결과 존재 시: 알림 → 수동 재처리 절차(8.3)
