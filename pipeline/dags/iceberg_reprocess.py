@@ -6,13 +6,14 @@
 역할: append DAG 조회 기간(최근 1일)에서 밀려난 WAIT/FAILED 데이터를 전날+그저께
       범위에서 회수하고, 적재분에 대해 기존 Compaction DAG을 trigger한다.
 
-구조: 단일 DAG. 테이블별로 기존 ConvertFileTaskGroup을 상속(get_jobs만 override)해
-      순차 실행. params는 prepare_run에서 1회 검증·정규화.
-      잔여분이 남으면 자기 자신을 재trigger (loop, 상한 10회).
+구조: 단일 DAG. 테이블별로 기존 ConvertFileTaskGroup을 재사용하되 재처리용 조회
+      task를 get_jobs_builder 인자로 주입해 순차 실행. params는 prepare_run에서
+      1회 검증·정규화. 잔여분이 남으면 자기 자신을 재trigger (loop, 상한 10회).
 
 ── 기존 구현 연결 지점 (grep "TODO(연결)") ────────────────────────
   1. iceberg.py의 hourly/daily Enum import (자리표시자 2개 교체)
-  2. ConvertFileTaskGroup import + 상속 방식 (ReprocessTaskGroup 주석 참조)
+  2. ConvertFileTaskGroup import + __init__에 get_jobs_builder 옵션 인자 추가
+     (build_reprocess_get_jobs 위 주석 참조)
   3. Oracle conn id
   4. 영수증 snapshot 조회 — snapshot_exists
   5. avro 경로 목록 S3 업로드 — upload_path_list_to_s3
@@ -273,70 +274,60 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     return True
 
 
-# --- 기존 ConvertFileTaskGroup 재사용 (상속 + get_jobs override) -------------
+# --- 기존 ConvertFileTaskGroup 재사용 (get_jobs_builder 주입) ----------------
 #
 # ConvertFileTaskGroup: get_jobs → spark append → [update_success, update_failure]
 # 재처리는 get_jobs(조회)만 다르다.
 #
-# 전제 — 부모 1회 추출 리팩토링 (동작 동일, 섹션 7):
-#   현재 get_jobs는 __init__ 안에 @task(task_group=self)로 인라인 정의되어 있고,
-#   __init__ 지역 함수 _update_jobs를 closure로 호출한다. 따라서
-#   ① get_jobs 블록만 메서드로 이동 ② _update_jobs는 __init__에 그대로 두고
-#   메서드 인자로 전달한다 (closure 참조 → 인자 호출로만 교체):
+# "get_jobs를 메서드로 추출 후 상속 override" 방식은 기각 — 인라인 get_jobs가
+# __init__ 지역값들(설정값, logger, _update_jobs 등)을 closure로 쓰고 있어서,
+# 메서드로 옮기는 순간 그 참조가 전부 끊긴다.
+#
+# 채택 — 부모 __init__에 옵션 인자 하나 + 분기만 추가 (기존 코드는 자리 이동 없음):
 #
 #     class ConvertFileTaskGroup(TaskGroup):
-#         def __init__(self, table, group_id, ..., **kwargs):
+#         def __init__(self, table, group_id, ..., get_jobs_builder=None, **kwargs):
 #             super().__init__(group_id=group_id, **kwargs)
-#             self.table = table
+#             ...설정값, logger, def _update_jobs(...) — 전부 기존 그대로...
 #
-#             def _update_jobs(...):                     # 그대로 __init__에 둠
-#                 ...
+#             if get_jobs_builder is None:
+#                 @task(task_group=self)          # 기존 append 경로: 인라인 코드와
+#                 def get_jobs(ti=None):          # closure 전부 그대로 유지
+#                     ...
+#                 jobs = get_jobs()
+#             else:                                # 재처리 등 외부 주입 경로
+#                 jobs = get_jobs_builder(self, _update_jobs)
 #
-#             jobs = self._build_get_jobs(_update_jobs)  # ← 헬퍼를 인자로 전달
 #             spark = ...
 #             jobs >> spark >> [update_success, update_failure]
 #
-#         def _build_get_jobs(self, update_jobs):
-#             @task(task_group=self)
-#             def get_jobs(ti=None):
-#                 ... 기존 코드 그대로 (update_jobs(...) 호출 포함) ...
-#             return get_jobs()
+# append DAG은 인자를 안 넘기므로 동작이 완전히 동일하고, 재처리는 builder로
+# 자기 조회 task를 그룹 안에 만들어 넣는다.
 #
-# 부모 __init__이 self._build_get_jobs(...)를 호출할 때 자식 override가 실행되므로
-# (파이썬 메서드 디스패치), 재처리는 아래처럼 override만 하면 된다.
-#
-# TODO(연결): 부모 import + __init__ 시그니처·추출 메서드명(_build_get_jobs)·
-#             _update_jobs 시그니처를 실제 정의에 맞출 것.
+# TODO(연결): 부모 import + __init__에 get_jobs_builder 옵션 인자 추가.
 
-class ReprocessTaskGroup(ConvertFileTaskGroup):  # noqa: F821  TODO(연결): 부모 import
-    """ConvertFileTaskGroup 상속 — get_jobs만 재처리 조회로 교체.
-    Spark append / update_success / update_failure는 부모 것을 그대로 사용한다.
+def build_reprocess_get_jobs(table, run_cfg):
+    """ConvertFileTaskGroup(get_jobs_builder=...)에 넘길 builder 생성.
+
+    builder는 부모 __init__이 (그룹 자신, _update_jobs)를 인자로 호출하며,
+    그룹 안에 재처리용 get_jobs task를 만들어 반환한다.
     """
 
-    def __init__(self, table, run_cfg, **kwargs):
-        # 부모 __init__이 _build_get_jobs()를 호출하므로, override가 쓰는 값은
-        # 반드시 super().__init__() 호출 전에 self에 넣어야 한다.
-        self._run_cfg = run_cfg
-        super().__init__(table, **kwargs)  # TODO(연결): 부모 __init__ 시그니처에 맞출 것
-
-    def _build_get_jobs(self, update_jobs):
-        """부모의 get_jobs 생성 메서드 override.
-
-        update_jobs: 부모 __init__의 상태 update 헬퍼.
-        TODO(연결): 시그니처가 맞으면 _mark_done/_claim_jobs 대신 이 헬퍼 사용 가능.
-        """
-        table = self.table  # 부모가 저장한 Enum 그대로 사용
-
+    def builder(group, update_jobs):
+        # update_jobs: 부모 __init__의 상태 update 헬퍼 (closure 그대로 전달받음).
+        # TODO(연결): 시그니처가 맞으면 _mark_done/_claim_jobs 대신 이 헬퍼 사용 가능
         @task.short_circuit(
-            task_group=self,                        # 부모와 동일 — with self: 없이 생성되므로 필수.
-            task_id="get_jobs",                     # 누락 시 dag 레벨 생성 → task_id 충돌
+            task_group=group,                       # builder는 그룹 컨텍스트 밖에서 호출되므로
+            task_id="get_jobs",                     # 명시 필수 — 누락 시 dag 레벨 생성/id 충돌
             trigger_rule="all_done",                # 앞 테이블 실패에도 실행 (순차 그룹)
             ignore_downstream_trigger_rules=False,  # skip을 그룹 내로 한정 (설계 5.2)
         )
         def get_jobs(cfg: dict, run_id=None, ti=None):
             return reprocess_get_jobs(cfg, table=table, run_id=run_id, ti=ti)
 
-        return get_jobs(self._run_cfg)
+        return get_jobs(run_cfg)
+
+    return builder
 
 
 def collect_metas(ti) -> list[dict]:
@@ -504,8 +495,14 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
 
     # 본류: params 정규화 → 테이블별 그룹 순차 → 집계(Compaction/loop) → trigger
     run_cfg = prepare_run()
-    groups = [ReprocessTaskGroup(t, run_cfg, group_id=f"reprocess_{t.get_name()}")
-              for t in ALL_TABLES]
+    groups = [
+        ConvertFileTaskGroup(  # noqa: F821  TODO(연결): 부모 import + 시그니처 확인
+            t,
+            group_id=f"reprocess_{t.get_name()}",
+            get_jobs_builder=build_reprocess_get_jobs(t, run_cfg),
+        )
+        for t in ALL_TABLES
+    ]
     # chain(run_cfg, g1, g2, ..., gN) = prepare_run → 그룹1 → 그룹2 → ... 순차 연결.
     # Spark job이 동시에 여러 개 뜨지 않도록 순차 (K8S 리소스, 설계 5.2).
     # 각 그룹 첫 task(get_jobs)가 trigger_rule="all_done"이라 앞 테이블이
