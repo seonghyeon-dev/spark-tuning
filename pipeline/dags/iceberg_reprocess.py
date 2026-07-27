@@ -214,8 +214,11 @@ def send_alert(message: str, detail=None) -> None:
 
 # --- 재처리 조회 로직 ---------------------------------------------------------
 
-def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
+def reprocess_get_jobs(cfg: dict, *, table, ctx, run_id, ti) -> bool:
     """append get_jobs의 재처리 버전 — 조회 범위·상한·영수증 확인만 다르다.
+
+    ctx: 부모 ConvertFileTaskGroup __init__의 지역 함수/설정 묶음
+         (`update_jobs`, `logger` 등). 헬퍼가 늘어도 이 시그니처는 바뀌지 않는다.
 
     반환 False = 처리 대상 없음 (short_circuit → 그룹 내 하류 skip).
     meta는 key="meta"로 push — 하류 Spark(num_executors)·update(job_ids)·
@@ -261,6 +264,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     committed = {b for b in failed_batches if snapshot_exists(table_name, b)}
     if committed:
         done_rows = [j for j in jobs if j["stat_desc"] in committed]
+        ctx.logger.info("%s: 영수증 확인으로 DONE 정정 %d건", table_name, len(done_rows))
         for conn_id, ids in _ids_by_conn(done_rows).items():  # DONE 정정도 원천 DB별로
             _mark_done(conn_id, ids)
         jobs = [j for j in jobs if j["stat_desc"] not in committed]
@@ -325,6 +329,8 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     for conn_id, ids in ids_by_conn.items():  # 마킹은 원천 DB별로
         _claim_jobs(conn_id, ids, batch_id)
 
+    ctx.logger.info("%s: 재처리 대상 %d건 선점 (batch_id=%s, %.1fGB)",
+                    table_name, len(picked), batch_id, total_mb / 1024)
     upload_path_list_to_s3(table_name, picked, batch_id)
     return True
 
@@ -334,44 +340,58 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
 # ConvertFileTaskGroup: get_jobs → spark append → [update_success, update_failure]
 # 재처리는 get_jobs(조회)만 다르다.
 #
-# "get_jobs를 메서드로 추출 후 상속 override" 방식은 기각 — 인라인 get_jobs가
-# __init__ 지역값들(설정값, logger, _update_jobs 등)을 closure로 쓰고 있어서,
-# 메서드로 옮기는 순간 그 참조가 전부 끊긴다.
+# 상속 override 방식은 기각 — 인라인 get_jobs가 __init__ 지역값들(설정값, logger,
+# _update_jobs 등)을 closure로 쓰고 있어 메서드로 옮기면 참조가 전부 끊긴다.
+# 헬퍼를 파라미터로 하나씩 넘기는 방식도 기각 — 헬퍼가 늘 때마다 시그니처가 깨진다.
 #
-# 채택 — 부모 __init__에 옵션 인자 하나 + 분기만 추가 (기존 코드는 자리 이동 없음):
+# 채택 — 부모 __init__에 (1) 지역 함수들을 self에 노출하는 한 줄과
+#        (2) get_jobs_builder 옵션 인자 + 분기만 추가 (기존 코드는 자리 이동 없음):
 #
 #     class ConvertFileTaskGroup(TaskGroup):
 #         def __init__(self, table, group_id, ..., get_jobs_builder=None, **kwargs):
 #             super().__init__(group_id=group_id, **kwargs)
-#             ...설정값, logger, def _update_jobs(...) — 전부 기존 그대로...
+#             self.table = table
+#             logger = ...            # 기존 지역값 그대로
+#             config = ...
 #
+#             def _update_jobs(...): ...      # 기존 지역 함수 그대로 (이동 없음)
+#             def _other_helper(...): ...     # 다른 지역 함수도 마찬가지
+#
+#             # (1) 지역 함수/값을 self에 노출 — 한 줄. 기존 인라인 get_jobs는
+#             #     여전히 closure로 직접 쓰므로 영향 없다. 헬퍼가 늘면 여기만 추가.
+#             self.ctx = SimpleNamespace(
+#                 update_jobs=_update_jobs, other=_other_helper,
+#                 logger=logger, config=config,
+#             )
+#
+#             # (2) 조회 task 생성 분기
 #             if get_jobs_builder is None:
-#                 @task(task_group=self)          # 기존 append 경로: 인라인 코드와
-#                 def get_jobs(ti=None):          # closure 전부 그대로 유지
+#                 @task(task_group=self)      # 기존 append 경로: 인라인 코드와
+#                 def get_jobs(ti=None):      # closure 전부 그대로 유지
 #                     ...
 #                 jobs = get_jobs()
-#             else:                                # 재처리 등 외부 주입 경로
-#                 jobs = get_jobs_builder(self, _update_jobs)
+#             else:
+#                 jobs = get_jobs_builder(self)   # ← 인자는 그룹 하나뿐
 #
 #             spark = ...
 #             jobs >> spark >> [update_success, update_failure]
 #
-# append DAG은 인자를 안 넘기므로 동작이 완전히 동일하고, 재처리는 builder로
-# 자기 조회 task를 그룹 안에 만들어 넣는다.
+# builder는 group.ctx로 필요한 헬퍼를 골라 쓴다 — 헬퍼가 몇 개든 builder 시그니처는
+# 그대로다. append DAG은 인자를 안 넘기므로 동작이 완전히 동일하다.
 #
-# TODO(연결): 부모 import + __init__에 get_jobs_builder 옵션 인자 추가.
-#             변경 예시 전체: pipeline/examples/convert_file_taskgroup_example.py
+# TODO(연결): 부모 import + 위 (1)(2) 두 줄 추가. self.ctx의 속성명은 실제
+#             지역 함수명에 맞출 것. 변경 예시 전체:
+#             pipeline/examples/convert_file_taskgroup_example.py
 
 def build_reprocess_get_jobs(table, run_cfg):
-    """ConvertFileTaskGroup(get_jobs_builder=...)에 넘길 builder 생성.
+    """ConvertFileTaskGroup(get_jobs_builder=...)에 넘길 builder를 만든다.
 
-    builder는 부모 __init__이 (그룹 자신, _update_jobs)를 인자로 호출하며,
-    그룹 안에 재처리용 get_jobs task를 만들어 반환한다.
+    부모 __init__은 builder(group) 형태로 그룹 인스턴스 하나만 넘기고,
+    builder는 그룹 안에 재처리용 get_jobs task를 만들어 반환한다.
+    부모 __init__의 지역 함수·설정값은 group.ctx로 접근한다.
     """
 
-    def builder(group, update_jobs):
-        # update_jobs: 부모 __init__의 상태 update 헬퍼 (closure 그대로 전달받음).
-        # TODO(연결): 시그니처가 맞으면 _mark_done/_claim_jobs 대신 이 헬퍼 사용 가능
+    def builder(group):
         @task.short_circuit(
             task_group=group,                       # builder는 그룹 컨텍스트 밖에서 호출되므로
             task_id="get_jobs",                     # 명시 필수 — 누락 시 dag 레벨 생성/id 충돌
@@ -379,7 +399,10 @@ def build_reprocess_get_jobs(table, run_cfg):
             ignore_downstream_trigger_rules=False,  # skip을 그룹 내로 한정 (설계 5.2)
         )
         def get_jobs(cfg: dict, run_id=None, ti=None):
-            return reprocess_get_jobs(cfg, table=table, run_id=run_id, ti=ti)
+            # group.ctx: 부모 __init__의 지역 함수/설정 묶음 (update_jobs, logger 등).
+            # 헬퍼가 추가돼도 이 호출부는 바뀌지 않는다.
+            return reprocess_get_jobs(cfg, table=table, ctx=group.ctx,
+                                      run_id=run_id, ti=ti)
 
         return get_jobs(run_cfg)
 
