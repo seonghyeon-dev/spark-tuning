@@ -32,7 +32,7 @@
 | 구성 요소 | 내용 |
 |----------|------|
 | Iceberg 테이블 | **20개 이상**. 첫 파티션 기준 hourly 그룹(`hour` hidden partition)과 daily 그룹(`day` hidden partition)으로 분류 |
-| Job History (Oracle) | 처리 대상 상태 관리 테이블. `table_name`(대상 테이블), `ts`(string, `YYYYMMDDHHmmSSsss` 밀리세컨즈 — 날짜 파티셔닝 키이자 조회 기준), `status`, `stat_desc`(CLOB, 현재 미사용) 등 |
+| Job History (Oracle) | 처리 대상 상태 관리 테이블. **Oracle DB 2개(a/b)에 동일 스키마로 존재** — append DAG은 conn_list(conn_id 2개) loop로 같은 쿼리를 DB별로 실행. 컬럼: `table_name`(대상 테이블), `ts`(string, `YYYYMMDDHHmmSSsss` 밀리세컨즈 — 날짜 파티셔닝 키이자 조회 기준), `status`, `stat_desc`(CLOB, 현재 미사용) 등. `job_id`는 DB 간 유일 보장 없음 |
 | append DAG | py 파일 1개에서 loop로 **테이블별 DAG 동적 생성** (테이블당 1개 실행). 약 5분 주기. `get_jobs`가 `table_name` 조건 + `ts` 최근 1일 범위 + `status='WAIT'`을 `ORDER BY ts ASC`, `ROWNUM <= 200`으로 조회 |
 | Compaction DAG | **hourly DAG 1개**(`15 * * * *`, 직전 1시간치) + **daily DAG 1개**(현재 `35 0 * * *`, 전일치). 각 DAG 내부에서 소속 테이블 task가 순차 실행. `max_active_runs=1`. UI 수동 실행용 params: daily는 `target_dt`, hourly는 `start_time`/`end_time` |
 | DB 상태 처리 | callback이 아닌 `update_success`(`trigger_rule=all_success`) / `update_failure`(`all_failed`) task 방식 — callback은 DB update 지연 시 작업이 kill되는 문제가 있었음 |
@@ -264,6 +264,7 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
 - **상태 update의 대상 식별은 XCom의 job_id 목록으로만**: `stat_desc`(batch_id)는 CLOB이라 WHERE 조건 사용 금지 (섹션 4.2 제약). update_success/update_failure는 get_jobs가 XCom(meta.job_ids)에 남긴 목록으로 UPDATE한다
+- **모든 상태 UPDATE는 row의 원천 DB로 되돌아간다**: Job History가 DB 2개에 있고 `job_id`는 DB 간 유일 보장이 없으므로, 조회 시 태깅한 `conn_id`로 그룹핑해 각 DB에 UPDATE한다. `meta.job_ids`는 단일 리스트가 아니라 **`{conn_id: [job_id, ...]}` 형태**이며, update task도 conn별 loop로 처리한다
 - **params는 prepare_run에서만 읽는다**: 기존 append DAG의 get_time 패턴과 동일. 검증·형식 변환(`ts` 경계 계산, 수동 범위 검증, date-time → ts 문자열 변환)을 첫 task에서 1회 수행하고, 이후 task들은 정규화된 XCom 값만 소비한다. 잘못된 입력은 파이프라인 중간이 아닌 첫 task에서 즉시 실패하고, TaskGroup 템플릿이 DAG params에 결합되지 않아 재사용이 가능해진다
 
 ### 5.3 get_jobs(재처리 조회) 처리 순서 (테이블별)
@@ -271,9 +272,10 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 선행 task `prepare_run`이 params 검증과 `ts` 경계 계산을 1회 수행해 XCom으로 내려보내며(수동 범위 검증, date-time → ts 문자열 변환 포함), 재처리 조회 로직은 정규화된 값만 사용한다.
 
 1. **실행 대상 확인** — 정규화된 `tables` 목록에 자기 테이블이 없으면 즉시 skip
-2. **대상 조회** — `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한:
+2. **대상 조회** — **Oracle DB 2개에 동일 쿼리를 반복**(append의 conn_list loop 패턴)하고 각 row에 원천 `conn_id`를 태깅한 뒤 전체를 `ts` 오름차순으로 병합 정렬한다. `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한(**DB당** 적용):
 
 ```sql
+-- conn_list의 DB 2개에 각각 실행 (결과는 conn_id 태깅 후 ts 기준 병합 정렬)
 SELECT * FROM (
     SELECT job_id, status, stat_desc, ts, avro_path, file_size_mb
       FROM JOB_HISTORY
@@ -298,11 +300,11 @@ SELECT * FROM (
 
 | 항목 | 값 | 보호 대상 | 근거 수준 |
 |------|-----|----------|----------|
-| 테이블당 조회 row 수 | 1,000 (ROWNUM) | Oracle SELECT 성능, XCom 크기, avro 경로 목록 파일 크기 | ⚠️ 러프 설정 — 재검증 필요 |
+| 테이블당·**DB당** 조회 row 수 | 1,000 (ROWNUM) | Oracle SELECT 성능, XCom 크기, avro 경로 목록 파일 크기. DB 2개이므로 테이블당 최대 2,000건이 병합될 수 있음 | ⚠️ 러프 설정 — 재검증 필요 |
 | 테이블당 처리 총 크기 | 16GB | Spark 리소스, 처리 소요시간. 벤치마크 검증 범위(~8GB, 24 executors)의 2배 이내 | ⚠️ 러프 설정 — 재검증 필요 |
 | num_executors | 24 | 벤치마크에서 32 이상은 성능 저하 확인 (spark-tuning-guide.md 2.2.3) | ✅ 벤치마크 검증 |
 
-**규모 감각**: append는 약 5분 주기에 조회 상한 200 rows(5분치 유입 ≈ 200 rows). 재처리 상한 1,000 rows ≈ 약 25분치 물량. 정상 운영의 하루 잔여분은 이보다 훨씬 적을 것으로 예상하지만, 상한값은 검증된 값이 아니므로 운영 데이터로 재조정한다.
+**규모 감각**: append는 약 5분 주기에 조회 상한 200 rows(DB당). 재처리 상한 1,000 rows(DB당) ≈ 약 25분치 물량. 정상 운영의 하루 잔여분은 이보다 훨씬 적을 것으로 예상하지만, 상한값은 검증된 값이 아니므로 운영 데이터로 재조정한다.
 
 > **K8S 리소스 경합 주의**: 재처리 Spark job(최대 24 executor, 96 core, ~213GB)이 도는 동안에도 약 5분 주기 append job이 뜬다. 동시 실행 시 최대 **~192 core, ~427GB**. 클러스터 여유가 부족하면 재처리 job의 executor 상한을 낮춘다(예: 12 — 지연 데이터이므로 처리 속도의 우선순위가 낮음).
 
@@ -401,7 +403,7 @@ append DAG의 조회 로직(최근 1일, WAIT만, ts ASC, ROWNUM 200)과 update 
 
 get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장애, worker 강제 종료 — update task 2개 모두 미실행) 해당 row는 어느 DAG도 집지 않는다.
 
-- 재처리 DAG 선행 task(`check_zombie_jobs`)가 임계 시간(2시간, 정상 처리 수 분 대비 충분한 여유) 초과 IN_PROGRESS를 전체 테이블 대상으로 탐지해 **알림만** 발송한다
+- 재처리 DAG의 독립 task(`check_zombie_jobs`)가 임계 시간(2시간, 정상 처리 수 분 대비 충분한 여유) 초과 IN_PROGRESS를 **양쪽 DB의** 전체 테이블 대상으로 탐지해 **알림만** 발송한다 (알림에 발견된 `conn_id` 포함 — 수동 정정 시 대상 DB 식별용)
 - 자동 복구는 하지 않는다 — 판정은 사람이 영수증 확인으로 수행:
   - 해당 테이블 snapshot에 그 batch_id **있음** → 적재 완료 → DONE으로 수동 정정
   - **없음** → 미적재 → WAIT로 수동 복구 (다음 주기에 자동 처리됨)
@@ -428,6 +430,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | 5 | Spark task retries | `retries=2`, `retry_delay=5분` 권장 (일시적 오류 1차 방어) |
 | 6 | 시간대 | 모든 DAG `Asia/Seoul` timezone 명시. `ts` 경계 계산 KST 기준 |
 | 7 | stat_desc 컬럼 | batch_id 용도 전환 공유. **WHERE 조건 사용 금지** (CLOB — 값 기록/읽기만) |
+| 7-1 | Oracle conn 목록 | append DAG의 conn_list와 동일 소스 사용. 조회·상태 UPDATE·좀비 탐지 모두 DB 2개 대상 |
 | 8 | 처리 상한 재검증 | 테이블당 row 1,000 / 16GB / loop 10회는 러프 설정 — 운영 데이터로 재조정 |
 
 ---
@@ -441,7 +444,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | # | 포인트 | 설계 근거 |
 |---|--------|----------|
 | 1 | ShortCircuit task는 `ignore_downstream_trigger_rules=False` 필수 — 기본값이면 첫 skip에서 뒤 테이블 그룹 전체가 skip됨 | 5.2 |
-| 2 | 상태 UPDATE는 XCom의 `job_ids` 목록으로만. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 |
+| 2 | 상태 UPDATE는 XCom의 `job_ids`(conn별 dict)로만, **원천 DB에 각각** 실행. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 / 5.2 |
 | 3 | 잔여분 판정은 필터 적용 전 조회 건수(ROW_LIMIT 도달) + 크기 상한 이월 기준 | 5.3 |
 | 4 | IN_PROGRESS 마킹 직후 XCom 먼저 기록, S3 업로드는 그 다음 | 5.3 |
 | 5 | loop 재trigger 조건 = 잔여분(상한 초과 이월) 있는 테이블 존재. 지속 실패는 MAX_LOOP(10회) 상한으로 유한 종료. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |
@@ -452,7 +455,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 ### 잔류 데이터 알림 쿼리 (별도 모니터링, 섹션 8.1)
 
 ```sql
--- 3~7일 전을 하루 단위 ts 범위로 반복 조회 (Partition Pruning 유지)
+-- DB 2개 각각에 실행. 3~7일 전을 하루 단위 ts 범위로 반복 조회 (Partition Pruning 유지)
 SELECT table_name, status, COUNT(*) AS cnt, SUM(file_size_mb) AS total_mb
   FROM JOB_HISTORY
  WHERE ts >= :day_start AND ts < :day_end      -- 예: '20260701000000000' ~ '20260702000000000'

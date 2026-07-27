@@ -14,7 +14,7 @@
   1. iceberg.py의 hourly/daily Enum import (자리표시자 2개 교체)
   2. ConvertFileTaskGroup import + __init__에 get_jobs_builder 옵션 인자 추가
      (build_reprocess_get_jobs 위 주석 참조)
-  3. Oracle conn id
+  3. Oracle conn 목록 — append DAG의 conn_list와 동일 소스 (DB 2개 동일 스키마)
   4. 영수증 snapshot 조회 — snapshot_exists
   5. avro 경로 목록 S3 업로드 — upload_path_list_to_s3
   6. 알림 채널 — send_alert
@@ -38,9 +38,11 @@ from airflow.sdk import Param, chain, dag, task
 KST = pendulum.timezone("Asia/Seoul")
 DAG_ID = Path(__file__).stem  # 조직 컨벤션: dag_id는 파일명에서 파생 (단일 소스)
 
-ORACLE_CONN_ID = "oracle_default"  # TODO(연결): 실제 conn id (append DAG과 동일)
+# Oracle DB 2개(a/b)에 동일 스키마의 Job History가 있어 같은 쿼리를 DB별로 반복한다.
+# TODO(연결): append DAG이 쓰는 conn_list와 동일 소스 사용
+ORACLE_CONN_IDS = ["oracle_a", "oracle_b"]
 
-ROW_LIMIT = 1000              # 테이블당 조회 상한 (설계 5.4 — 러프 설정, 재검증 필요)
+ROW_LIMIT = 1000              # 테이블당·DB당 조회 상한 (설계 5.4 — 러프 설정, 재검증 필요)
 SIZE_LIMIT_MB = 16 * 1024     # 테이블당 크기 상한 16GB (설계 5.4 — 러프 설정, 재검증 필요)
 MAX_EXECUTORS = 24            # 벤치마크 검증 상한 (spark-tuning-guide.md 2.2.3)
 MAX_LOOP = 10                 # 자기 재trigger 상한 (설계 5.5)
@@ -133,9 +135,9 @@ SELECT table_name, job_id, updated_at
 """
 
 
-def _rows(sql: str, binds: dict, columns: tuple[str, ...]) -> list[dict]:
+def _rows(conn_id: str, sql: str, binds: dict, columns: tuple[str, ...]) -> list[dict]:
     """OracleHook.get_records → 컬럼명 dict 매핑. columns는 SELECT 순서와 일치해야 한다."""
-    records = OracleHook(oracle_conn_id=ORACLE_CONN_ID).get_records(sql, parameters=binds)
+    records = OracleHook(oracle_conn_id=conn_id).get_records(sql, parameters=binds)
     return [dict(zip(columns, r)) for r in records]
 
 
@@ -153,21 +155,36 @@ def _in_binds(values: list) -> tuple[str, dict]:
     return ", ".join(f":{k}" for k in binds), binds
 
 
-def _mark_done(job_ids: list[str]) -> None:
+def _ids_by_conn(jobs: list[dict]) -> dict[str, list[str]]:
+    """row 목록을 원천 DB별 job_id 목록으로 그룹핑.
+
+    상태 UPDATE는 반드시 row를 가져온 DB로 되돌아가야 한다 — job_id는
+    두 DB 사이에서 유일하다는 보장이 없으므로 conn 구분 없이 섞으면 안 된다.
+
+    예) [{conn_id:'a', job_id:'J1'}, {conn_id:'b', job_id:'J1'}, {conn_id:'a', job_id:'J2'}]
+        → {'a': ['J1', 'J2'], 'b': ['J1']}
+    """
+    out: dict[str, list[str]] = {}
+    for j in jobs:
+        out.setdefault(j["conn_id"], []).append(j["job_id"])
+    return out
+
+
+def _mark_done(conn_id: str, job_ids: list[str]) -> None:
     """영수증으로 커밋이 확인된 FAILED row를 DONE으로 정정 (설계 4.2)."""
     clause, binds = _in_binds(job_ids)
-    OracleHook(oracle_conn_id=ORACLE_CONN_ID).run(
+    OracleHook(oracle_conn_id=conn_id).run(
         f"UPDATE JOB_HISTORY SET status = 'DONE' "
         f"WHERE job_id IN ({clause}) AND status = 'FAILED'",
         parameters=binds,
     )
 
 
-def _claim_jobs(job_ids: list[str], batch_id: str) -> None:
+def _claim_jobs(conn_id: str, job_ids: list[str], batch_id: str) -> None:
     """원자적 IN_PROGRESS 전환 + batch_id(영수증) 기록 (설계 5.3).
     stat_desc(CLOB)는 값 기록만 — WHERE 조건 사용 금지 (설계 4.2)."""
     clause, binds = _in_binds(job_ids)
-    OracleHook(oracle_conn_id=ORACLE_CONN_ID).run(
+    OracleHook(oracle_conn_id=conn_id).run(
         f"UPDATE JOB_HISTORY SET status = 'IN_PROGRESS', stat_desc = :batch_id "
         f"WHERE job_id IN ({clause}) AND status IN ('WAIT', 'FAILED')",
         parameters={"batch_id": batch_id, **binds},
@@ -211,16 +228,26 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     if table_name not in cfg["tables"]:
         return False  # 수동 실행에서 미선택 → skip
 
-    jobs = _rows(
-        SELECT_TARGETS_SQL,
-        {"tbl": table_name, "ts_from": cfg["ts_from"], "ts_to": cfg["ts_to"],
-         "wait_bound": cfg["wait_bound"], "row_limit": ROW_LIMIT},
-        JOB_COLUMNS,
-    )
-    # 조회가 ROW_LIMIT을 꽉 채웠다 = DB에 더 남아 있다는 신호.
-    # 아래 영수증/크기 필터로 jobs가 줄어든 "후"의 건수로 판단하면 이 신호를
-    # 놓치므로, 반드시 필터 적용 "전"에 기록해 둔다 (설계 5.3)
-    fetched_full = len(jobs) >= ROW_LIMIT
+    # ── 조회: Oracle DB 2개(a/b)에 같은 쿼리를 반복 (append의 conn_list 패턴) ──
+    # 각 row에 원천 conn_id를 태깅한다 — 이후 모든 상태 UPDATE는 이 값으로
+    # 자기 DB를 찾아간다 (job_id는 DB 간 유일 보장 없음).
+    # ROW_LIMIT은 append(DB당 200)와 동일하게 DB당 적용된다.
+    jobs, fetched_full = [], False
+    for conn_id in ORACLE_CONN_IDS:
+        rows = _rows(
+            conn_id, SELECT_TARGETS_SQL,
+            {"tbl": table_name, "ts_from": cfg["ts_from"], "ts_to": cfg["ts_to"],
+             "wait_bound": cfg["wait_bound"], "row_limit": ROW_LIMIT},
+            JOB_COLUMNS,
+        )
+        # 어느 한쪽 DB라도 상한을 꽉 채웠으면 = 그 DB에 더 남아 있다는 신호.
+        # 아래 영수증/크기 필터로 줄어든 "후"의 건수로 판단하면 신호를 놓치므로
+        # 반드시 필터 적용 "전"에 기록해 둔다 (설계 5.3)
+        fetched_full = fetched_full or len(rows) >= ROW_LIMIT
+        for r in rows:
+            r["conn_id"] = conn_id
+        jobs += rows
+    jobs.sort(key=lambda j: j["ts"])  # DB별 결과를 전체 ts 오름차순으로 병합
 
     # ── 영수증 확인 (설계 4): "거짓 실패" 걸러내기 ──────────────────────────
     # Airflow가 실패로 판정했어도 Iceberg 커밋은 성공했을 수 있다 (커밋 직후
@@ -233,7 +260,9 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
                       if j["status"] == "FAILED" and j["stat_desc"]}
     committed = {b for b in failed_batches if snapshot_exists(table_name, b)}
     if committed:
-        _mark_done([j["job_id"] for j in jobs if j["stat_desc"] in committed])
+        done_rows = [j for j in jobs if j["stat_desc"] in committed]
+        for conn_id, ids in _ids_by_conn(done_rows).items():  # DONE 정정도 원천 DB별로
+            _mark_done(conn_id, ids)
         jobs = [j for j in jobs if j["stat_desc"] not in committed]
 
     # ── 크기 상한 적용 (설계 5.4) ───────────────────────────────────────────
@@ -250,7 +279,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         # 정상 케이스는 "처리할 게 없어서 빈 것"(jobs도 비고 상한 미달)뿐이다.
         # 그 외는 조용히 skip하면 안 되는 비정상 신호라 알림으로 노출한다:
         #   jobs 비어있지 않음 → 선두 job 하나가 크기 상한(16GB) 초과 (매일 반복될 데이터)
-        #   fetched_full      → 1,000건이 전부 영수증 정정으로 소진 — DB에 더 남아
+        #   fetched_full      → 조회분이 전부 영수증 정정으로 소진 — DB에 더 남아
         #                        있는데 meta가 없어 loop의 잔여분 신호가 유실됨
         if jobs or fetched_full:
             send_alert(
@@ -260,24 +289,29 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         return False
 
     # 잔여분(leftover) 판정 — 둘 중 하나라도 참이면 "아직 남았다":
-    #   fetched_full           : 조회가 1,000건을 꽉 채움 → DB에 더 있음
+    #   fetched_full           : 어느 한 DB라도 조회 상한(1,000)을 꽉 채움 → 그 DB에 더 있음
     #   len(picked) < len(jobs): 크기 상한으로 뒤쪽이 잘림 → 이번에 못 담은 게 있음
     # (영수증으로 제외된 건은 '처리 완료 정정'이라 잔여분이 아님 —
     #  이미 jobs에서 빠진 뒤라 이 비교에 영향을 주지 않는다)
     leftover = fetched_full or len(picked) < len(jobs)
 
+    # batch_id는 배치당 1개 — 두 DB에서 온 row들이 하나의 Spark 커밋으로 적재되므로
+    # 양쪽 DB의 row 모두 같은 batch_id를 달고, 영수증 확인도 snapshot 1곳에서 끝난다
     batch_id = f"{run_id}_{table_name}"
-    _claim_jobs([j["job_id"] for j in picked], batch_id)
+    for conn_id, ids in _ids_by_conn(picked).items():  # 마킹은 원천 DB별로
+        _claim_jobs(conn_id, ids, batch_id)
 
     # 마킹 직후 meta 기록 — 이후 단계 실패 시에도 update_failure가 job_ids로 회수 (설계 5.3)
     # TODO(연결): meta의 key/필드명은 append get_jobs가 push하는 스키마와 필드 단위로
     #             일치시킬 것 — 부모의 Spark(num_executors)·update(job_ids) task가
-    #             append과 같은 방식으로 이 XCom을 소비한다
+    #             append과 같은 방식으로 이 XCom을 소비한다.
+    #             job_ids는 conn별 dict — update task도 conn_list loop로 각 DB에
+    #             UPDATE하는 append 방식과 동일해야 한다
     ti.xcom_push(key="meta", value={
         "table": table_name,
         "group": compaction_group(table),
         "batch_id": batch_id,
-        "job_ids": [j["job_id"] for j in picked],
+        "job_ids": _ids_by_conn(picked),   # {conn_id: [job_id, ...]} — 원천 DB별
         "leftover": leftover,
         "ts_min": picked[0]["ts"], "ts_max": picked[-1]["ts"],
         # append DAG과 동일 산정식: ceil(총크기/128MB × 1.5 / executor-cores 4)
@@ -386,9 +420,15 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
 
     @task
     def check_zombie_jobs():
-        """좀비 IN_PROGRESS 탐지 → 알림만 (설계 8.2). 독립 실행 — 본류와 의존 없음."""
-        zombies = _rows(ZOMBIE_SQL, {"h": ZOMBIE_HOURS},
-                        ("table_name", "job_id", "updated_at"))
+        """좀비 IN_PROGRESS 탐지 → 알림만 (설계 8.2). 독립 실행 — 본류와 의존 없음.
+        Oracle 2개 모두 조회한다 (어느 DB에서 발견됐는지 알림에 포함)."""
+        zombies = []
+        for conn_id in ORACLE_CONN_IDS:
+            rows = _rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS},
+                         ("table_name", "job_id", "updated_at"))
+            for r in rows:
+                r["conn_id"] = conn_id
+            zombies += rows
         if zombies:
             send_alert(f"좀비 IN_PROGRESS {len(zombies)}건 — 영수증 확인 후 수동 판정 필요",
                        zombies)
