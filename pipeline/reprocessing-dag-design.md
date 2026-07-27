@@ -378,7 +378,7 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 | 대상 | 변경 | 내용 |
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 2건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 |
-| ConvertFileTaskGroup | get_jobs 생성부 메서드 추출 | `__init__` 인라인의 `@task(task_group=self) def get_jobs` 블록을 `_build_get_jobs()` 메서드로 이동하고 `__init__`은 호출로 교체. **코드 이동만 — 동작 완전 동일** (append DAG 그래프/로직 변화 없음). 재처리의 `ReprocessTaskGroup`이 이 메서드를 override하기 위한 전제 |
+| ConvertFileTaskGroup | get_jobs 생성부 메서드 추출 | `__init__` 인라인의 `@task(task_group=self) def get_jobs` 블록을 `_build_get_jobs(update_jobs)` 메서드로 이동하고 `__init__`은 호출로 교체. get_jobs가 closure로 참조하던 `__init__` 지역 함수 `_update_jobs`는 **그대로 두고 메서드 인자로 전달** (closure 참조 → 인자 호출로만 교체, 다른 task의 사용은 영향 없음). **동작 완전 동일** — 재처리의 `ReprocessTaskGroup`이 이 메서드를 override하기 위한 전제 |
 | daily Compaction DAG | 스케줄 + params | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체) |
 | hourly Compaction DAG | params | params에 `tables` multi-select 추가 (기본 전체). 스케줄 변경 없음 |
 

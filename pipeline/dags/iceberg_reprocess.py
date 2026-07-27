@@ -220,29 +220,35 @@ def reprocess_get_jobs(cfg: dict, *, table_name: str, group: str, run_id, ti) ->
 # ConvertFileTaskGroup은 get_jobs → spark append → [update_success, update_failure]
 # 흐름을 담고 있고, 재처리는 이 중 get_jobs(조회)만 다르다.
 #
-# 전제 — 부모 1회 추출 리팩토링 (동작 완전 동일, 코드 이동만. 섹션 7):
-#   현재 get_jobs는 __init__ 안에 @task(task_group=self)로 인라인 정의되어 있어
-#   override가 불가능하다. __init__의 해당 블록을 메서드로 옮기고 호출로 바꾼다:
+# 전제 — 부모 1회 추출 리팩토링 (동작 동일, 섹션 7):
+#   현재 get_jobs는 __init__ 안에 @task(task_group=self)로 인라인 정의되어 있고,
+#   같은 __init__ 지역 함수 _update_jobs를 closure로 호출한다. 따라서
+#   ① get_jobs 블록만 메서드로 이동하고 ② _update_jobs는 __init__에 그대로 둔 채
+#   메서드 인자로 전달한다 (closure 참조 → 인자 호출로만 교체):
 #
 #     class ConvertFileTaskGroup(TaskGroup):
 #         def __init__(self, table, group_id, ..., **kwargs):
 #             super().__init__(group_id=group_id, **kwargs)
 #             self.table = table
-#             jobs = self._build_get_jobs()   # ← __init__에서 바뀌는 건 이 줄뿐
+#
+#             def _update_jobs(...):                     # 그대로 __init__에 둠
+#                 ...                                    # (다른 task가 써도 영향 없음)
+#
+#             jobs = self._build_get_jobs(_update_jobs)  # ← 헬퍼를 인자로 전달
 #             spark = ...
 #             jobs >> spark >> [update_success, update_failure]
 #
-#         def _build_get_jobs(self):
+#         def _build_get_jobs(self, update_jobs):
 #             @task(task_group=self)
 #             def get_jobs(ti=None):
-#                 ... 기존 인라인 코드 그대로 이동 (self.table 등 그대로 접근) ...
+#                 ... 기존 코드 그대로 (update_jobs(...) 호출 포함) ...
 #             return get_jobs()
 #
-# 그러면 부모 __init__이 self._build_get_jobs()를 호출할 때 자식의 override가
+# 그러면 부모 __init__이 self._build_get_jobs(...)를 호출할 때 자식의 override가
 # 실행되므로(파이썬 메서드 디스패치), 재처리는 아래처럼 override만 하면 된다.
 #
-# TODO(연결): 부모 import + __init__ 시그니처·추출 메서드명(_build_get_jobs)을
-#             실제 정의에 맞출 것.
+# TODO(연결): 부모 import + __init__ 시그니처·추출 메서드명(_build_get_jobs)·
+#             _update_jobs 시그니처를 실제 정의에 맞출 것.
 
 class ReprocessTaskGroup(ConvertFileTaskGroup):  # noqa: F821  TODO(연결): 부모 import
     """ConvertFileTaskGroup 상속 — get_jobs만 재처리 조회로 교체.
@@ -255,9 +261,13 @@ class ReprocessTaskGroup(ConvertFileTaskGroup):  # noqa: F821  TODO(연결): 부
         self._run_cfg = run_cfg
         super().__init__(table, **kwargs)  # TODO(연결): 부모 __init__ 시그니처에 맞출 것
 
-    def _build_get_jobs(self):
+    def _build_get_jobs(self, update_jobs):
         """부모의 get_jobs 생성 메서드 override.
         조회 범위·상한·영수증 확인만 다르고, 계약(False=대상없음→skip, meta push)은 동일.
+
+        update_jobs: 부모 __init__의 상태 update 헬퍼 (인자로 전달받음).
+        TODO(연결): 시그니처가 맞으면 재처리의 DONE 정정/IN_PROGRESS 마킹도 이
+        헬퍼로 교체 가능 (그 경우 이 파일의 _update_status 제거).
         """
         table_name = self.table.get_name()   # 부모가 저장한 table 그대로 사용
         group = compaction_group(self.table)
