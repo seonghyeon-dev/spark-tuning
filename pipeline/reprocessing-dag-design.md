@@ -267,7 +267,7 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
 - **상태 update의 대상 식별은 XCom의 job_id 목록으로만**: `stat_desc`(batch_id)는 CLOB이라 WHERE 조건 사용 금지 (섹션 4.2 제약). update_success/update_failure는 get_jobs가 XCom(meta.job_ids)에 남긴 목록으로 UPDATE한다
-- **모든 상태 UPDATE는 row의 원천 DB로 되돌아간다**: Job History가 DB 2개에 있고 `job_id`는 DB 간 유일 보장이 없으므로, 조회 시 태깅한 `conn_id`로 그룹핑해 각 DB에 UPDATE한다. `meta.job_ids`는 단일 리스트가 아니라 **`{conn_id: [job_id, ...]}` 형태**이며, update task도 conn별 loop로 처리한다
+- **모든 상태 UPDATE는 row의 원천 DB로 되돌아간다**: Job History가 DB 2개에 있고 `job_id`는 DB 간 유일 보장이 없으므로, 조회 결과를 담은 `{conn_id: rows}` 구조를 그대로 사용해 각 DB에 UPDATE한다. `meta.job_ids`는 단일 리스트가 아니라 **`{conn_id: [job_id, ...]}` 형태**이며, update task도 conn별 loop로 처리한다
 - **params는 prepare_run에서만 읽는다**: 기존 append DAG의 get_time 패턴과 동일. 검증·형식 변환(`ts` 경계 계산, 수동 범위 검증, date-time → ts 문자열 변환)을 첫 task에서 1회 수행하고, 이후 task들은 정규화된 XCom 값만 소비한다. 잘못된 입력은 파이프라인 중간이 아닌 첫 task에서 즉시 실패하고, TaskGroup 템플릿이 DAG params에 결합되지 않아 재사용이 가능해진다
 
 ### 5.3 get_jobs(재처리 조회) 처리 순서 (테이블별)
@@ -275,7 +275,7 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 선행 task `prepare_run`이 params 검증과 `ts` 경계 계산을 1회 수행해 XCom으로 내려보내며(수동 범위 검증, date-time → ts 문자열 변환 포함), 재처리 조회 로직은 정규화된 값만 사용한다.
 
 1. **실행 대상 확인** — 정규화된 `tables` 목록에 자기 테이블이 없으면 즉시 skip
-2. **대상 조회** — **Oracle DB 2개에 동일 쿼리를 반복**(append의 conn_list loop 패턴)하고 각 row에 원천 `conn_id`를 태깅한 뒤 전체를 `ts` 오름차순으로 병합 정렬한다. `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한(**DB당** 적용):
+2. **대상 조회** — **Oracle DB 2개에 동일 쿼리를 반복**(append의 conn_list loop 패턴)하고 결과를 `{conn_id: rows}` dict로 보관한다 (상태 UPDATE가 이 키로 원천 DB를 찾아가므로 row에 출처를 태깅할 필요가 없다). 크기 상한을 적용할 때만 `(row, conn_id)` 쌍으로 펼쳐 전체 `ts` 오름차순 정렬한다. `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한(**DB당** 적용):
 
 ```sql
 -- conn_list의 DB 2개에 각각 실행 (결과는 conn_id 태깅 후 ts 기준 병합 정렬)
@@ -449,7 +449,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | # | 포인트 | 설계 근거 |
 |---|--------|----------|
 | 1 | ShortCircuit task는 `ignore_downstream_trigger_rules=False` 필수 — 기본값이면 첫 skip에서 뒤 테이블 그룹 전체가 skip됨 | 5.2 |
-| 2 | 조회는 conn_list loop로 DB별 실행 → 각 row에 `conn_id` 태깅 → 전체 `ts` 오름차순 병합 정렬 | 5.3 |
+| 2 | 조회 결과는 `{conn_id: rows}` dict로 보관 (row 태깅·재그룹핑 없음). 크기 상한 적용 시에만 `(row, conn_id)`로 펼쳐 `ts` 정렬 | 5.3 |
 | 2-1 | 상태 UPDATE는 XCom의 `job_ids`(conn별 dict)로만, **원천 DB에 각각** 실행. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 / 5.2 |
 | 3 | 잔여분 판정은 필터 적용 전 조회 건수(ROW_LIMIT 도달) + 크기 상한 이월 기준 | 5.3 |
 | 4 | XCom(meta) 기록 → IN_PROGRESS 마킹 → S3 업로드 순서 (마킹 중간 실패 시 좀비 방지) | 5.3 |

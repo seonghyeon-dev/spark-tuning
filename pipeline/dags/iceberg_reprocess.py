@@ -156,23 +156,11 @@ def _in_binds(values: list) -> tuple[str, dict]:
     return ", ".join(f":{k}" for k in binds), binds
 
 
-def _ids_by_conn(jobs: list[dict]) -> dict[str, list[str]]:
-    """row 목록을 원천 DB별 job_id 목록으로 그룹핑.
-
-    상태 UPDATE는 반드시 row를 가져온 DB로 되돌아가야 한다 — job_id는
-    두 DB 사이에서 유일하다는 보장이 없으므로 conn 구분 없이 섞으면 안 된다.
-
-    예) [{conn_id:'a', job_id:'J1'}, {conn_id:'b', job_id:'J1'}, {conn_id:'a', job_id:'J2'}]
-        → {'a': ['J1', 'J2'], 'b': ['J1']}
-    """
-    out: dict[str, list[str]] = {}
-    for j in jobs:
-        out.setdefault(j["conn_id"], []).append(j["job_id"])
-    return out
-
-
 def _mark_done(conn_id: str, job_ids: list[str]) -> None:
-    """영수증으로 커밋이 확인된 FAILED row를 DONE으로 정정 (설계 4.2)."""
+    """영수증으로 커밋이 확인된 FAILED row를 DONE으로 정정 (설계 4.2).
+    해당 DB에 정정할 게 없으면 아무것도 하지 않는다."""
+    if not job_ids:
+        return
     clause, binds = _in_binds(job_ids)
     OracleHook(oracle_conn_id=conn_id).run(
         f"UPDATE JOB_HISTORY SET status = 'DONE' "
@@ -222,7 +210,6 @@ def send_alert(message: str, detail=None) -> None:
 def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     """append get_jobs의 재처리 버전 — 조회 범위·상한·영수증 확인만 다르다.
 
-
     반환 False = 처리 대상 없음 (short_circuit → 그룹 내 하류 skip).
     meta는 key="meta"로 push — 하류 Spark(num_executors)·update(job_ids)·
     집계 task(Compaction/loop)가 소비한다.
@@ -234,26 +221,24 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     if table_name not in cfg["tables"]:
         return False  # 수동 실행에서 미선택 → skip
 
-    # ── 조회: Oracle DB 2개(a/b)에 같은 쿼리를 반복 (append의 conn_list 패턴) ──
-    # 각 row에 원천 conn_id를 태깅한다 — 이후 모든 상태 UPDATE는 이 값으로
-    # 자기 DB를 찾아간다 (job_id는 DB 간 유일 보장 없음).
+    # ── 조회: DB별로 같은 쿼리 실행 (append의 conn_list 패턴) ───────────────
+    # 결과를 conn_id를 키로 하는 dict에 그대로 담는다. 이후 상태 UPDATE는
+    # 이 키로 자기 DB를 찾아가므로, row에 출처를 태깅하거나 나중에 다시
+    # 그룹핑할 필요가 없다 (job_id는 DB 간 유일 보장 없음).
     # ROW_LIMIT은 append(DB당 200)와 동일하게 DB당 적용된다.
-    jobs, fetched_full = [], False
-    for conn_id in ORACLE_CONN_IDS:
-        rows = _rows(
+    jobs_by_conn = {
+        conn_id: _rows(
             conn_id, SELECT_TARGETS_SQL,
             {"tbl": table_name, "ts_from": cfg["ts_from"], "ts_to": cfg["ts_to"],
              "wait_bound": cfg["wait_bound"], "row_limit": ROW_LIMIT},
             JOB_COLUMNS,
         )
-        # 어느 한쪽 DB라도 상한을 꽉 채웠으면 = 그 DB에 더 남아 있다는 신호.
-        # 아래 영수증/크기 필터로 줄어든 "후"의 건수로 판단하면 신호를 놓치므로
-        # 반드시 필터 적용 "전"에 기록해 둔다 (설계 5.3)
-        fetched_full = fetched_full or len(rows) >= ROW_LIMIT
-        for r in rows:
-            r["conn_id"] = conn_id
-        jobs += rows
-    jobs.sort(key=lambda j: j["ts"])  # DB별 결과를 전체 ts 오름차순으로 병합
+        for conn_id in ORACLE_CONN_IDS
+    }
+    # 어느 한쪽 DB라도 상한을 꽉 채웠으면 = 그 DB에 더 남아 있다는 신호.
+    # 아래 영수증/크기 필터로 줄어든 "후"의 건수로 판단하면 신호를 놓치므로
+    # 반드시 필터 적용 "전"에 기록해 둔다 (설계 5.3)
+    fetched_full = any(len(rows) >= ROW_LIMIT for rows in jobs_by_conn.values())
 
     # ── 영수증 확인 (설계 4): "거짓 실패" 걸러내기 ──────────────────────────
     # Airflow가 실패로 판정했어도 Iceberg 커밋은 성공했을 수 있다 (커밋 직후
@@ -261,50 +246,59 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     #   1) FAILED row들이 달고 있는 batch_id(stat_desc)를 set으로 수집
     #      — 같은 batch의 row가 수백 건이어도 snapshot 조회는 batch당 1회
     #   2) batch_id별로 해당 테이블 snapshot에 영수증이 있는지 확인
-    #   3) 있으면 = 이미 적재 완료 → row들을 DONE으로 정정하고 이번 대상에서 제외
-    failed_batches = {j["stat_desc"] for j in jobs
-                      if j["status"] == "FAILED" and j["stat_desc"]}
+    #   3) 있으면 = 이미 적재 완료 → 원천 DB별로 DONE 정정하고 대상에서 제외
+    failed_batches = {r["stat_desc"] for rows in jobs_by_conn.values() for r in rows
+                      if r["status"] == "FAILED" and r["stat_desc"]}
     committed = {b for b in failed_batches if snapshot_exists(table_name, b)}
     if committed:
-        done_rows = [j for j in jobs if j["stat_desc"] in committed]
-        for conn_id, ids in _ids_by_conn(done_rows).items():  # DONE 정정도 원천 DB별로
-            _mark_done(conn_id, ids)
-        jobs = [j for j in jobs if j["stat_desc"] not in committed]
+        for conn_id, rows in jobs_by_conn.items():
+            _mark_done(conn_id, [r["job_id"] for r in rows
+                                 if r["stat_desc"] in committed])
+        jobs_by_conn = {
+            conn_id: [r for r in rows if r["stat_desc"] not in committed]
+            for conn_id, rows in jobs_by_conn.items()
+        }
 
     # ── 크기 상한 적용 (설계 5.4) ───────────────────────────────────────────
-    # jobs는 ts ASC 정렬 상태이므로, 앞(가장 오래된 것)부터 누적 크기가
-    # 16GB를 넘기 직전까지만 picked에 담고 멈춘다.
+    # DB별 결과를 (row, conn_id) 쌍으로 펼쳐 전체 ts 오름차순으로 정렬한 뒤,
+    # 앞(가장 오래된 것)부터 누적 크기가 16GB를 넘기 직전까지만 담는다.
     # 잘린 뒤쪽은 상태를 건드리지 않고 이월 → loop 회차 또는 다음날 회수
-    picked, total_mb = [], 0
-    for j in jobs:
-        if total_mb + j["file_size_mb"] > SIZE_LIMIT_MB:
+    candidates = sorted(
+        ((r, conn_id) for conn_id, rows in jobs_by_conn.items() for r in rows),
+        key=lambda pair: pair[0]["ts"],
+    )
+    picked_rows = []                            # ts 순서 유지 (Spark 입력·ts 범위용)
+    picked_ids: dict[str, list[str]] = {}       # {conn_id: [job_id, ...]} — 상태 UPDATE용
+    total_mb = 0
+    for row, conn_id in candidates:
+        if total_mb + row["file_size_mb"] > SIZE_LIMIT_MB:
             break
-        picked.append(j)
-        total_mb += j["file_size_mb"]
-    if not picked:
-        # 정상 케이스는 "처리할 게 없어서 빈 것"(jobs도 비고 상한 미달)뿐이다.
+        picked_rows.append(row)
+        picked_ids.setdefault(conn_id, []).append(row["job_id"])
+        total_mb += row["file_size_mb"]
+
+    if not picked_rows:
+        # 정상 케이스는 "처리할 게 없어서 빈 것"(조회도 비고 상한 미달)뿐이다.
         # 그 외는 조용히 skip하면 안 되는 비정상 신호라 알림으로 노출한다:
-        #   jobs 비어있지 않음 → 선두 job 하나가 크기 상한(16GB) 초과 (매일 반복될 데이터)
-        #   fetched_full      → 조회분이 전부 영수증 정정으로 소진 — DB에 더 남아
-        #                        있는데 meta가 없어 loop의 잔여분 신호가 유실됨
-        if jobs or fetched_full:
+        #   candidates 있음 → 선두 job 하나가 크기 상한(16GB) 초과 (매일 반복될 데이터)
+        #   fetched_full   → 조회분이 전부 영수증 정정으로 소진 — DB에 더 남아
+        #                     있는데 meta가 없어 loop의 잔여분 신호가 유실됨
+        if candidates or fetched_full:
             send_alert(
                 f"재처리 {table_name}: 처리 대상 구성 불가 — 수동 확인 필요 "
-                f"(조회 상한 도달={fetched_full}, 크기 상한 초과 잔여 {len(jobs)}건)"
+                f"(조회 상한 도달={fetched_full}, 크기 상한 초과 잔여 {len(candidates)}건)"
             )
         return False
 
     # 잔여분(leftover) 판정 — 둘 중 하나라도 참이면 "아직 남았다":
-    #   fetched_full           : 어느 한 DB라도 조회 상한(1,000)을 꽉 채움 → 그 DB에 더 있음
-    #   len(picked) < len(jobs): 크기 상한으로 뒤쪽이 잘림 → 이번에 못 담은 게 있음
-    # (영수증으로 제외된 건은 '처리 완료 정정'이라 잔여분이 아님 —
-    #  이미 jobs에서 빠진 뒤라 이 비교에 영향을 주지 않는다)
-    leftover = fetched_full or len(picked) < len(jobs)
+    #   fetched_full                        : 어느 한 DB라도 조회 상한(1,000)을 꽉 채움
+    #   len(picked_rows) < len(candidates)  : 크기 상한으로 뒤쪽이 잘림
+    # (영수증으로 제외된 건은 '처리 완료 정정'이라 잔여분이 아님 — 이미 candidates에서 빠짐)
+    leftover = fetched_full or len(picked_rows) < len(candidates)
 
     # batch_id는 배치당 1개 — 두 DB에서 온 row들이 하나의 Spark 커밋으로 적재되므로
     # 양쪽 DB의 row 모두 같은 batch_id를 달고, 영수증 확인도 snapshot 1곳에서 끝난다
     batch_id = f"{run_id}_{table_name}"
-    ids_by_conn = _ids_by_conn(picked)
 
     # meta를 마킹보다 "먼저" 기록한다 (설계 5.3).
     # 마킹은 DB 수만큼 UPDATE가 나가므로 중간에 실패할 수 있는데, meta가 없으면
@@ -321,17 +315,17 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         "table": table_name,
         "group": compaction_group(table),
         "batch_id": batch_id,
-        "job_ids": ids_by_conn,            # {conn_id: [job_id, ...]} — 원천 DB별
+        "job_ids": picked_ids,             # {conn_id: [job_id, ...]} — 원천 DB별
         "leftover": leftover,
-        "ts_min": picked[0]["ts"], "ts_max": picked[-1]["ts"],
+        "ts_min": picked_rows[0]["ts"], "ts_max": picked_rows[-1]["ts"],
         # append DAG과 동일 산정식: ceil(총크기/128MB × 1.5 / executor-cores 4)
         "num_executors": min(max(math.ceil(total_mb / 128 * 1.5 / 4), 1), MAX_EXECUTORS),
     })
 
-    for conn_id, ids in ids_by_conn.items():  # 마킹은 원천 DB별로
+    for conn_id, ids in picked_ids.items():  # 마킹은 원천 DB별로
         _claim_jobs(conn_id, ids, batch_id)
 
-    upload_path_list_to_s3(table_name, picked, batch_id)
+    upload_path_list_to_s3(table_name, picked_rows, batch_id)
     return True
 
 
@@ -424,16 +418,16 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     def check_zombie_jobs():
         """좀비 IN_PROGRESS 탐지 → 알림만 (설계 8.2). 독립 실행 — 본류와 의존 없음.
         Oracle 2개 모두 조회한다 (어느 DB에서 발견됐는지 알림에 포함)."""
-        zombies = []
-        for conn_id in ORACLE_CONN_IDS:
-            rows = _rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS},
-                         ("table_name", "job_id", "updated_at"))
-            for r in rows:
-                r["conn_id"] = conn_id
-            zombies += rows
-        if zombies:
-            send_alert(f"좀비 IN_PROGRESS {len(zombies)}건 — 영수증 확인 후 수동 판정 필요",
-                       zombies)
+        # conn_id를 키로 담아 그대로 알림에 넘긴다 (어느 DB의 row인지 구분됨)
+        zombies_by_conn = {
+            conn_id: _rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS},
+                           ("table_name", "job_id", "updated_at"))
+            for conn_id in ORACLE_CONN_IDS
+        }
+        total = sum(len(rows) for rows in zombies_by_conn.values())
+        if total:
+            send_alert(f"좀비 IN_PROGRESS {total}건 — 영수증 확인 후 수동 판정 필요",
+                       zombies_by_conn)
 
     @task
     def prepare_run(params=None, dag_run=None) -> dict:
