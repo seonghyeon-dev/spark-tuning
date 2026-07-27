@@ -116,9 +116,21 @@ def dates_between(ts_min: str, ts_max: str) -> list[str]:
 
 JOB_COLUMNS = ("job_id", "status", "stat_desc", "ts", "avro_path", "file_size_mb")
 
+# stat_desc는 CLOB이라 드라이버가 LOB 객체로 돌려준다 — 문자열 비교·set 연산이
+# 되지 않아 영수증 확인이 오작동하므로, 조회 시점에 VARCHAR2로 변환해서 받는다
+# (batch_id는 짧은 값이라 4000바이트로 충분).
+JOB_SELECT_EXPRS = (
+    "job_id",
+    "status",
+    "DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc",
+    "ts",
+    "avro_path",
+    "file_size_mb",
+)
+
 SELECT_TARGETS_SQL = f"""
 SELECT * FROM (
-    SELECT {", ".join(JOB_COLUMNS)}
+    SELECT {", ".join(JOB_SELECT_EXPRS)}
       FROM JOB_HISTORY
      WHERE table_name = :tbl
        AND ts >= :ts_from AND ts < :ts_to
@@ -278,13 +290,14 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     )
     picked_rows = []                            # ts 순서 유지 (Spark 입력·ts 범위용)
     picked_ids: dict[str, list[str]] = {}       # {conn_id: [job_id, ...]} — 상태 UPDATE용
-    total_mb = 0
-    for row, conn_id in candidates:
-        if total_mb + row["file_size_mb"] > SIZE_LIMIT_MB:
+    total_mb = 0.0                              # NUMBER는 Decimal로 오므로 float으로 누적
+    for row, conn_id in candidates:             # (Decimal * float는 TypeError)
+        size_mb = float(row["file_size_mb"] or 0)
+        if total_mb + size_mb > SIZE_LIMIT_MB:
             break
         picked_rows.append(row)
         picked_ids.setdefault(conn_id, []).append(row["job_id"])
-        total_mb += row["file_size_mb"]
+        total_mb += size_mb
 
     if not picked_rows:
         # 정상 케이스는 "처리할 게 없어서 빈 것"(조회도 비고 상한 미달)뿐이다.
