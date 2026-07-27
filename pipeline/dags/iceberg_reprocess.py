@@ -247,6 +247,16 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         picked.append(j)
         total_mb += j["file_size_mb"]
     if not picked:
+        # 정상 케이스는 "처리할 게 없어서 빈 것"(jobs도 비고 상한 미달)뿐이다.
+        # 그 외는 조용히 skip하면 안 되는 비정상 신호라 알림으로 노출한다:
+        #   jobs 비어있지 않음 → 선두 job 하나가 크기 상한(16GB) 초과 (매일 반복될 데이터)
+        #   fetched_full      → 1,000건이 전부 영수증 정정으로 소진 — DB에 더 남아
+        #                        있는데 meta가 없어 loop의 잔여분 신호가 유실됨
+        if jobs or fetched_full:
+            send_alert(
+                f"재처리 {table_name}: 처리 대상 구성 불가 — 수동 확인 필요 "
+                f"(조회 상한 도달={fetched_full}, 크기 상한 초과 잔여 {len(jobs)}건)"
+            )
         return False
 
     # 잔여분(leftover) 판정 — 둘 중 하나라도 참이면 "아직 남았다":
@@ -260,6 +270,9 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     _claim_jobs([j["job_id"] for j in picked], batch_id)
 
     # 마킹 직후 meta 기록 — 이후 단계 실패 시에도 update_failure가 job_ids로 회수 (설계 5.3)
+    # TODO(연결): meta의 key/필드명은 append get_jobs가 push하는 스키마와 필드 단위로
+    #             일치시킬 것 — 부모의 Spark(num_executors)·update(job_ids) task가
+    #             append과 같은 방식으로 이 XCom을 소비한다
     ti.xcom_push(key="meta", value={
         "table": table_name,
         "group": compaction_group(table),
