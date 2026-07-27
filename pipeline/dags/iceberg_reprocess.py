@@ -95,9 +95,9 @@ def dates_between(ts_min: str, ts_max: str) -> list[str]:
     daily Compaction은 날짜 단위로 trigger하므로 적재 범위가 걸친 날짜를 빠짐없이
     뽑아야 한다. 양 끝 날짜만 쓰면 3일 이상 범위에서 중간 날짜가 누락된다.
 
-    예) ts_min='20260705213000000', ts_max='20260707081500000'
-        → ts 앞 8자리(날짜)만 취해 5일부터 7일까지 하루씩 전진
-        → ['20260705', '20260706', '20260707']
+    예) ts_min='20260701213000000', ts_max='20260703081500000'
+        → ts 앞 8자리(날짜)만 취해 1일부터 3일까지 하루씩 전진
+        → ['20260701', '20260702', '20260703']
     """
     day = pendulum.from_format(ts_min[:8], "YYYYMMDD", tz=KST)
     last = pendulum.from_format(ts_max[:8], "YYYYMMDD", tz=KST)
@@ -403,7 +403,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
                 "loop_count": int(conf.get("loop_count", 0)),
             }
 
-        base = pendulum.now(KST).start_of("day")  # 오늘 00:00 (10일 01:00 실행이면 10일 00:00)
+        base = pendulum.now(KST).start_of("day")  # 오늘 00:00 (오늘=4일 01:00 실행이면 4일 00:00)
         st, et = params.get("start_time"), params.get("end_time")
 
         if st and et:
@@ -418,11 +418,11 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         elif st or et:
             raise ValueError("start_time과 end_time은 함께 지정해야 한다")
         else:
-            # 정기 실행 경계 (설계 2.1). base=10일 00:00 기준 예시:
-            #   ts_from    = 8일 00:00  — 그저께 시작. 재처리가 하룻밤 실패해도
+            # 정기 실행 경계 (설계 2.1). 오늘=4일 (base=4일 00:00) 기준 예시:
+            #   ts_from    = 그저께(2일) 00:00 — 재처리가 하룻밤 실패해도
             #                             다음날 이 안전망 범위로 자동 회수된다
-            #   ts_to      = 10일 00:00 — 전날 끝
-            #   wait_bound = 9일 01:00  — WAIT 상한. 이 시각 이후의 WAIT는 아직
+            #   ts_to      = 오늘(4일) 00:00  — 전날 끝
+            #   wait_bound = 전날(3일) 01:00  — WAIT 상한. 이 시각 이후의 WAIT는 아직
             #                             append 조회 범위(실행시각-24h) 안이라
             #                             건드리면 경합 → 재처리 대상에서 제외.
             #                             FAILED는 append가 안 보므로 상한 없음
@@ -452,9 +452,9 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         # 날짜 단위(target_dt)로 실행되므로 집계 축을 바꿔야 한다.
         #   바깥 for: 테이블별 meta 순회
         #   안쪽 for: 그 테이블의 적재 범위가 걸친 날짜들 순회 (dates_between)
-        # 예) TABLE_A가 8~9일, TABLE_B가 9일만 적재했다면
-        #     by_date = {'20260708': [A], '20260709': [A, B]}
-        #     → trigger 2건: (8일, [A]), (9일, [A, B])
+        # 예) TABLE_A가 그저께~전날(2~3일), TABLE_B가 전날(3일)만 적재했다면
+        #     by_date = {'20260702': [A], '20260703': [A, B]}
+        #     → trigger 2건: (2일, [A]), (3일, [A, B])
         by_date: dict[str, list[str]] = {}
         for m in daily:
             for date in dates_between(m["ts_min"], m["ts_max"]):
