@@ -242,7 +242,7 @@ check_zombie_jobs                          # 좀비 IN_PROGRESS 탐지 → 알�
 prepare_run                                # params 검증·정규화 1회 → XCom (get_time 패턴)
       │                                    # ts 경계 계산, 수동 범위 검증, date-time → ts 변환
 ┌─ ConvertFileTaskGroup: TABLE_A (기존 append DAG 템플릿 재사용) ─┐
-│  get_jobs            # ← get_jobs_builder 주입으로 교체        │
+│  get_jobs            # ← __init__ 재처리 분기가 생성           │
 │      │               # (범위·상한·영수증 확인. 대상 0건→skip)  │
 │  append_data         # 템플릿 제공 (Spark append)              │
 │      ├── update_success  [all_success]  # 템플릿 제공          │
@@ -259,11 +259,10 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 
 > Compaction/재trigger는 대상 개수가 가변(Compaction 여러 건, loop 0/1건)이므로, 집계 task가 `TriggerDagRunOperator` kwargs 목록을 만들고 **dynamic task mapping(`expand_kwargs`)** 으로 trigger한다. 빈 목록이면 mapped operator는 skip된다.
 
-- **기존 ConvertFileTaskGroup 재사용 (`get_jobs_builder` 주입 + `self.ctx` 노출)**: append DAG의 TaskGroup 템플릿(get_jobs → Spark append → update_success/update_failure)을 그대로 쓰되, **재처리용 조회 task를 만들어 주는 builder 함수를 생성자 옵션 인자로 주입**한다.
-  - 기각한 대안 ①: "get_jobs를 메서드로 추출 후 상속 override" — 인라인 get_jobs가 `__init__` 지역값들(설정값, logger, `_update_jobs` 등)을 closure로 사용하고 있어 메서드로 옮기면 참조가 전부 끊긴다
-  - 기각한 대안 ②: "필요한 헬퍼를 builder 파라미터로 전달" — `__init__` 지역 함수가 여러 개이고 앞으로도 늘 수 있어, 헬퍼가 추가될 때마다 builder 시그니처가 깨진다
-  - **채택**: 부모 `__init__`에 ⓐ 지역 함수/설정값을 `self.ctx`(SimpleNamespace)로 노출하는 한 줄과 ⓑ `get_jobs_builder=None` 인자·분기를 추가한다. **기존 코드는 자리 이동이 없다** — 미지정이면 기존 인라인 경로(append: closure 전부 유지, 동작 동일), 지정이면 `get_jobs_builder(self)` 호출(**인자는 그룹 하나뿐**)로 재처리 조회 task를 그룹 안에 생성 (섹션 7). builder는 부모 헬퍼가 필요하면 `group.ctx.update_jobs(...)`, `group.ctx.logger` 처럼 골라 쓰므로, 헬퍼가 늘어도 ⓐ에 항목 한 줄만 추가되고 builder 시그니처는 그대로다
-  - builder 구현 주의: builder는 그룹 컨텍스트 밖에서 호출되므로 task 데코레이터에 `task_group=group` 명시 필수 (누락 시 dag 레벨 생성 → 테이블 간 task_id 충돌)
+- **기존 ConvertFileTaskGroup 재사용 (`__init__`에 재처리 분기 추가)**: append DAG의 TaskGroup 템플릿(get_jobs → Spark append → update_success/update_failure)을 그대로 쓰고, **재처리 조회 task도 부모 `__init__` 안에 둔다**. 재처리 DAG이 넘기는 것은 조회 범위(`reprocess_cfg` = prepare_run XCom) 하나뿐이다.
+  - 기각한 대안들 — 조회 task를 부모 밖으로 빼는 방식 전부: ① 메서드 추출 후 상속 override ② builder 주입 ③ 필요한 헬퍼를 파라미터로 전달. 공통 사유: 조회 로직은 `__init__` 지역 함수·설정값(`_update_jobs`, logger, config …)을 사용해야 하는데, 밖으로 빼면 그것들을 일일이 전달해야 하고 헬퍼가 늘 때마다 시그니처가 깨진다
+  - **채택**: `__init__(..., reprocess_cfg=None)` 인자와 분기만 추가한다. 미지정이면 기존 인라인 경로(append: 코드·closure 전부 그대로, 동작 동일), 지정이면 같은 `__init__` 스코프에서 재처리 조회 task를 만든다 — **지역 함수를 그냥 호출**하면 되므로 전달 인자가 늘지 않는다 (섹션 7)
+  - 재처리 조회 task 옵션: `trigger_rule="all_done"`(앞 테이블 실패에도 실행) + `ignore_downstream_trigger_rules=False`(skip을 그룹 내로 한정)
 - **테이블별 순차 실행**: Spark job(최대 24 executor)이 테이블 수만큼 동시에 뜨면 K8S가 감당하지 못한다. Compaction DAG과 동일하게 순차 — 잔여분 없는 테이블은 조회 후 즉시 skip이라 빠르다
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
@@ -385,7 +384,7 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 | 대상 | 변경 | 내용 |
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 2건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 |
-| ConvertFileTaskGroup | `self.ctx` 노출 + `get_jobs_builder` 옵션 인자 추가 (3줄) | ① `__init__` 지역 함수/설정값을 `self.ctx = SimpleNamespace(update_jobs=_update_jobs, logger=logger, ...)`로 노출 ② `__init__(..., get_jobs_builder=None)` 인자 추가 ③ get_jobs 생성부를 분기로 감싸기 — 미지정이면 기존 인라인 경로(**코드·closure 전부 그대로, append 동작 완전 동일**), 지정이면 `get_jobs_builder(self)` 호출. 지역값을 옮기지 않으므로 closure 파손 없고, 헬퍼가 늘어도 ①에 한 줄만 추가된다. **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
+| ConvertFileTaskGroup | `reprocess_cfg` 옵션 인자 + 재처리 분기 추가 | ① `__init__(..., reprocess_cfg=None)` 인자 추가 ② get_jobs 생성부를 if/else로 감싸고 else에 재처리 조회 task를 둔다 — 미지정이면 기존 인라인 경로(**코드·closure 전부 그대로, append 동작 완전 동일**). 재처리 task가 같은 `__init__` 스코프에 있으므로 `_update_jobs`·logger·config를 그냥 호출한다 (전달 인자 없음). **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
 | daily Compaction DAG | 스케줄 + params | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체) |
 | hourly Compaction DAG | params | params에 `tables` multi-select 추가 (기본 전체). 스케줄 변경 없음 |
 
