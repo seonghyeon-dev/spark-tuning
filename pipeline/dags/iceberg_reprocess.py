@@ -23,6 +23,7 @@
 ────────────────────────────────────────────────────────────────────
 """
 
+import json
 import math
 from enum import Enum
 from pathlib import Path
@@ -114,18 +115,26 @@ def dates_between(ts_min: str, ts_max: str) -> list[str]:
 
 # --- Oracle -----------------------------------------------------------------
 
-JOB_COLUMNS = ("job_id", "status", "stat_desc", "ts", "avro_path", "file_size_mb")
+# Job History의 키는 단일 컬럼이 아니라 복합키 4개다. ts도 그중 하나이며
+# 조회 범위 조건·정렬·Compaction 범위 산출에 함께 쓰인다.
+# TODO(연결): 실제 복합키 컬럼명으로 교체 (순서 무관, 이름만 맞추면 된다)
+KEY_COLUMNS = ("k_1", "k_2", "k_3", "ts")
+
+# 조회 컬럼 = 복합키 4개 + base_path + param(JSON: 파일명·크기)
+#            + status(WAIT/FAILED 필터) + stat_desc(영수증 확인용)
+JOB_COLUMNS = (*KEY_COLUMNS, "base_path", "param", "status", "stat_desc")
 
 # stat_desc는 CLOB이라 드라이버가 LOB 객체로 돌려준다 — 문자열 비교·set 연산이
 # 되지 않아 영수증 확인이 오작동하므로, 조회 시점에 VARCHAR2로 변환해서 받는다
 # (batch_id는 짧은 값이라 4000바이트로 충분).
+# TODO(연결): param 컬럼이 CLOB이면 동일하게 변환할 것 (JSON이 4000바이트를
+#             넘길 수 있으면 변환 대신 LOB.read()로 읽어야 한다)
 JOB_SELECT_EXPRS = (
-    "job_id",
+    *KEY_COLUMNS,
+    "base_path",
+    "param",
     "status",
     "DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc",
-    "ts",
-    "avro_path",
-    "file_size_mb",
 )
 
 SELECT_TARGETS_SQL = f"""
@@ -140,8 +149,13 @@ SELECT * FROM (
 ) WHERE ROWNUM <= :row_limit
 """
 
-ZOMBIE_SQL = """
-SELECT table_name, job_id, updated_at
+# 복합키 전체를 AND로 묶은 조건 (executemany 바인딩용 — 건수와 무관하게 고정 SQL)
+KEY_WHERE = " AND ".join(f"{k} = :{k}" for k in KEY_COLUMNS)
+
+ZOMBIE_COLUMNS = ("table_name", *KEY_COLUMNS, "updated_at")
+
+ZOMBIE_SQL = f"""
+SELECT {", ".join(ZOMBIE_COLUMNS)}
   FROM JOB_HISTORY
  WHERE status = 'IN_PROGRESS'
    AND updated_at < SYSTIMESTAMP - NUMTODSINTERVAL(:h, 'HOUR')
@@ -174,31 +188,46 @@ def _execute_many(conn_id: str, sql: str, rows: list[dict]) -> None:
         conn.commit()
 
 
-MARK_DONE_SQL = """
+MARK_DONE_SQL = f"""
 UPDATE JOB_HISTORY SET status = 'DONE'
- WHERE job_id = :job_id AND status = 'FAILED'
+ WHERE {KEY_WHERE} AND status = 'FAILED'
 """
 
-CLAIM_SQL = """
+CLAIM_SQL = f"""
 UPDATE JOB_HISTORY SET status = 'IN_PROGRESS', stat_desc = :batch_id
- WHERE job_id = :job_id AND status IN ('WAIT', 'FAILED')
+ WHERE {KEY_WHERE} AND status IN ('WAIT', 'FAILED')
 """
 
 
-def _mark_done(conn_id: str, job_ids: list[str]) -> None:
+def key_of(row: dict) -> dict:
+    """row에서 복합키만 뽑아낸다 — UPDATE 바인딩과 XCom 전달에 그대로 쓴다."""
+    return {k: row[k] for k in KEY_COLUMNS}
+
+
+def _mark_done(conn_id: str, keys: list[dict]) -> None:
     """영수증으로 커밋이 확인된 FAILED row를 DONE으로 정정 (설계 4.2)."""
-    _execute_many(conn_id, MARK_DONE_SQL, [{"job_id": jid} for jid in job_ids])
+    _execute_many(conn_id, MARK_DONE_SQL, keys)
 
 
-def _claim_jobs(conn_id: str, job_ids: list[str], batch_id: str) -> None:
+def _claim_jobs(conn_id: str, keys: list[dict], batch_id: str) -> None:
     """IN_PROGRESS 전환 + batch_id(영수증) 기록 (설계 5.3).
 
     `status IN ('WAIT','FAILED')` 조건은 만약의 이중 실행에 대한 방어선이다
     (설계상 조회 범위가 겹치지 않아 발생하지 않는다 — 설계 2.1).
     stat_desc(CLOB)는 값 기록만 — WHERE 조건 사용 금지 (설계 4.2).
     """
-    _execute_many(conn_id, CLAIM_SQL,
-                  [{"batch_id": batch_id, "job_id": jid} for jid in job_ids])
+    _execute_many(conn_id, CLAIM_SQL, [{"batch_id": batch_id, **k} for k in keys])
+
+
+def parse_param(param) -> tuple[str, float]:
+    """param(JSON) → (파일명, 파일 크기 MB).
+
+    TODO(연결): 실제 JSON 키 이름과 크기 단위를 append DAG의 파싱 로직과 맞출 것
+                (아래는 {"file_name": ..., "file_size": <bytes>} 가정).
+                base_path와의 결합 규칙(구분자·prefix)도 append와 동일해야 한다.
+    """
+    data = json.loads(param) if isinstance(param, str) else param
+    return data["file_name"], float(data["file_size"]) / 1024 / 1024
 
 
 # --- 기존 구현 연결 스텁 ------------------------------------------------------
@@ -212,8 +241,9 @@ def snapshot_exists(table_name: str, batch_id: str) -> bool:
     raise NotImplementedError
 
 
-def upload_path_list_to_s3(table_name: str, jobs: list[dict], batch_id: str) -> None:
-    """TODO(연결): 기존 get_jobs의 avro 경로 목록 S3 업로드 로직 재사용."""
+def upload_path_list_to_s3(table_name: str, paths: list[str], batch_id: str) -> None:
+    """경로 문자열 배열을 텍스트 파일로 만들어 S3에 업로드 (Spark 입력 목록).
+    TODO(연결): 기존 get_jobs의 업로드 로직 재사용 (파일 경로 규칙 포함)."""
     raise NotImplementedError
 
 
@@ -232,7 +262,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     """append get_jobs의 재처리 버전 — 조회 범위·상한·영수증 확인만 다르다.
 
     반환 False = 처리 대상 없음 (short_circuit → 그룹 내 하류 skip).
-    meta는 key="meta"로 push — 하류 Spark(num_executors)·update(job_ids)·
+    meta는 key="meta"로 push — 하류 Spark(num_executors)·update(keys)·
     집계 task(Compaction/loop)가 소비한다.
     """
     if not cfg:
@@ -245,7 +275,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     # ── 조회: DB별로 같은 쿼리 실행 (append의 conn_list 패턴) ───────────────
     # 결과를 conn_id를 키로 하는 dict에 그대로 담는다. 이후 상태 UPDATE는
     # 이 키로 자기 DB를 찾아가므로, row에 출처를 태깅하거나 나중에 다시
-    # 그룹핑할 필요가 없다 (job_id는 DB 간 유일 보장 없음).
+    # 그룹핑할 필요가 없다 (복합키는 DB 간 유일 보장 없음).
     # ROW_LIMIT은 append(DB당 200)와 동일하게 DB당 적용된다.
     jobs_by_conn = {
         conn_id: _rows(
@@ -273,7 +303,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     committed = {b for b in failed_batches if snapshot_exists(table_name, b)}
     if committed:
         for conn_id, rows in jobs_by_conn.items():
-            _mark_done(conn_id, [r["job_id"] for r in rows
+            _mark_done(conn_id, [key_of(r) for r in rows
                                  if r["stat_desc"] in committed])
         jobs_by_conn = {
             conn_id: [r for r in rows if r["stat_desc"] not in committed]
@@ -288,18 +318,20 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         ((r, conn_id) for conn_id, rows in jobs_by_conn.items() for r in rows),
         key=lambda pair: pair[0]["ts"],
     )
-    picked_rows = []                            # ts 순서 유지 (Spark 입력·ts 범위용)
-    picked_ids: dict[str, list[str]] = {}       # {conn_id: [job_id, ...]} — 상태 UPDATE용
-    total_mb = 0.0                              # NUMBER는 Decimal로 오므로 float으로 누적
-    for row, conn_id in candidates:             # (Decimal * float는 TypeError)
-        size_mb = float(row["file_size_mb"] or 0)
+    picked_ts = []                            # ts 오름차순 (Compaction 범위 산출용)
+    picked_paths = []                         # base_path+파일명 결합 문자열 (S3 목록)
+    picked_keys: dict[str, list[dict]] = {}   # {conn_id: [복합키 dict, ...]} — 상태 UPDATE용
+    total_mb = 0.0                            # 크기는 param JSON에서 꺼내 float으로 누적
+    for row, conn_id in candidates:
+        file_name, size_mb = parse_param(row["param"])
         if total_mb + size_mb > SIZE_LIMIT_MB:
             break
-        picked_rows.append(row)
-        picked_ids.setdefault(conn_id, []).append(row["job_id"])
+        picked_ts.append(row["ts"])
+        picked_paths.append(f"{row['base_path'].rstrip('/')}/{file_name}")
+        picked_keys.setdefault(conn_id, []).append(key_of(row))
         total_mb += size_mb
 
-    if not picked_rows:
+    if not picked_paths:
         # 정상 케이스는 "처리할 게 없어서 빈 것"(조회도 비고 상한 미달)뿐이다.
         # 그 외는 조용히 skip하면 안 되는 비정상 신호라 알림으로 노출한다:
         #   candidates 있음 → 선두 job 하나가 크기 상한(16GB) 초과 (매일 반복될 데이터)
@@ -314,9 +346,9 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
 
     # 잔여분(leftover) 판정 — 둘 중 하나라도 참이면 "아직 남았다":
     #   fetched_full                        : 어느 한 DB라도 조회 상한(1,000)을 꽉 채움
-    #   len(picked_rows) < len(candidates)  : 크기 상한으로 뒤쪽이 잘림
+    #   len(picked_paths) < len(candidates) : 크기 상한으로 뒤쪽이 잘림
     # (영수증으로 제외된 건은 '처리 완료 정정'이라 잔여분이 아님 — 이미 candidates에서 빠짐)
-    leftover = fetched_full or len(picked_rows) < len(candidates)
+    leftover = fetched_full or len(picked_paths) < len(candidates)
 
     # batch_id는 배치당 1개 — 두 DB에서 온 row들이 하나의 Spark 커밋으로 적재되므로
     # 양쪽 DB의 row 모두 같은 batch_id를 달고, 영수증 확인도 snapshot 1곳에서 끝난다
@@ -329,25 +361,25 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     # update task의 UPDATE(WHERE status='IN_PROGRESS')에서 자동으로 빠지고
     # 다음 회차에 정상 회수된다 — 어느 쪽으로 실패해도 안전하다.
     # TODO(연결): meta의 key/필드명은 append get_jobs가 push하는 스키마와 필드 단위로
-    #             일치시킬 것 — 부모의 Spark(num_executors)·update(job_ids) task가
+    #             일치시킬 것 — 부모의 Spark(num_executors)·update(keys) task가
     #             append과 같은 방식으로 이 XCom을 소비한다.
-    #             job_ids는 conn별 dict — update task도 conn_list loop로 각 DB에
-    #             UPDATE하는 append 방식과 동일해야 한다
+    #             keys는 {conn_id: [복합키 dict, ...]} — update task도 conn_list loop로
+    #             각 DB에 복합키 AND 조건으로 UPDATE하는 append 방식과 동일해야 한다
     ti.xcom_push(key="meta", value={
         "table": table_name,
         "group": compaction_group(table),
         "batch_id": batch_id,
-        "job_ids": picked_ids,             # {conn_id: [job_id, ...]} — 원천 DB별
+        "keys": picked_keys,               # {conn_id: [복합키 dict, ...]} — 원천 DB별
         "leftover": leftover,
-        "ts_min": picked_rows[0]["ts"], "ts_max": picked_rows[-1]["ts"],
+        "ts_min": picked_ts[0], "ts_max": picked_ts[-1],
         # append DAG과 동일 산정식: ceil(총크기/128MB × 1.5 / executor-cores 4)
         "num_executors": min(max(math.ceil(total_mb / 128 * 1.5 / 4), 1), MAX_EXECUTORS),
     })
 
-    for conn_id, ids in picked_ids.items():  # 마킹은 원천 DB별로
-        _claim_jobs(conn_id, ids, batch_id)
+    for conn_id, keys in picked_keys.items():  # 마킹은 원천 DB별로
+        _claim_jobs(conn_id, keys, batch_id)
 
-    upload_path_list_to_s3(table_name, picked_rows, batch_id)
+    upload_path_list_to_s3(table_name, picked_paths, batch_id)
     return True
 
 
@@ -442,8 +474,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         Oracle 2개 모두 조회한다 (어느 DB에서 발견됐는지 알림에 포함)."""
         # conn_id를 키로 담아 그대로 알림에 넘긴다 (어느 DB의 row인지 구분됨)
         zombies_by_conn = {
-            conn_id: _rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS},
-                           ("table_name", "job_id", "updated_at"))
+            conn_id: _rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS}, ZOMBIE_COLUMNS)
             for conn_id in ORACLE_CONN_IDS
         }
         total = sum(len(rows) for rows in zombies_by_conn.values())
