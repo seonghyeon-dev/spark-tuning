@@ -215,40 +215,56 @@ def reprocess_get_jobs(cfg: dict, *, table_name: str, group: str, run_id, ti) ->
     return True
 
 
-# --- 기존 ConvertFileTaskGroup 재사용 --------------------------------------
+# --- 기존 ConvertFileTaskGroup 재사용 (상속 + get_jobs override) -------------
 #
-# append DAG의 ConvertFileTaskGroup(TaskGroup 서브클래스)은 대략 이 흐름을 담고 있다:
-#   get_jobs → spark append → [update_success, update_failure]
-# 재처리는 이 중 get_jobs(조회)만 다르고 나머지는 동일하다. 그래서 새로 만들지 않고
-# 상속해서 get_jobs 생성 부분만 override 한다 (append용 조회 → 재처리용 조회).
+# ConvertFileTaskGroup은 get_jobs → spark append → [update_success, update_failure]
+# 흐름을 담고 있고, 재처리는 이 중 get_jobs(조회)만 다르다.
 #
-# ┌ 부모(ConvertFileTaskGroup)가 아래 둘 중 하나면 그대로 재사용된다:
-# │  (a) get_jobs를 별도 메서드로 분리해 뒀다  → 그 메서드만 override (아래 예시)
-# │  (b) get_jobs를 인자로 받는다              → 생성자에 넘기면 됨
-# └ 만약 __init__에 인라인으로 박혀 있으면, 부모에서 그 부분만 메서드로 추출
-#    (템플릿 1곳 소규모 리팩토링)하면 (a)가 된다.
+# 전제 — 부모 1회 추출 리팩토링 (동작 완전 동일, 코드 이동만. 섹션 7):
+#   현재 get_jobs는 __init__ 안에 @task(task_group=self)로 인라인 정의되어 있어
+#   override가 불가능하다. __init__의 해당 블록을 메서드로 옮기고 호출로 바꾼다:
 #
-# TODO(연결): 아래 부모 클래스명·생성자 인자·override 메서드명을 실제 정의에 맞출 것.
+#     class ConvertFileTaskGroup(TaskGroup):
+#         def __init__(self, table, group_id, ..., **kwargs):
+#             super().__init__(group_id=group_id, **kwargs)
+#             self.table = table
+#             jobs = self._build_get_jobs()   # ← __init__에서 바뀌는 건 이 줄뿐
+#             spark = ...
+#             jobs >> spark >> [update_success, update_failure]
+#
+#         def _build_get_jobs(self):
+#             @task(task_group=self)
+#             def get_jobs(ti=None):
+#                 ... 기존 인라인 코드 그대로 이동 (self.table 등 그대로 접근) ...
+#             return get_jobs()
+#
+# 그러면 부모 __init__이 self._build_get_jobs()를 호출할 때 자식의 override가
+# 실행되므로(파이썬 메서드 디스패치), 재처리는 아래처럼 override만 하면 된다.
+#
+# TODO(연결): 부모 import + __init__ 시그니처·추출 메서드명(_build_get_jobs)을
+#             실제 정의에 맞출 것.
 
 class ReprocessTaskGroup(ConvertFileTaskGroup):  # noqa: F821  TODO(연결): 부모 import
-    """ConvertFileTaskGroup 재사용 — get_jobs만 재처리 조회로 교체.
+    """ConvertFileTaskGroup 상속 — get_jobs만 재처리 조회로 교체.
     Spark append / update_success / update_failure는 부모 것을 그대로 사용한다.
     """
 
     def __init__(self, table, run_cfg, **kwargs):
-        self._table = table
+        # 주의: 부모 __init__이 _build_get_jobs()를 호출하므로, override가 쓰는 값은
+        # 반드시 super().__init__() 호출 전에 self에 넣어야 한다.
         self._run_cfg = run_cfg
         super().__init__(table, **kwargs)  # TODO(연결): 부모 __init__ 시그니처에 맞출 것
 
-    def build_get_jobs(self):
-        """부모의 get_jobs 생성 메서드를 override (메서드명은 부모 정의에 맞출 것).
-        조회 범위·상한·영수증 확인만 다르고, 반환 계약(False=대상없음→skip, meta push)은 동일.
+    def _build_get_jobs(self):
+        """부모의 get_jobs 생성 메서드 override.
+        조회 범위·상한·영수증 확인만 다르고, 계약(False=대상없음→skip, meta push)은 동일.
         """
-        table_name = self._table.get_name()
-        group = compaction_group(self._table)
+        table_name = self.table.get_name()   # 부모가 저장한 table 그대로 사용
+        group = compaction_group(self.table)
 
         @task.short_circuit(
-            task_id="get_jobs",
+            task_group=self,                        # 부모와 동일 — with self: 없이 생성되므로 필수.
+            task_id="get_jobs",                     # 누락 시 dag 레벨에 생성돼 task_id 충돌
             trigger_rule="all_done",                # 앞 테이블 실패에도 실행 (순차 그룹)
             ignore_downstream_trigger_rules=False,  # skip을 그룹 내로 한정 (설계 5.2)
         )

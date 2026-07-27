@@ -259,7 +259,7 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 
 > Compaction/재trigger는 대상 개수가 가변(Compaction 여러 건, loop 0/1건)이므로, 집계 task가 `TriggerDagRunOperator` kwargs 목록을 만들고 **dynamic task mapping(`expand_kwargs`)** 으로 trigger한다. 빈 목록이면 mapped operator는 skip된다.
 
-- **기존 ConvertFileTaskGroup 재사용**: append DAG이 쓰는 TaskGroup 템플릿(get_jobs → Spark append → update_success/update_failure)을 그대로 재사용하고, **조회 task(get_jobs)만 재처리용으로 주입**한다. 템플릿에 재처리 로직을 추가하지 않는다 — 재처리와 append의 차이는 조회 범위·상한·영수증 확인뿐이고 이후 단계는 동일하기 때문
+- **기존 ConvertFileTaskGroup 재사용 (상속 + override)**: append DAG의 TaskGroup 템플릿(get_jobs → Spark append → update_success/update_failure)을 상속한 `ReprocessTaskGroup`이 **get_jobs 생성 메서드만 override**한다. 템플릿에 재처리 로직을 추가하지 않는다 — 차이는 조회 범위·상한·영수증 확인뿐이고 이후 단계는 동일하기 때문. 전제: 현재 부모의 get_jobs는 `__init__` 인라인이라 override 불가 → **생성부를 메서드(`_build_get_jobs`)로 추출하는 1회 리팩토링 필요** (코드 이동만, 동작 완전 동일 — 섹션 7). override 구현 주의 2가지: ① 부모 `__init__`이 override를 호출하므로 자식이 쓰는 값은 `super().__init__()` 전에 self에 저장 ② 부모가 `with self:` 없이 `@task(task_group=self)` 방식이므로 override의 데코레이터에도 `task_group=self` 필수 (누락 시 dag 레벨 생성 → 테이블 간 task_id 충돌)
 - **테이블별 순차 실행**: Spark job(최대 24 executor)이 테이블 수만큼 동시에 뜨면 K8S가 감당하지 못한다. Compaction DAG과 동일하게 순차 — 잔여분 없는 테이블은 조회 후 즉시 skip이라 빠르다
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
@@ -378,6 +378,7 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 | 대상 | 변경 | 내용 |
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 2건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 |
+| ConvertFileTaskGroup | get_jobs 생성부 메서드 추출 | `__init__` 인라인의 `@task(task_group=self) def get_jobs` 블록을 `_build_get_jobs()` 메서드로 이동하고 `__init__`은 호출로 교체. **코드 이동만 — 동작 완전 동일** (append DAG 그래프/로직 변화 없음). 재처리의 `ReprocessTaskGroup`이 이 메서드를 override하기 위한 전제 |
 | daily Compaction DAG | 스케줄 + params | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체) |
 | hourly Compaction DAG | params | params에 `tables` multi-select 추가 (기본 전체). 스케줄 변경 없음 |
 
