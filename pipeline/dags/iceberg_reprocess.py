@@ -298,10 +298,14 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     # batch_id는 배치당 1개 — 두 DB에서 온 row들이 하나의 Spark 커밋으로 적재되므로
     # 양쪽 DB의 row 모두 같은 batch_id를 달고, 영수증 확인도 snapshot 1곳에서 끝난다
     batch_id = f"{run_id}_{table_name}"
-    for conn_id, ids in _ids_by_conn(picked).items():  # 마킹은 원천 DB별로
-        _claim_jobs(conn_id, ids, batch_id)
+    ids_by_conn = _ids_by_conn(picked)
 
-    # 마킹 직후 meta 기록 — 이후 단계 실패 시에도 update_failure가 job_ids로 회수 (설계 5.3)
+    # meta를 마킹보다 "먼저" 기록한다 (설계 5.3).
+    # 마킹은 DB 수만큼 UPDATE가 나가므로 중간에 실패할 수 있는데, meta가 없으면
+    # 이미 마킹된 row를 update_failure가 회수하지 못해 좀비 IN_PROGRESS가 된다.
+    # 반대로 meta가 먼저 있으면: 마킹 안 된 row는 상태가 WAIT/FAILED라
+    # update task의 UPDATE(WHERE status='IN_PROGRESS')에서 자동으로 빠지고
+    # 다음 회차에 정상 회수된다 — 어느 쪽으로 실패해도 안전하다.
     # TODO(연결): meta의 key/필드명은 append get_jobs가 push하는 스키마와 필드 단위로
     #             일치시킬 것 — 부모의 Spark(num_executors)·update(job_ids) task가
     #             append과 같은 방식으로 이 XCom을 소비한다.
@@ -311,12 +315,16 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         "table": table_name,
         "group": compaction_group(table),
         "batch_id": batch_id,
-        "job_ids": _ids_by_conn(picked),   # {conn_id: [job_id, ...]} — 원천 DB별
+        "job_ids": ids_by_conn,            # {conn_id: [job_id, ...]} — 원천 DB별
         "leftover": leftover,
         "ts_min": picked[0]["ts"], "ts_max": picked[-1]["ts"],
         # append DAG과 동일 산정식: ceil(총크기/128MB × 1.5 / executor-cores 4)
         "num_executors": min(max(math.ceil(total_mb / 128 * 1.5 / 4), 1), MAX_EXECUTORS),
     })
+
+    for conn_id, ids in ids_by_conn.items():  # 마킹은 원천 DB별로
+        _claim_jobs(conn_id, ids, batch_id)
+
     upload_path_list_to_s3(table_name, picked, batch_id)
     return True
 

@@ -292,8 +292,8 @@ SELECT * FROM (
    - 조회 직후 **필터 적용 전 조회 건수로 잔여분 여부를 기록** (1,000건을 채웠으면 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 영수증/크기 상한으로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
 3. **영수증 확인** — FAILED row에서 읽은 stat_desc(batch_id)별로 `.snapshots` 조회 → 이미 커밋된 batch의 row는 DONE 정정 후 대상에서 제외 (섹션 4)
 4. **크기 상한 적용** — 총 avro 크기 16GB 초과분은 잘라냄. 잘린 건도 잔여분으로 기록 (loop 회차 또는 다음날 회수)
-5. **IN_PROGRESS 마킹** — `WHERE job_id IN (...) AND status IN ('WAIT','FAILED')` 원자적 UPDATE + `stat_desc = 새 batch_id` 기록
-6. **XCom 기록 (마킹 직후, S3 업로드 전)** — job_id 목록·batch_id·잔여분 여부·적재 ts 범위를 먼저 XCom에 남긴다. 이후 단계(S3 업로드 등)에서 task가 실패해도 update_failure가 XCom의 job_id 목록으로 마킹된 row를 FAILED로 회수할 수 있어 좀비 IN_PROGRESS 발생 경로가 줄어든다
+5. **IN_PROGRESS 마킹** — 원천 DB별로 `WHERE job_id IN (...) AND status IN ('WAIT','FAILED')` 원자적 UPDATE + `stat_desc = 새 batch_id` 기록 (순서상 아래 6번 XCom 기록 이후에 수행)
+6. **XCom 기록 (마킹보다 먼저)** — job_id 목록(conn별)·batch_id·잔여분 여부·적재 ts 범위를 마킹 전에 XCom에 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, meta가 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. meta가 먼저 있으면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task의 `WHERE status='IN_PROGRESS'` 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
 7. **Spark 입력 준비** — avro 경로 목록 S3 업로드, num_executors 산정 (append DAG과 동일 산정식: `ceil(총크기/128MB × 1.5 / 4)`, 상한 24)
 
 ### 5.4 처리 상한
@@ -446,7 +446,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | 1 | ShortCircuit task는 `ignore_downstream_trigger_rules=False` 필수 — 기본값이면 첫 skip에서 뒤 테이블 그룹 전체가 skip됨 | 5.2 |
 | 2 | 상태 UPDATE는 XCom의 `job_ids`(conn별 dict)로만, **원천 DB에 각각** 실행. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 / 5.2 |
 | 3 | 잔여분 판정은 필터 적용 전 조회 건수(ROW_LIMIT 도달) + 크기 상한 이월 기준 | 5.3 |
-| 4 | IN_PROGRESS 마킹 직후 XCom 먼저 기록, S3 업로드는 그 다음 | 5.3 |
+| 4 | XCom(meta) 기록 → IN_PROGRESS 마킹 → S3 업로드 순서 (마킹 중간 실패 시 좀비 방지) | 5.3 |
 | 5 | loop 재trigger 조건 = 잔여분(상한 초과 이월) 있는 테이블 존재. 지속 실패는 MAX_LOOP(10회) 상한으로 유한 종료. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |
 | 6 | 수동 `start_time`/`end_time`은 함께 지정 + `end_time ≤ 전날 00:00` (전날/당일 거부) — prepare_run에서 검증 | 5.1 |
 | 7 | Compaction trigger는 적재분 전부, `tables` 필터 포함. 날짜/시간 형식은 기존 Compaction DAG params 형식과 일치 확인 | 6.3 |
