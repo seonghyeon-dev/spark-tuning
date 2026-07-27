@@ -6,7 +6,7 @@
 |------|------|
 | 작성 목적 | append DAG 조회 기간(최근 1일)에서 밀려난 WAIT 데이터와 FAILED 데이터를 회수하는 재처리 DAG 설계 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
-| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.1.7, Oracle DB |
+| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.2.2, Oracle DB |
 | 시간대 기준 | **KST (Asia/Seoul)** — 모든 날짜/시간 계산에 적용 |
 | 최종 수정일 | 2026-07-14 |
 
@@ -241,33 +241,34 @@ check_zombie_jobs                          # 좀비 IN_PROGRESS 탐지 → 알�
 
 prepare_run                                # params 검증·정규화 1회 → XCom (get_time 패턴)
       │                                    # ts 경계 계산, 수동 범위 검증, date-time → ts 변환
-┌─ TaskGroup: TABLE_A ──────────────────────────────────────────┐
-│  get_table_jobs      # 정규화 XCom 값 기반 조회                │
-│      │               # + 영수증 확인 + 상한 적용 + 마킹         │
-│      │               # 대상 0건이면 그룹 내 후속 skip           │
-│  append_data         # SparkKubernetesOperator (기존 job 재사용)│
-│      ├── update_success  [all_success]                         │
-│      └── update_failure  [all_failed]                          │
+┌─ ConvertFileTaskGroup: TABLE_A (기존 append DAG 템플릿 재사용) ─┐
+│  get_jobs            # ← 재처리용 조회 task만 주입             │
+│      │               # (범위·상한·영수증 확인. 대상 0건→skip)  │
+│  append_data         # 템플릿 제공 (Spark append)              │
+│      ├── update_success  [all_success]  # 템플릿 제공          │
+│      └── update_failure  [all_failed]   # 템플릿 제공          │
 └────────────────────────────────────────────────────────────────┘
       │  (다음 그룹 첫 task는 trigger_rule=all_done —
       │   앞 테이블 실패가 뒤 테이블 처리를 막지 않음)
 ┌─ TaskGroup: TABLE_B ─┐ ... (테이블 수만큼 순차)
 └──────────────────────┘
       │
-trigger_compaction  [all_done]             # 적재 결과 집계 → Compaction DAG trigger (섹션 6)
-      │
-check_loop          [all_done]             # 상한 채운 테이블 존재 시 자기 자신 재trigger (5.5)
+compaction_targets [all_done] → trigger_compaction  # 집계 → TriggerDagRunOperator.expand (섹션 6)
+next_loop          [all_done] → retrigger_self       # 잔여분 판단 → 자기 재trigger (0/1건, 5.5)
 ```
 
+> Compaction/재trigger는 대상 개수가 가변(Compaction 여러 건, loop 0/1건)이므로, 집계 task가 `TriggerDagRunOperator` kwargs 목록을 만들고 **dynamic task mapping(`expand_kwargs`)** 으로 trigger한다. 빈 목록이면 mapped operator는 skip된다.
+
+- **기존 ConvertFileTaskGroup 재사용 (상속 + override)**: append DAG의 TaskGroup 템플릿(get_jobs → Spark append → update_success/update_failure)을 상속한 `ReprocessTaskGroup`이 **get_jobs 생성 메서드만 override**한다. 템플릿에 재처리 로직을 추가하지 않는다 — 차이는 조회 범위·상한·영수증 확인뿐이고 이후 단계는 동일하기 때문. 전제: 현재 부모의 get_jobs는 `__init__` 인라인이라 override 불가 → **생성부를 메서드(`_build_get_jobs`)로 추출하는 1회 리팩토링 필요** (코드 이동만, 동작 완전 동일 — 섹션 7). override 구현 주의 2가지: ① 부모 `__init__`이 override를 호출하므로 자식이 쓰는 값은 `super().__init__()` 전에 self에 저장 ② 부모가 `with self:` 없이 `@task(task_group=self)` 방식이므로 override의 데코레이터에도 `task_group=self` 필수 (누락 시 dag 레벨 생성 → 테이블 간 task_id 충돌)
 - **테이블별 순차 실행**: Spark job(최대 24 executor)이 테이블 수만큼 동시에 뜨면 K8S가 감당하지 못한다. Compaction DAG과 동일하게 순차 — 잔여분 없는 테이블은 조회 후 즉시 skip이라 빠르다
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
-- **상태 update의 대상 식별은 XCom의 job_id 목록으로만**: `stat_desc`(batch_id)는 CLOB이라 WHERE 조건 사용 금지 (섹션 4.2 제약). update_success/update_failure는 get_table_jobs가 XCom에 남긴 job_id 목록으로 UPDATE한다
+- **상태 update의 대상 식별은 XCom의 job_id 목록으로만**: `stat_desc`(batch_id)는 CLOB이라 WHERE 조건 사용 금지 (섹션 4.2 제약). update_success/update_failure는 get_jobs가 XCom(meta.job_ids)에 남긴 목록으로 UPDATE한다
 - **params는 prepare_run에서만 읽는다**: 기존 append DAG의 get_time 패턴과 동일. 검증·형식 변환(`ts` 경계 계산, 수동 범위 검증, date-time → ts 문자열 변환)을 첫 task에서 1회 수행하고, 이후 task들은 정규화된 XCom 값만 소비한다. 잘못된 입력은 파이프라인 중간이 아닌 첫 task에서 즉시 실패하고, TaskGroup 템플릿이 DAG params에 결합되지 않아 재사용이 가능해진다
 
-### 5.3 get_table_jobs 처리 순서 (테이블별)
+### 5.3 get_jobs(재처리 조회) 처리 순서 (테이블별)
 
-선행 task `prepare_run`이 params 검증과 `ts` 경계 계산을 1회 수행해 XCom으로 내려보내며(수동 범위 검증, date-time → ts 문자열 변환 포함), get_table_jobs는 정규화된 값만 사용한다.
+선행 task `prepare_run`이 params 검증과 `ts` 경계 계산을 1회 수행해 XCom으로 내려보내며(수동 범위 검증, date-time → ts 문자열 변환 포함), 재처리 조회 로직은 정규화된 값만 사용한다.
 
 1. **실행 대상 확인** — 정규화된 `tables` 목록에 자기 테이블이 없으면 즉시 skip
 2. **대상 조회** — `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한:
@@ -311,14 +312,15 @@ SELECT * FROM (
 
 ```
 run N: 테이블별 최대 1,000건 처리
-       → 잔여분이 있는 테이블 중 이번 회차 Spark가 성공한 테이블이 하나라도 있으면
-         자기 자신을 trigger (첫 회차가 확정한 조회 범위·tables·loop_count를 conf로 승계)
+       → 잔여분(상한 초과 이월)이 있는 테이블이 하나라도 있으면 자기 자신을 trigger
+         (첫 회차가 확정한 조회 범위·tables·loop_count를 conf로 승계)
 run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 후 즉시 skip
-종료: 재trigger 조건을 만족하는 테이블 없음 → trigger 안 함
+종료: 잔여분 있는 테이블 없음 또는 loop_count 상한 도달 → trigger 안 함
 ```
 
-- **재trigger 조건 = 잔여분 존재 AND 해당 테이블의 이번 회차 Spark 성공.** 실패한 테이블은 조건에서 제외한다 — 실패한 row는 FAILED로 돌아가 있고 `ORDER BY ts ASC`라 다음 회차가 같은 row를 다시 집게 되므로, 성공 조건 없이 돌리면 깨진 데이터를 같은 밤에 loop 상한까지 반복 재시도하게 된다. 실패분은 다음날 정기 실행이 회수한다
-- 잔여분 판정은 **필터 전 조회 건수(1,000건 도달) 또는 크기 상한 이월 발생** 기준 (섹션 5.3)
+- **재trigger 조건 = 잔여분(상한 초과 이월)이 있는 테이블 존재.** 잔여분 판정은 **필터 전 조회 건수(1,000건 도달) 또는 크기 상한 이월 발생** 기준 (섹션 5.3). 상한을 채우지 못한 테이블(실패 포함)은 잔여분이 없으므로 loop를 유발하지 않는다
+- **지속 실패의 유한 종료**: 상한을 채운 테이블의 Spark가 계속 실패하면 다음 회차가 같은 row를 다시 집을 수 있으나, `loop_count` 상한 10회로 그날 밤 안에 종료되고 알림 후 수동 전환된다. 대부분의 실패는 상한 미달이라 애초에 loop를 만들지 않는다
+- 집계용 meta는 **get_jobs가 push한 XCom**에서 읽는다 (Airflow 3 worker는 task 상태 DB 조회 불가). meta 존재 = 그 테이블이 이번 회차에 처리 대상을 선점했다는 뜻
 - `max_active_runs=1`이므로 회차는 자동으로 순차 실행된다
 - 매 회차가 동일한 단순 파이프라인 — Spark task당 자기 상태 update가 붙어 있어 부분 실패 문제가 없다
 - **첫 회차가 확정한 조회 범위·tables를 conf로 승계**: prepare_run은 conf에 범위가 있으면 재계산하지 않고 그대로 사용한다. 수동 실행의 선택 값이 회차에서 유실되지 않고, 회차가 자정을 넘겨 실행되어도 ts 경계가 첫 회차 기준으로 유지된다
@@ -376,6 +378,7 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 | 대상 | 변경 | 내용 |
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 2건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 |
+| ConvertFileTaskGroup | get_jobs 생성부 메서드 추출 | `__init__` 인라인의 `@task(task_group=self) def get_jobs` 블록을 `_build_get_jobs(update_jobs)` 메서드로 이동하고 `__init__`은 호출로 교체. get_jobs가 closure로 참조하던 `__init__` 지역 함수 `_update_jobs`는 **그대로 두고 메서드 인자로 전달** (closure 참조 → 인자 호출로만 교체, 다른 task의 사용은 영향 없음). **동작 완전 동일** — 재처리의 `ReprocessTaskGroup`이 이 메서드를 override하기 위한 전제 |
 | daily Compaction DAG | 스케줄 + params | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체) |
 | hourly Compaction DAG | params | params에 `tables` multi-select 추가 (기본 전체). 스케줄 변경 없음 |
 

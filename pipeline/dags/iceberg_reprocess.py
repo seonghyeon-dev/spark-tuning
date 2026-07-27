@@ -1,27 +1,23 @@
 """재처리(Reprocessing) DAG — 구현 스켈레톤.
 
 설계 문서: pipeline/reprocessing-dag-design.md
+환경: Airflow 3.2.2
 
-역할: append DAG 조회 기간(최근 1일)에서 밀려난 WAIT 데이터와 FAILED 데이터를
-      전날+그저께 범위에서 회수하고, 적재분에 대해 기존 Compaction DAG을 trigger한다.
+역할: append DAG 조회 기간(최근 1일)에서 밀려난 WAIT/FAILED 데이터를 전날+그저께
+      범위에서 회수하고, 적재분에 대해 기존 Compaction DAG을 trigger한다.
 
-구조: 단일 DAG, 테이블별 TaskGroup 순차 실행 (Compaction DAG과 동일 패턴).
-      params는 prepare_run task에서 1회 검증·정규화 후 XCom으로만 소비한다.
+구조: 단일 DAG. 테이블별로 기존 ConvertFileTaskGroup을 상속(get_jobs만 override)해
+      순차 실행. params는 prepare_run에서 1회 검증·정규화.
       잔여분이 남으면 자기 자신을 재trigger (loop, 상한 10회).
 
-── 기존 구현 연결 지점 ─────────────────────────────────────────────
-이미 구현되어 있는 것들이므로 연결만 하면 된다. 코드 내 `TODO(연결):` 태그와
-1:1로 대응한다 (grep "TODO(연결)" 으로 전체 확인 가능).
-
-  1. iceberg.py의 hourly/daily Enum import (자리표시자 클래스 2개 교체)
-  2. Compaction DAG id 상수 2건
-  3. Oracle 조회/실행     — oracle_fetch / oracle_execute
+── 기존 구현 연결 지점 (grep "TODO(연결)") ────────────────────────
+  1. iceberg.py의 hourly/daily Enum import (자리표시자 2개 교체)
+  2. ConvertFileTaskGroup import + 상속 방식 (ReprocessTaskGroup 주석 참조)
+  3. Oracle conn id
   4. 영수증 snapshot 조회 — snapshot_exists
   5. avro 경로 목록 S3 업로드 — upload_path_list_to_s3
-  6. 알림 채널            — send_alert
-  7. Spark 실행           — append_data의 SparkKubernetesOperator 템플릿
-  8. Compaction trigger   — trigger_dag_run 호출 + conf 날짜/시간 형식 확인
-  9. TaskGroup 템플릿     — 기존 ConvertFileTaskGroup 확장/재사용 (build_table_group)
+  6. 알림 채널 — send_alert
+  7. Compaction DAG id 상수 + conf 날짜/시간 형식 (기존 Compaction UI params와 일치)
 ────────────────────────────────────────────────────────────────────
 """
 
@@ -30,47 +26,18 @@ from enum import Enum
 from pathlib import Path
 
 import pendulum
-from airflow.models.param import Param
-from airflow.sdk import dag, task
-from airflow.utils.task_group import TaskGroup
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.providers.oracle.hooks.oracle import OracleHook
+from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.sdk import Param, chain, dag, task
+
+# TODO(연결): 기존 append DAG 공통 모듈에서 import
+# from <공통 모듈>.taskgroups import ConvertFileTaskGroup
+# from <공통 모듈>.iceberg import HourlyIcebergTable, DailyIcebergTable
 
 KST = pendulum.timezone("Asia/Seoul")
-
 DAG_ID = Path(__file__).stem  # 조직 컨벤션: dag_id는 파일명에서 파생 (단일 소스)
 
-
-# TODO(연결): append DAG이 사용하는 iceberg.py의 hourly/daily Enum 클래스를 그대로 import해서
-#       아래 자리표시자를 제거 (클래스명은 iceberg.py의 실제 정의에 맞출 것 — 단일 소스).
-# from <공통 모듈>.iceberg import HourlyIcebergTable, DailyIcebergTable
-class HourlyIcebergTable(str, Enum):
-    """자리표시자 — 첫 파티션이 hour인 테이블 그룹 (실제 iceberg.py 정의로 교체)."""
-
-    # TABLE_A = "table_a"
-
-    def get_name(self) -> str:
-        """실제 테이블명 반환. value는 alias이므로 테이블명은 반드시 get_name() 사용."""
-        return self.value  # 자리표시자 구현 — 실제 Enum의 get_name()으로 대체됨
-
-
-class DailyIcebergTable(str, Enum):
-    """자리표시자 — 첫 파티션이 day인 테이블 그룹 (실제 iceberg.py 정의로 교체)."""
-
-    # TABLE_B = "table_b"
-
-    def get_name(self) -> str:
-        """실제 테이블명 반환. value는 alias이므로 테이블명은 반드시 get_name() 사용."""
-        return self.value  # 자리표시자 구현 — 실제 Enum의 get_name()으로 대체됨
-
-
-# append DAG과 동일한 순회 방식. hourly/daily 분류는 소속 Enum 클래스로 결정된다.
-ALL_TABLES = [*HourlyIcebergTable, *DailyIcebergTable]
-
-
-def table_group(table) -> str:
-    """테이블의 Compaction 그룹: 소속 Enum 클래스가 곧 분류다."""
-    return "hourly" if isinstance(table, HourlyIcebergTable) else "daily"
-
+ORACLE_CONN_ID = "oracle_default"  # TODO(연결): 실제 conn id (append DAG과 동일)
 
 ROW_LIMIT = 1000              # 테이블당 조회 상한 (설계 5.4 — 러프 설정, 재검증 필요)
 SIZE_LIMIT_MB = 16 * 1024     # 테이블당 크기 상한 16GB (설계 5.4 — 러프 설정, 재검증 필요)
@@ -82,37 +49,127 @@ DAILY_COMPACTION_DAG_ID = "daily_compaction_dag"    # TODO(연결): 실제 DAG i
 HOURLY_COMPACTION_DAG_ID = "hourly_compaction_dag"  # TODO(연결): 실제 DAG id
 
 
+# --- 테이블 Enum (자리표시자 — 실제 iceberg.py 정의로 교체) -----------------
+
+class HourlyIcebergTable(str, Enum):
+    """첫 파티션이 hour인 테이블 그룹."""
+
+    # TABLE_A = "table_a"
+
+    def get_name(self) -> str:
+        return self.value  # value는 alias — 실제 Enum의 get_name()으로 대체
+
+
+class DailyIcebergTable(str, Enum):
+    """첫 파티션이 day인 테이블 그룹."""
+
+    # TABLE_B = "table_b"
+
+    def get_name(self) -> str:
+        return self.value
+
+
+ALL_TABLES = [*HourlyIcebergTable, *DailyIcebergTable]
+
+
+def compaction_group(table) -> str:
+    """Compaction 그룹: 소속 Enum 클래스가 곧 분류다."""
+    return "hourly" if isinstance(table, HourlyIcebergTable) else "daily"
+
+
+# --- 시간 유틸 --------------------------------------------------------------
+
 def ts_str(dt: pendulum.DateTime) -> str:
-    """pendulum datetime → Job History ts 형식 'YYYYMMDDHHmmSSsss' (밀리세컨즈 3자리)."""
+    """pendulum datetime → Job History ts 형식 'YYYYMMDDHHmmSSsss'."""
     return dt.format("YYYYMMDDHHmmss") + "000"
 
 
-# ---------------------------------------------------------------------------
-# TODO(연결): 아래 헬퍼들은 기존 append DAG의 구현을 재사용해서 연결한다.
-# ---------------------------------------------------------------------------
-
-def oracle_fetch(sql: str, **binds) -> list[dict]:
-    """TODO(연결): 기존 Oracle 커넥션/Hook 재사용."""
-    raise NotImplementedError
+def param_to_ts(value: str) -> str:
+    """date-time param → ts 문자열. offset이 와도 KST로 통일."""
+    return ts_str(pendulum.parse(value, tz=KST).in_timezone(KST))
 
 
-def oracle_execute(sql: str, **binds) -> None:
-    """TODO(연결): 기존 Oracle 커넥션/Hook 재사용 (autocommit 또는 명시 commit)."""
-    raise NotImplementedError
+def dates_between(ts_min: str, ts_max: str) -> list[str]:
+    """ts_min~ts_max가 걸친 날짜(YYYYMMDD) 목록 (수동 범위가 여러 날에 걸칠 때 대비)."""
+    day = pendulum.from_format(ts_min[:8], "YYYYMMDD", tz=KST)
+    last = pendulum.from_format(ts_max[:8], "YYYYMMDD", tz=KST)
+    days = []
+    while day <= last:
+        days.append(day.format("YYYYMMDD"))
+        day = day.add(days=1)
+    return days
 
 
-def snapshot_exists(table: str, batch_id: str) -> bool:
-    """영수증 확인 (설계 4.2): 해당 테이블 snapshot summary에 batch_id 존재 여부.
+# --- Oracle -----------------------------------------------------------------
 
-    TODO(연결): Trino/Spark 중 기존 조회 경로 재사용.
-      SELECT snapshot_id FROM <catalog>.<db>.<table>.snapshots
+JOB_COLUMNS = ("job_id", "status", "stat_desc", "ts", "avro_path", "file_size_mb")
+
+SELECT_TARGETS_SQL = f"""
+SELECT * FROM (
+    SELECT {", ".join(JOB_COLUMNS)}
+      FROM JOB_HISTORY
+     WHERE table_name = :tbl
+       AND ts >= :ts_from AND ts < :ts_to
+       AND ( status = 'FAILED'
+             OR (status = 'WAIT' AND ts < :wait_bound) )
+     ORDER BY ts ASC
+) WHERE ROWNUM <= :row_limit
+"""
+
+ZOMBIE_SQL = """
+SELECT table_name, job_id, updated_at
+  FROM JOB_HISTORY
+ WHERE status = 'IN_PROGRESS'
+   AND updated_at < SYSTIMESTAMP - NUMTODSINTERVAL(:h, 'HOUR')
+"""
+
+
+def _rows(sql: str, binds: dict, columns: tuple[str, ...]) -> list[dict]:
+    """OracleHook.get_records → 컬럼명 dict 매핑. columns는 SELECT 순서와 일치해야 한다."""
+    records = OracleHook(oracle_conn_id=ORACLE_CONN_ID).get_records(sql, parameters=binds)
+    return [dict(zip(columns, r)) for r in records]
+
+
+def _in_binds(values: list) -> tuple[str, dict]:
+    """Oracle IN은 list를 바로 못 바인딩 → placeholder 동적 확장."""
+    binds = {f"id{i}": v for i, v in enumerate(values)}
+    return ", ".join(f":{k}" for k in binds), binds
+
+
+def _mark_done(job_ids: list[str]) -> None:
+    """영수증으로 커밋이 확인된 FAILED row를 DONE으로 정정 (설계 4.2)."""
+    clause, binds = _in_binds(job_ids)
+    OracleHook(oracle_conn_id=ORACLE_CONN_ID).run(
+        f"UPDATE JOB_HISTORY SET status = 'DONE' "
+        f"WHERE job_id IN ({clause}) AND status = 'FAILED'",
+        parameters=binds,
+    )
+
+
+def _claim_jobs(job_ids: list[str], batch_id: str) -> None:
+    """원자적 IN_PROGRESS 전환 + batch_id(영수증) 기록 (설계 5.3).
+    stat_desc(CLOB)는 값 기록만 — WHERE 조건 사용 금지 (설계 4.2)."""
+    clause, binds = _in_binds(job_ids)
+    OracleHook(oracle_conn_id=ORACLE_CONN_ID).run(
+        f"UPDATE JOB_HISTORY SET status = 'IN_PROGRESS', stat_desc = :batch_id "
+        f"WHERE job_id IN ({clause}) AND status IN ('WAIT', 'FAILED')",
+        parameters={"batch_id": batch_id, **binds},
+    )
+
+
+# --- 기존 구현 연결 스텁 ------------------------------------------------------
+
+def snapshot_exists(table_name: str, batch_id: str) -> bool:
+    """영수증 확인 (설계 4.2): 테이블 snapshot summary에 batch_id 존재 여부.
+    TODO(연결): 기존 Trino/Spark 조회 경로 재사용.
+      SELECT 1 FROM <catalog>.<db>.<table>.snapshots
        WHERE element_at(summary, 'batch_id') = :batch_id
     """
     raise NotImplementedError
 
 
-def upload_path_list_to_s3(table: str, jobs: list[dict], batch_id: str) -> None:
-    """TODO(연결): 기존 get_jobs의 avro 경로 목록 텍스트 파일 S3 업로드 로직 재사용."""
+def upload_path_list_to_s3(table_name: str, jobs: list[dict], batch_id: str) -> None:
+    """TODO(연결): 기존 get_jobs의 avro 경로 목록 S3 업로드 로직 재사용."""
     raise NotImplementedError
 
 
@@ -121,19 +178,145 @@ def send_alert(message: str, detail=None) -> None:
     raise NotImplementedError
 
 
-def mark_status_by_job_ids(job_ids: list[str], status: str) -> None:
-    """job_id 목록으로 상태 UPDATE. stat_desc(CLOB)는 WHERE 조건 사용 금지 (설계 4.2).
+# --- 재처리 조회 로직 ---------------------------------------------------------
 
-    TODO(연결): Oracle은 목록을 IN에 직접 바인드할 수 없다 — 기존 Hook의
-    목록 확장 방식(IN (:1,:2,...) 동적 생성 등)을 그대로 사용할 것.
+def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
+    """append get_jobs의 재처리 버전 — 조회 범위·상한·영수증 확인만 다르다.
+
+    반환 False = 처리 대상 없음 (short_circuit → 그룹 내 하류 skip).
+    meta는 key="meta"로 push — 하류 Spark(num_executors)·update(job_ids)·
+    집계 task(Compaction/loop)가 소비한다.
     """
-    oracle_execute(
-        """
-        UPDATE JOB_HISTORY SET status = :status
-         WHERE job_id IN :ids AND status = 'IN_PROGRESS'
-        """,
-        status=status, ids=job_ids,
+    if not cfg:
+        raise ValueError("prepare_run 결과 없음 — 선행 task 실패")
+
+    table_name = table.get_name()
+    if table_name not in cfg["tables"]:
+        return False  # 수동 실행에서 미선택 → skip
+
+    jobs = _rows(
+        SELECT_TARGETS_SQL,
+        {"tbl": table_name, "ts_from": cfg["ts_from"], "ts_to": cfg["ts_to"],
+         "wait_bound": cfg["wait_bound"], "row_limit": ROW_LIMIT},
+        JOB_COLUMNS,
     )
+    fetched_full = len(jobs) >= ROW_LIMIT  # 잔여분 판정은 필터 전 건수 (설계 5.3)
+
+    # 영수증 확인: 거짓 실패(커밋됐는데 FAILED)는 DONE 정정 후 제외 (설계 4)
+    failed_batches = {j["stat_desc"] for j in jobs
+                      if j["status"] == "FAILED" and j["stat_desc"]}
+    committed = {b for b in failed_batches if snapshot_exists(table_name, b)}
+    if committed:
+        _mark_done([j["job_id"] for j in jobs if j["stat_desc"] in committed])
+        jobs = [j for j in jobs if j["stat_desc"] not in committed]
+
+    # 크기 상한: 초과분은 이월 (loop 회차 또는 다음날 회수, 설계 5.4)
+    picked, total_mb = [], 0
+    for j in jobs:
+        if total_mb + j["file_size_mb"] > SIZE_LIMIT_MB:
+            break
+        picked.append(j)
+        total_mb += j["file_size_mb"]
+    if not picked:
+        return False
+    leftover = fetched_full or len(picked) < len(jobs)
+
+    batch_id = f"{run_id}_{table_name}"
+    _claim_jobs([j["job_id"] for j in picked], batch_id)
+
+    # 마킹 직후 meta 기록 — 이후 단계 실패 시에도 update_failure가 job_ids로 회수 (설계 5.3)
+    ti.xcom_push(key="meta", value={
+        "table": table_name,
+        "group": compaction_group(table),
+        "batch_id": batch_id,
+        "job_ids": [j["job_id"] for j in picked],
+        "leftover": leftover,
+        "ts_min": picked[0]["ts"], "ts_max": picked[-1]["ts"],
+        # append DAG과 동일 산정식: ceil(총크기/128MB × 1.5 / executor-cores 4)
+        "num_executors": min(max(math.ceil(total_mb / 128 * 1.5 / 4), 1), MAX_EXECUTORS),
+    })
+    upload_path_list_to_s3(table_name, picked, batch_id)
+    return True
+
+
+# --- 기존 ConvertFileTaskGroup 재사용 (상속 + get_jobs override) -------------
+#
+# ConvertFileTaskGroup: get_jobs → spark append → [update_success, update_failure]
+# 재처리는 get_jobs(조회)만 다르다.
+#
+# 전제 — 부모 1회 추출 리팩토링 (동작 동일, 섹션 7):
+#   현재 get_jobs는 __init__ 안에 @task(task_group=self)로 인라인 정의되어 있고,
+#   __init__ 지역 함수 _update_jobs를 closure로 호출한다. 따라서
+#   ① get_jobs 블록만 메서드로 이동 ② _update_jobs는 __init__에 그대로 두고
+#   메서드 인자로 전달한다 (closure 참조 → 인자 호출로만 교체):
+#
+#     class ConvertFileTaskGroup(TaskGroup):
+#         def __init__(self, table, group_id, ..., **kwargs):
+#             super().__init__(group_id=group_id, **kwargs)
+#             self.table = table
+#
+#             def _update_jobs(...):                     # 그대로 __init__에 둠
+#                 ...
+#
+#             jobs = self._build_get_jobs(_update_jobs)  # ← 헬퍼를 인자로 전달
+#             spark = ...
+#             jobs >> spark >> [update_success, update_failure]
+#
+#         def _build_get_jobs(self, update_jobs):
+#             @task(task_group=self)
+#             def get_jobs(ti=None):
+#                 ... 기존 코드 그대로 (update_jobs(...) 호출 포함) ...
+#             return get_jobs()
+#
+# 부모 __init__이 self._build_get_jobs(...)를 호출할 때 자식 override가 실행되므로
+# (파이썬 메서드 디스패치), 재처리는 아래처럼 override만 하면 된다.
+#
+# TODO(연결): 부모 import + __init__ 시그니처·추출 메서드명(_build_get_jobs)·
+#             _update_jobs 시그니처를 실제 정의에 맞출 것.
+
+class ReprocessTaskGroup(ConvertFileTaskGroup):  # noqa: F821  TODO(연결): 부모 import
+    """ConvertFileTaskGroup 상속 — get_jobs만 재처리 조회로 교체.
+    Spark append / update_success / update_failure는 부모 것을 그대로 사용한다.
+    """
+
+    def __init__(self, table, run_cfg, **kwargs):
+        # 부모 __init__이 _build_get_jobs()를 호출하므로, override가 쓰는 값은
+        # 반드시 super().__init__() 호출 전에 self에 넣어야 한다.
+        self._run_cfg = run_cfg
+        super().__init__(table, **kwargs)  # TODO(연결): 부모 __init__ 시그니처에 맞출 것
+
+    def _build_get_jobs(self, update_jobs):
+        """부모의 get_jobs 생성 메서드 override.
+
+        update_jobs: 부모 __init__의 상태 update 헬퍼.
+        TODO(연결): 시그니처가 맞으면 _mark_done/_claim_jobs 대신 이 헬퍼 사용 가능.
+        """
+        table = self.table  # 부모가 저장한 Enum 그대로 사용
+
+        @task.short_circuit(
+            task_group=self,                        # 부모와 동일 — with self: 없이 생성되므로 필수.
+            task_id="get_jobs",                     # 누락 시 dag 레벨 생성 → task_id 충돌
+            trigger_rule="all_done",                # 앞 테이블 실패에도 실행 (순차 그룹)
+            ignore_downstream_trigger_rules=False,  # skip을 그룹 내로 한정 (설계 5.2)
+        )
+        def get_jobs(cfg: dict, run_id=None, ti=None):
+            return reprocess_get_jobs(cfg, table=table, run_id=run_id, ti=ti)
+
+        return get_jobs(self._run_cfg)
+
+
+def collect_metas(ti) -> list[dict]:
+    """처리 대상이 있던 테이블들의 get_jobs meta 수집 (설계 6.3 / 5.5).
+
+    meta 존재 = 그 테이블이 이번 회차에 처리 대상을 선점했다는 뜻.
+    (Airflow 3 worker는 메타데이터 DB 접근 불가 — task 상태 조회 대신 XCom만 사용)
+    """
+    metas = []
+    for t in ALL_TABLES:
+        meta = ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.get_jobs", key="meta")
+        if meta:
+            metas.append(meta)
+    return metas
 
 
 # ---------------------------------------------------------------------------
@@ -147,52 +330,36 @@ def mark_status_by_job_ids(job_ids: list[str], status: str) -> None:
     catchup=False,
     max_active_runs=1,      # loop 회차 순차 실행 보장
     params={
-        # UI 수동 실행: 1개/여러 개/전체 multi-select (설계 5.1)
-        # 선택지·기본값 모두 iceberg.py Enum에서 생성 — 하드코딩 목록 없음
+        # multi-select: 선택지·기본값 모두 iceberg.py Enum에서 생성 (설계 5.1)
         "tables": Param(
             default=[t.get_name() for t in ALL_TABLES],
             type="array",
             items={"type": "string", "enum": [t.get_name() for t in ALL_TABLES]},
         ),
-        # 수동 실행: 조회 범위를 직접 정의 (둘 다 함께 지정, end_time ≤ 전날 00:00 —
-        # prepare_run에서 검증). 미지정 시 정기 범위(그저께 00:00 ~ 전날 끝).
-        # 기존 DAG과 동일한 date-time 형식 → prepare_run에서 ts 문자열로 변환
+        # 수동 실행 조회 범위 (둘 다 함께, end ≤ 전날 00:00 — prepare_run 검증).
+        # 미지정 시 정기 범위(그저께 00:00 ~ 전날 끝).
         "start_time": Param(None, type=["null", "string"], format="date-time"),
         "end_time": Param(None, type=["null", "string"], format="date-time"),
     },
     tags=["iceberg", "reprocess"],
 )
-def dag():  # 조직 컨벤션: 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 담당
+def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 담당
 
     @task
     def check_zombie_jobs():
-        """임계 시간 초과 IN_PROGRESS 탐지 → 알림만, 자동 복구 안 함 (설계 8.2)."""
-        zombies = oracle_fetch(
-            """
-            SELECT table_name, job_id, updated_at FROM JOB_HISTORY
-             WHERE status = 'IN_PROGRESS'
-               AND updated_at < SYSTIMESTAMP - NUMTODSINTERVAL(:h, 'HOUR')
-            """,
-            h=ZOMBIE_HOURS,
-        )
+        """좀비 IN_PROGRESS 탐지 → 알림만 (설계 8.2). 독립 실행 — 본류와 의존 없음."""
+        zombies = _rows(ZOMBIE_SQL, {"h": ZOMBIE_HOURS},
+                        ("table_name", "job_id", "updated_at"))
         if zombies:
-            send_alert(
-                f"좀비 IN_PROGRESS {len(zombies)}건 — 영수증 확인 후 수동 판정 필요 (설계 8.2)",
-                zombies,
-            )
+            send_alert(f"좀비 IN_PROGRESS {len(zombies)}건 — 영수증 확인 후 수동 판정 필요",
+                       zombies)
 
     @task
     def prepare_run(params=None, dag_run=None) -> dict:
-        """params 검증·정규화 (1회) — 이후 task들은 params를 직접 읽지 않는다.
-
-        기존 append DAG의 get_time 패턴과 동일. 형식 오류·잘못된 범위는 여기서
-        즉시 실패하고, 하류 task들은 정규화된 XCom 값만 소비한다.
-        loop 재trigger 회차는 첫 회차가 확정한 값을 conf로 승계받는다 (설계 5.5).
-        """
+        """params 검증·정규화 1회 (append DAG의 get_time 패턴). 이후 task는 XCom만 소비."""
         conf = dag_run.conf or {}
 
-        # loop 재trigger 회차: 첫 회차가 정규화한 조회 범위·tables를 그대로 승계.
-        # 수동 실행의 선택 값이 회차에서 유실되지 않고, 회차가 자정을 넘겨도 경계가 안 흔들림
+        # loop 재trigger 회차: 첫 회차가 확정한 값을 그대로 승계 (설계 5.5)
         if conf.get("ts_from"):
             return {
                 "tables": conf["tables"],
@@ -203,23 +370,18 @@ def dag():  # 조직 컨벤션: 함수명 dag() 고정 — DAG 정체성은 파�
             }
 
         base = pendulum.now(KST).start_of("day")
-        start_time, end_time = params.get("start_time"), params.get("end_time")
+        st, et = params.get("start_time"), params.get("end_time")
 
-        if start_time or end_time:
-            # 수동 실행: start_time/end_time이 조회 범위를 직접 정의한다 (설계 5.1)
-            # in_timezone(KST): UI가 offset 포함 문자열을 보내도 KST 기준으로 통일
-            if not (start_time and end_time):
-                raise ValueError("start_time과 end_time은 함께 지정해야 한다")
-            ts_from = ts_str(pendulum.parse(start_time, tz=KST).in_timezone(KST))
-            ts_to = ts_str(pendulum.parse(end_time, tz=KST).in_timezone(KST))
-            if ts_to <= ts_from:
-                raise ValueError("end_time은 start_time 이후여야 한다")
-            # 전날 00:00 이후는 append 조회 범위(최근 24시간)와 겹칠 수 있어 거부
-            if ts_to > ts_str(base.subtract(days=1)):
-                raise ValueError("end_time은 전날 00:00 이전만 허용 — append 조회 범위와 겹침")
+        if st and et:
+            # 수동: 조회 범위 직접 정의. end ≤ 전날 00:00 (append 겹침 방지, 설계 5.1)
+            ts_from, ts_to = param_to_ts(st), param_to_ts(et)
+            if not ts_from < ts_to <= ts_str(base.subtract(days=1)):
+                raise ValueError("start < end 이고 end_time ≤ 전날 00:00 이어야 한다")
             wait_bound = ts_to  # 범위 전체가 append 범위 밖 → WAIT 전 구간 허용
+        elif st or et:
+            raise ValueError("start_time과 end_time은 함께 지정해야 한다")
         else:
-            # 정기: 그저께 00:00 ~ 전날 끝. WAIT는 전날 01:00 이전만 (설계 2.1)
+            # 정기: 그저께 00:00 ~ 전날 끝, WAIT는 전날 01:00 이전만 (설계 2.1)
             ts_from = ts_str(base.subtract(days=2))
             ts_to = ts_str(base)
             wait_bound = ts_str(base.subtract(days=1).add(hours=1))
@@ -232,222 +394,69 @@ def dag():  # 조직 컨벤션: 함수명 dag() 고정 — DAG 정체성은 파�
             "loop_count": 0,
         }
 
-    # TODO(연결): 기존 append DAG의 ConvertFileTaskGroup 템플릿 확장/재사용.
-    #   구조(조회 → Spark → update_success/update_failure)가 동일하므로 조회 task만
-    #   재처리용(get_table_jobs)으로 교체 가능하게 템플릿을 파라미터화하면 재사용 가능.
-    #   단, 그룹 첫 task에 trigger_rule=all_done + short_circuit 옵션 노출 필요 (설계 5.2).
-    def build_table_group(table, run_cfg) -> TaskGroup:
-        tbl = table.get_name()               # 테이블명은 get_name() 사용 (value는 alias)
-        with TaskGroup(group_id=f"reprocess_{tbl}") as group:
+    @task(trigger_rule="all_done")
+    def compaction_targets(ti=None) -> list[dict]:
+        """적재 결과 집계 → TriggerDagRunOperator kwargs 목록 (설계 6.3).
+        적재분 전부 trigger — tables 필터로 비용 최소, 중복은 no-op.
+        TODO(연결): conf 날짜/시간 형식을 기존 Compaction DAG UI params와 일치시킬 것."""
+        metas = collect_metas(ti)
+        daily = [m for m in metas if m["group"] == "daily"]
+        hourly = [m for m in metas if m["group"] == "hourly"]
 
-            @task.short_circuit(
-                task_id="get_table_jobs",
-                trigger_rule=TriggerRule.ALL_DONE,      # 앞 테이블 실패에도 실행
-                ignore_downstream_trigger_rules=False,  # skip을 그룹 내로 한정 (설계 5.2 — 필수)
-            )
-            def get_table_jobs(cfg: dict, run_id=None, ti=None):
-                if not cfg:
-                    raise ValueError("prepare_run 결과 없음 — 선행 task 실패")
-                if tbl not in cfg["tables"]:
-                    return False  # 수동 실행에서 미선택 → skip
+        # daily: 적재된 날짜별로 테이블을 묶어 target_dt+tables 전달
+        by_date: dict[str, list[str]] = {}
+        for m in daily:
+            for date in dates_between(m["ts_min"], m["ts_max"]):
+                by_date.setdefault(date, []).append(m["table"])
+        targets = [
+            {"trigger_dag_id": DAILY_COMPACTION_DAG_ID,
+             "conf": {"target_dt": date, "tables": tables}}
+            for date, tables in by_date.items()
+        ]
 
-                jobs = oracle_fetch(
-                    """
-                    SELECT * FROM (
-                        SELECT job_id, status, stat_desc, ts, avro_path, file_size_mb
-                          FROM JOB_HISTORY
-                         WHERE table_name = :tbl
-                           AND ts >= :ts_from AND ts < :ts_to
-                           AND ( status = 'FAILED'
-                                 OR (status = 'WAIT' AND ts < :wait_bound) )
-                         ORDER BY ts ASC
-                    ) WHERE ROWNUM <= :row_limit
-                    """,
-                    tbl=tbl, ts_from=cfg["ts_from"], ts_to=cfg["ts_to"],
-                    wait_bound=cfg["wait_bound"], row_limit=ROW_LIMIT,
-                )
-                # 잔여분 판정은 필터 적용 전 조회 건수 기준 (설계 5.3)
-                fetched_full = len(jobs) >= ROW_LIMIT
+        # hourly: 적재 ts 범위(min~max)를 모아 start/end+tables 전달
+        if hourly:
+            targets.append({
+                "trigger_dag_id": HOURLY_COMPACTION_DAG_ID,
+                "conf": {
+                    "start_time": min(m["ts_min"] for m in hourly),
+                    "end_time": max(m["ts_max"] for m in hourly),
+                    "tables": [m["table"] for m in hourly],
+                },
+            })
+        return targets  # 빈 목록이면 mapped operator는 skip
 
-                # 영수증 확인: 거짓 실패(커밋됐는데 FAILED) 건은 DONE 정정 후 제외 (설계 4)
-                failed_batch_ids = {
-                    j["stat_desc"] for j in jobs
-                    if j["status"] == "FAILED" and j["stat_desc"]
-                }
-                committed = {b for b in failed_batch_ids if snapshot_exists(tbl, b)}
-                if committed:
-                    done_ids = [j["job_id"] for j in jobs if j["stat_desc"] in committed]
-                    mark_status_by_job_ids(done_ids, "DONE")
-                    jobs = [j for j in jobs if j["stat_desc"] not in committed]
-
-                # 크기 상한: 초과분은 이월. 잘린 것도 잔여분 (설계 5.4)
-                picked, total_mb = [], 0
-                for j in jobs:
-                    if total_mb + j["file_size_mb"] > SIZE_LIMIT_MB:
-                        break
-                    picked.append(j)
-                    total_mb += j["file_size_mb"]
-                leftover = fetched_full or len(picked) < len(jobs)
-                if not picked:
-                    return False
-
-                # 원자적 IN_PROGRESS 전환 + batch_id 기록 (설계 5.3)
-                batch_id = f"{run_id}_{tbl}"
-                oracle_execute(
-                    """
-                    UPDATE JOB_HISTORY
-                       SET status = 'IN_PROGRESS', stat_desc = :batch_id
-                     WHERE job_id IN :ids AND status IN ('WAIT', 'FAILED')
-                    """,
-                    batch_id=batch_id, ids=[j["job_id"] for j in picked],
-                )
-
-                # 마킹 직후 XCom 먼저 기록 — 이후 단계 실패 시에도 update_failure가
-                # job_ids로 회수 가능 (설계 5.3)
-                ti.xcom_push(
-                    key="meta",
-                    value={
-                        "table": tbl,                  # XCom은 JSON 직렬화 — 문자열 값 저장
-                        "group": table_group(table),
-                        "batch_id": batch_id,
-                        "job_ids": [j["job_id"] for j in picked],  # 상태 update용 (stat_desc 조건 금지)
-                        "leftover": leftover,                      # loop 판단용
-                        "ts_min": picked[0]["ts"],                 # Compaction 범위
-                        "ts_max": picked[-1]["ts"],
-                        # append DAG과 동일 산정식: ceil(총크기/128MB × 1.5 / executor-cores 4)
-                        "num_executors": min(
-                            max(math.ceil(total_mb / 128 * 1.5 / 4), 1), MAX_EXECUTORS
-                        ),
-                    },
-                )
-                upload_path_list_to_s3(tbl, picked, batch_id)
-                return True
-
-            # TODO(연결): 기존 append DAG의 SparkKubernetesOperator 템플릿 재사용.
-            #       Spark 코드에는 .option("snapshot-property.batch_id", batch_id) 적용 (설계 4.2)
-            #       권장: Spark job 시작 시 자기 batch_id의 snapshot 존재 확인 → 있으면 즉시 성공 종료
-            #       (task retry가 거짓 실패를 같은 batch_id로 재실행할 때의 중복 적재 방어, 설계 4.2)
-            append_data = SparkKubernetesOperator(  # noqa: F821  TODO(연결): import/템플릿 연결
-                task_id="append_data",
-                retries=2,                          # 일시적 오류 1차 방어 (설계 3.3)
-                retry_delay=pendulum.duration(minutes=5),
-                # application_file=..., num_executors는 XCom meta 참조
-            )
-
-            @task(task_id="update_success", trigger_rule=TriggerRule.ALL_SUCCESS)
-            def update_success(ti=None):
-                meta = ti.xcom_pull(task_ids=f"reprocess_{tbl}.get_table_jobs", key="meta")
-                mark_status_by_job_ids(meta["job_ids"], "DONE")
-                # Spark 성공 테이블의 meta를 후속 집계(Compaction/loop)용으로 반환.
-                # 이 task 자체가 Spark 성공 시에만 실행되므로, 집계 task는 task 상태를
-                # DB 조회할 필요 없이 이 반환값의 존재 여부만 보면 된다 (Airflow 3
-                # worker에서는 메타데이터 DB 접근 불가 — dag_run.get_task_instance 사용 금지)
-                return meta
-
-            @task(task_id="update_failure", trigger_rule=TriggerRule.ALL_FAILED)
-            def update_failure(ti=None):
-                meta = ti.xcom_pull(task_ids=f"reprocess_{tbl}.get_table_jobs", key="meta")
-                if meta:  # XCom 기록 전에 실패했으면 좀비 → check_zombie_jobs가 탐지 (설계 8.2)
-                    mark_status_by_job_ids(meta["job_ids"], "FAILED")
-
-            get_table_jobs(run_cfg) >> append_data >> [update_success(), update_failure()]
-        return group
-
-    def _collect_metas(ti) -> list[dict]:
-        """Spark가 성공한 테이블의 meta만 수집.
-
-        update_success는 해당 테이블 Spark가 성공했을 때만 실행되는 task이므로,
-        그 반환값(XCom)의 존재 = Spark 성공. task 상태 DB 조회가 필요 없다.
-        """
-        metas = []
-        for t in ALL_TABLES:
-            meta = ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.update_success")
-            if meta:
-                metas.append(meta)
-        return metas
-
-    @task(trigger_rule=TriggerRule.ALL_DONE)
-    def trigger_compaction(ti=None):
-        """적재 결과 집계 → 기존 Compaction DAG trigger (설계 6.3).
-
-        조건 없이 적재분 전부 trigger — tables 필터로 비용 최소, 중복은 no-op.
-        daily: 적재 날짜별로 테이블을 묶어 target_dt+tables 전달.
-        hourly: 적재 ts 범위(min~max)를 모아 start/end+tables 전달.
-        TODO(연결): 날짜/시간 형식은 기존 Compaction DAG의 UI params 형식과 일치시킬 것.
-        """
-        metas = _collect_metas(ti)
-
-        daily_targets: dict[str, list[str]] = {}   # 날짜(YYYYMMDD) → 테이블 목록
-        hourly_tables: list[str] = []
-        hourly_min, hourly_max = None, None
-        for m in metas:
-            if m["group"] == "daily":
-                # 수동 실행 범위는 여러 날짜에 걸칠 수 있음 — 구간 내 날짜 전부 포함
-                d = pendulum.from_format(m["ts_min"][:8], "YYYYMMDD", tz=KST)
-                d_end = pendulum.from_format(m["ts_max"][:8], "YYYYMMDD", tz=KST)
-                while d <= d_end:
-                    daily_targets.setdefault(d.format("YYYYMMDD"), []).append(m["table"])
-                    d = d.add(days=1)
-            else:
-                hourly_tables.append(m["table"])
-                hourly_min = min(hourly_min or m["ts_min"], m["ts_min"])
-                hourly_max = max(hourly_max or m["ts_max"], m["ts_max"])
-
-        for target_dt, tables in daily_targets.items():
-            trigger_dag_run(  # noqa: F821  TODO(연결): TriggerDagRunOperator 또는 API 호출로 구현
-                DAILY_COMPACTION_DAG_ID,
-                conf={"target_dt": target_dt, "tables": tables},
-            )
-        if hourly_tables:
-            trigger_dag_run(  # noqa: F821  TODO(연결)
-                HOURLY_COMPACTION_DAG_ID,
-                conf={"start_time": hourly_min, "end_time": hourly_max,
-                      "tables": hourly_tables},
-            )
-
-    @task.short_circuit(
-        trigger_rule=TriggerRule.ALL_DONE,
-        ignore_downstream_trigger_rules=False,
-    )
-    def check_loop(cfg: dict, ti=None):
-        """재trigger 조건: 잔여분 존재 AND 해당 테이블 Spark 성공 (설계 5.5).
-
-        실패 테이블은 제외 — 같은 밤에 깨진 데이터를 반복 재시도하지 않음 (다음날 회수).
-        """
-        if not cfg:
-            return False  # prepare_run 실패 → loop 없이 종료
-        pending = [m for m in _collect_metas(ti) if m["leftover"]]
-        if not pending:
-            return False
+    @task(trigger_rule="all_done")
+    def next_loop(cfg: dict, ti=None) -> list[dict]:
+        """재trigger 판단 (설계 5.5) → TriggerDagRunOperator kwargs 0/1건.
+        잔여분(상한 초과 이월) 있는 테이블이 하나라도 있으면 재trigger.
+        지속 실패도 leftover + MAX_LOOP 상한으로 유한하게 종료된다."""
+        if not cfg or not any(m["leftover"] for m in collect_metas(ti)):
+            return []
         if cfg["loop_count"] >= MAX_LOOP:
             send_alert(f"재처리 loop 상한({MAX_LOOP}회) 도달 — 수동 처리 필요 (설계 8.1)")
-            return False
-        return True
+            return []
+        # 첫 회차가 확정한 조회 범위·tables를 conf로 승계 (수동 선택값·경계 유지)
+        return [{"trigger_dag_id": DAG_ID,
+                 "conf": {**cfg, "loop_count": cfg["loop_count"] + 1}}]
 
-    @task
-    def retrigger_self(cfg: dict):
-        """자기 자신 재trigger (설계 5.5) — 첫 회차가 확정한 조회 범위·tables를
-        conf로 승계해서, 수동 선택 값 유실과 자정 넘김에 의한 경계 변동을 막는다."""
-        trigger_dag_run(  # noqa: F821  TODO(연결): Compaction trigger와 동일 헬퍼 사용
-            DAG_ID,
-            conf={**cfg, "loop_count": cfg["loop_count"] + 1},
-        )
-
-    # 흐름: params 정규화 → 테이블별 그룹 순차 → Compaction → loop 판단
-    # (앞 테이블 실패에도 다음 그룹은 all_done으로 계속)
-    #
-    # check_zombie_jobs는 알림만 하는 관측용 task라 본 파이프라인과 데이터·순서
-    # 의존이 없다. 독립 실행으로 분리해, 알림 실패가 재처리 본류를 중단시키지 않게 한다.
+    # 좀비 점검은 독립 실행 — 알림 실패가 재처리 본류를 막지 않음 (설계 8.2)
     check_zombie_jobs()
 
+    # 본류: params 정규화 → 테이블별 그룹 순차 → 집계(Compaction/loop) → trigger
     run_cfg = prepare_run()
-    prev = run_cfg
-    for _table in ALL_TABLES:
-        g = build_table_group(_table, run_cfg)
-        prev >> g
-        prev = g
+    groups = [ReprocessTaskGroup(t, run_cfg, group_id=f"reprocess_{t.get_name()}")
+              for t in ALL_TABLES]
+    chain(run_cfg, *groups)
+    tail = groups[-1] if groups else run_cfg  # 자리표시자(빈 Enum) 상태에서도 파싱 가능
 
-    prev >> trigger_compaction() >> check_loop(run_cfg) >> retrigger_self(run_cfg)
+    comp, nxt = compaction_targets(), next_loop(run_cfg)
+    tail >> comp
+    tail >> nxt
+    # trigger 대상 개수가 가변(Compaction 여러 건, loop 0/1건)이라 dynamic task mapping 사용.
+    # TriggerDagRunOperator는 wait_for_completion 기본 False (설계 6.3 — 대기 없음)
+    TriggerDagRunOperator.partial(task_id="trigger_compaction").expand_kwargs(comp)
+    TriggerDagRunOperator.partial(task_id="retrigger_self").expand_kwargs(nxt)
 
 
 dag()
