@@ -90,7 +90,15 @@ def param_to_ts(value: str) -> str:
 
 
 def dates_between(ts_min: str, ts_max: str) -> list[str]:
-    """ts_min~ts_max가 걸친 날짜(YYYYMMDD) 목록 (수동 범위가 여러 날에 걸칠 때 대비)."""
+    """ts_min~ts_max 구간이 걸치는 모든 날짜(YYYYMMDD) 목록.
+
+    daily Compaction은 날짜 단위로 trigger하므로 적재 범위가 걸친 날짜를 빠짐없이
+    뽑아야 한다. 양 끝 날짜만 쓰면 3일 이상 범위에서 중간 날짜가 누락된다.
+
+    예) ts_min='20260710213000000', ts_max='20260712081500000'
+        → ts 앞 8자리(날짜)만 취해 10일부터 12일까지 하루씩 전진
+        → ['20260710', '20260711', '20260712']
+    """
     day = pendulum.from_format(ts_min[:8], "YYYYMMDD", tz=KST)
     last = pendulum.from_format(ts_max[:8], "YYYYMMDD", tz=KST)
     days = []
@@ -131,7 +139,15 @@ def _rows(sql: str, binds: dict, columns: tuple[str, ...]) -> list[dict]:
 
 
 def _in_binds(values: list) -> tuple[str, dict]:
-    """Oracle IN은 list를 바로 못 바인딩 → placeholder 동적 확장."""
+    """Oracle IN절용 placeholder 동적 확장.
+
+    Oracle은 IN (:ids)에 파이썬 list를 통째로 바인딩할 수 없어서,
+    값 개수만큼 개별 placeholder를 만들어 바인딩한다.
+
+    예) values=['J1', 'J2', 'J3']
+        → (":id0, :id1, :id2", {"id0": "J1", "id1": "J2", "id2": "J3"})
+        사용: f"... WHERE job_id IN ({clause})" + parameters=binds
+    """
     binds = {f"id{i}": v for i, v in enumerate(values)}
     return ", ".join(f":{k}" for k in binds), binds
 
@@ -200,9 +216,18 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
          "wait_bound": cfg["wait_bound"], "row_limit": ROW_LIMIT},
         JOB_COLUMNS,
     )
-    fetched_full = len(jobs) >= ROW_LIMIT  # 잔여분 판정은 필터 전 건수 (설계 5.3)
+    # 조회가 ROW_LIMIT을 꽉 채웠다 = DB에 더 남아 있다는 신호.
+    # 아래 영수증/크기 필터로 jobs가 줄어든 "후"의 건수로 판단하면 이 신호를
+    # 놓치므로, 반드시 필터 적용 "전"에 기록해 둔다 (설계 5.3)
+    fetched_full = len(jobs) >= ROW_LIMIT
 
-    # 영수증 확인: 거짓 실패(커밋됐는데 FAILED)는 DONE 정정 후 제외 (설계 4)
+    # ── 영수증 확인 (설계 4): "거짓 실패" 걸러내기 ──────────────────────────
+    # Airflow가 실패로 판정했어도 Iceberg 커밋은 성공했을 수 있다 (커밋 직후
+    # Pod 통신 오류 등). 그대로 재적재하면 중복이 되므로:
+    #   1) FAILED row들이 달고 있는 batch_id(stat_desc)를 set으로 수집
+    #      — 같은 batch의 row가 수백 건이어도 snapshot 조회는 batch당 1회
+    #   2) batch_id별로 해당 테이블 snapshot에 영수증이 있는지 확인
+    #   3) 있으면 = 이미 적재 완료 → row들을 DONE으로 정정하고 이번 대상에서 제외
     failed_batches = {j["stat_desc"] for j in jobs
                       if j["status"] == "FAILED" and j["stat_desc"]}
     committed = {b for b in failed_batches if snapshot_exists(table_name, b)}
@@ -210,7 +235,10 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         _mark_done([j["job_id"] for j in jobs if j["stat_desc"] in committed])
         jobs = [j for j in jobs if j["stat_desc"] not in committed]
 
-    # 크기 상한: 초과분은 이월 (loop 회차 또는 다음날 회수, 설계 5.4)
+    # ── 크기 상한 적용 (설계 5.4) ───────────────────────────────────────────
+    # jobs는 ts ASC 정렬 상태이므로, 앞(가장 오래된 것)부터 누적 크기가
+    # 16GB를 넘기 직전까지만 picked에 담고 멈춘다.
+    # 잘린 뒤쪽은 상태를 건드리지 않고 이월 → loop 회차 또는 다음날 회수
     picked, total_mb = [], 0
     for j in jobs:
         if total_mb + j["file_size_mb"] > SIZE_LIMIT_MB:
@@ -219,6 +247,12 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
         total_mb += j["file_size_mb"]
     if not picked:
         return False
+
+    # 잔여분(leftover) 판정 — 둘 중 하나라도 참이면 "아직 남았다":
+    #   fetched_full           : 조회가 1,000건을 꽉 채움 → DB에 더 있음
+    #   len(picked) < len(jobs): 크기 상한으로 뒤쪽이 잘림 → 이번에 못 담은 게 있음
+    # (영수증으로 제외된 건은 '처리 완료 정정'이라 잔여분이 아님 —
+    #  이미 jobs에서 빠진 뒤라 이 비교에 영향을 주지 않는다)
     leftover = fetched_full or len(picked) < len(jobs)
 
     batch_id = f"{run_id}_{table_name}"
@@ -369,11 +403,14 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
                 "loop_count": int(conf.get("loop_count", 0)),
             }
 
-        base = pendulum.now(KST).start_of("day")
+        base = pendulum.now(KST).start_of("day")  # 오늘 00:00 (14일 01:00 실행이면 14일 00:00)
         st, et = params.get("start_time"), params.get("end_time")
 
         if st and et:
-            # 수동: 조회 범위 직접 정의. end ≤ 전날 00:00 (append 겹침 방지, 설계 5.1)
+            # 수동: start/end가 조회 범위를 직접 정의 (설계 5.1).
+            # append DAG은 "실행 시각-24시간 이후"를 계속 조회하므로, 전날 00:00
+            # 이후를 허용하면 두 DAG이 같은 WAIT를 집을 수 있다
+            # → end_time ≤ 전날 00:00 검증으로 원천 차단
             ts_from, ts_to = param_to_ts(st), param_to_ts(et)
             if not ts_from < ts_to <= ts_str(base.subtract(days=1)):
                 raise ValueError("start < end 이고 end_time ≤ 전날 00:00 이어야 한다")
@@ -381,7 +418,14 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         elif st or et:
             raise ValueError("start_time과 end_time은 함께 지정해야 한다")
         else:
-            # 정기: 그저께 00:00 ~ 전날 끝, WAIT는 전날 01:00 이전만 (설계 2.1)
+            # 정기 실행 경계 (설계 2.1). base=14일 00:00 기준 예시:
+            #   ts_from    = 12일 00:00 — 그저께 시작. 재처리가 하룻밤 실패해도
+            #                             다음날 이 안전망 범위로 자동 회수된다
+            #   ts_to      = 14일 00:00 — 전날 끝
+            #   wait_bound = 13일 01:00 — WAIT 상한. 이 시각 이후의 WAIT는 아직
+            #                             append 조회 범위(실행시각-24h) 안이라
+            #                             건드리면 경합 → 재처리 대상에서 제외.
+            #                             FAILED는 append가 안 보므로 상한 없음
             ts_from = ts_str(base.subtract(days=2))
             ts_to = ts_str(base)
             wait_bound = ts_str(base.subtract(days=1).add(hours=1))
@@ -403,7 +447,14 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         daily = [m for m in metas if m["group"] == "daily"]
         hourly = [m for m in metas if m["group"] == "hourly"]
 
-        # daily: 적재된 날짜별로 테이블을 묶어 target_dt+tables 전달
+        # ── daily 그룹: "테이블 → 적재 범위"를 "날짜 → 테이블 목록"으로 뒤집기 ──
+        # meta는 테이블 단위(테이블당 적재 ts 범위)인데, daily Compaction DAG은
+        # 날짜 단위(target_dt)로 실행되므로 집계 축을 바꿔야 한다.
+        #   바깥 for: 테이블별 meta 순회
+        #   안쪽 for: 그 테이블의 적재 범위가 걸친 날짜들 순회 (dates_between)
+        # 예) TABLE_A가 12~13일, TABLE_B가 13일만 적재했다면
+        #     by_date = {'20260712': [A], '20260713': [A, B]}
+        #     → trigger 2건: (12일, [A]), (13일, [A, B])
         by_date: dict[str, list[str]] = {}
         for m in daily:
             for date in dates_between(m["ts_min"], m["ts_max"]):
@@ -414,7 +465,11 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
             for date, tables in by_date.items()
         ]
 
-        # hourly: 적재 ts 범위(min~max)를 모아 start/end+tables 전달
+        # ── hourly 그룹: 시간 범위 합집합으로 1회 trigger ────────────────────
+        # 테이블별 범위를 전체 min~전체 max 하나로 합쳐 tables와 함께 넘긴다.
+        # 테이블 간 범위 차이로 사이에 빈 시간대가 포함될 수 있지만, Compaction은
+        # 합칠 파일이 없는 구간에서 no-op이라 무해 — trigger 횟수를 1회로 줄이는
+        # 쪽이 이득 (Compaction DAG은 max_active_runs=1이라 run이 곧 대기열)
         if hourly:
             targets.append({
                 "trigger_dag_id": HOURLY_COMPACTION_DAG_ID,
@@ -431,12 +486,16 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         """재trigger 판단 (설계 5.5) → TriggerDagRunOperator kwargs 0/1건.
         잔여분(상한 초과 이월) 있는 테이블이 하나라도 있으면 재trigger.
         지속 실패도 leftover + MAX_LOOP 상한으로 유한하게 종료된다."""
+        # 종료 ①: prepare_run 실패(cfg 없음) 또는 잔여분 있는 테이블이 하나도 없음
         if not cfg or not any(m["leftover"] for m in collect_metas(ti)):
             return []
+        # 종료 ②: 회차 상한 도달 — 이 정도 물량은 자동으로 다 못 푼다는 신호 → 알림 후 수동
         if cfg["loop_count"] >= MAX_LOOP:
             send_alert(f"재처리 loop 상한({MAX_LOOP}회) 도달 — 수동 처리 필요 (설계 8.1)")
             return []
-        # 첫 회차가 확정한 조회 범위·tables를 conf로 승계 (수동 선택값·경계 유지)
+        # 재trigger: 첫 회차가 확정한 조회 범위·tables를 conf 그대로 승계.
+        # 다음 회차의 prepare_run은 conf에 ts_from이 있으면 재계산하지 않으므로,
+        # 수동 선택값이 유실되지 않고 회차가 자정을 넘겨도 경계가 흔들리지 않는다
         return [{"trigger_dag_id": DAG_ID,
                  "conf": {**cfg, "loop_count": cfg["loop_count"] + 1}}]
 
@@ -447,6 +506,10 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     run_cfg = prepare_run()
     groups = [ReprocessTaskGroup(t, run_cfg, group_id=f"reprocess_{t.get_name()}")
               for t in ALL_TABLES]
+    # chain(run_cfg, g1, g2, ..., gN) = prepare_run → 그룹1 → 그룹2 → ... 순차 연결.
+    # Spark job이 동시에 여러 개 뜨지 않도록 순차 (K8S 리소스, 설계 5.2).
+    # 각 그룹 첫 task(get_jobs)가 trigger_rule="all_done"이라 앞 테이블이
+    # 실패/skip해도 다음 테이블은 계속 진행된다
     chain(run_cfg, *groups)
     tail = groups[-1] if groups else run_cfg  # 자리표시자(빈 Enum) 상태에서도 파싱 가능
 
