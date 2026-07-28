@@ -32,7 +32,7 @@
 | 구성 요소 | 내용 |
 |----------|------|
 | Iceberg 테이블 | **20개 이상**. 첫 파티션 기준 hourly 그룹(`hour` hidden partition)과 daily 그룹(`day` hidden partition)으로 분류 |
-| Job History (Oracle) | 처리 대상 상태 관리 테이블. **Oracle DB 2개(a/b)에 동일 스키마로 존재** — append DAG은 conn_list(conn_id 2개) loop로 같은 쿼리를 DB별로 실행. **키는 복합키 4개**(예: `k_1`, `k_2`, `k_3`, `ts`) — `ts`(string, `YYYYMMDDHHmmSSsss` 밀리세컨즈)도 그중 하나이며 날짜 파티셔닝 키이자 조회 기준이다. 그 외 컬럼: `table_name`(대상 테이블), `base_path`, `param`(JSON — 파일명·파일 크기), `status`, `stat_desc`(CLOB, 현재 미사용). 복합키 값은 DB 간 유일 보장 없음 |
+| Job History (Oracle) | 처리 대상 상태 관리 테이블. **Oracle DB 2개(a/b)에 동일 스키마로 존재** — append DAG은 conn_list(conn_id 2개) loop로 같은 쿼리를 DB별로 실행. **키는 복합키 4개**(예: `k_1`, `k_2`, `k_3`, `ts`) — `ts`(string, `YYYYMMDDHHmmSSsss` 밀리세컨즈)도 그중 하나이며 날짜 파티셔닝 키이자 조회 기준이다. 그 외 컬럼: `table_name`(대상 테이블), `base_path`, `param`(JSON — `{"files": [{"file_path", "size"}, ...]}`, row당 파일 여러 개 가능), `status`, `stat_desc`(CLOB, 현재 미사용). 복합키 값은 DB 간 유일 보장 없음 |
 | append DAG | py 파일 1개에서 loop로 **테이블별 DAG 동적 생성** (테이블당 1개 실행). 약 5분 주기. `get_jobs`가 conn_list의 **DB별로** `table_name` 조건 + `ts` 최근 1일 범위 + `status='WAIT'`을 `ORDER BY ts ASC`, `ROWNUM <= 200`으로 조회 |
 | Compaction DAG | **hourly DAG 1개**(`15 * * * *`, 직전 1시간치) + **daily DAG 1개**(현재 `35 0 * * *`, 전일치). 각 DAG 내부에서 소속 테이블 task가 순차 실행. `max_active_runs=1`. UI 수동 실행용 params: daily는 `target_dt`, hourly는 `start_time`/`end_time` |
 | DB 상태 처리 | callback이 아닌 `update_success`(`trigger_rule=all_success`) / `update_failure`(`all_failed`) task 방식 — callback은 DB update 지연 시 작업이 kill되는 문제가 있었음 |
@@ -91,7 +91,7 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 
 > **경계값은 실행 시각이 아니라 그 날의 01:00 고정값으로 계산한다.** 재실행이나 loop 회차가 늦게 돌아도 경계가 append 조회 하한보다 항상 과거이므로 안전이 유지된다.
 >
-> **그저께까지 조회하는 이유(안전망)**: 재처리가 하룻밤 통째로 실패하거나 상한으로 이월이 생겨도, 다음날 실행이 그저께 범위로 자동 회수한다. 이틀 연속 실패부터 수동 영역이다.
+> **그저께까지 조회하는 이유(안전망)**: 재처리가 하룻밤 통째로 실패하거나 조회 상한으로 이월이 생겨도, 다음날 실행이 그저께 범위로 자동 회수한다. 이틀 연속 실패부터 수동 영역이다.
 >
 > 겹침이 없다는 것이 이 설계의 유일한 경합 방지 수단이다. 상태 UPDATE에 이전 상태를 조건으로 거는 낙관적 잠금은 두지 않는다 (섹션 5.3-6).
 
@@ -287,7 +287,7 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 선행 task `prepare_run`이 params 검증과 `ts` 경계 계산을 1회 수행해 XCom으로 내려보내며(수동 범위 검증, date-time → ts 문자열 변환 포함), 재처리 조회 로직은 정규화된 값만 사용한다.
 
 1. **실행 대상 확인** — 정규화된 `tables` 목록에 자기 테이블이 없으면 즉시 skip
-2. **대상 조회** — **Oracle DB 2개에 동일 쿼리를 반복**(append의 conn_list loop 패턴)하고 결과를 `{conn_id: rows}` dict로 보관한다 (상태 UPDATE가 이 키로 원천 DB를 찾아가므로 row에 출처를 태깅할 필요가 없다). 크기 상한을 적용할 때만 `(row, conn_id)` 쌍으로 펼쳐 전체 `ts` 오름차순 정렬한다. `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한(**DB당** 적용):
+2. **대상 조회** — **Oracle DB 2개에 동일 쿼리를 반복**(append의 conn_list loop 패턴)하고 결과를 `{conn_id: rows}` dict로 보관한다 (상태 UPDATE가 이 키로 원천 DB를 찾아가므로 row에 출처를 태깅할 필요가 없다). 이후 `(ts, row, conn_id)`로 펼쳐 전체 `ts` 오름차순 정렬한다 (append와 같이 오래된 것부터 처리). `ts` 범위 조건(파티션 키 → Partition Pruning 유지) + row 수 상한(**DB당** 적용):
 
 ```sql
 -- conn_list의 DB 2개에 각각 실행 (결과는 {conn_id: rows}로 보관)
@@ -307,11 +307,31 @@ SELECT * FROM (
 ) WHERE ROWNUM <= :row_limit        -- 1,000 (ts는 meta의 적재 범위 기록용으로 함께 조회)
 ```
    - 수동 실행 시: prepare_run이 검증한 `start_time`~`end_time` 범위의 WAIT+FAILED 전체
-   - 조회 직후 **필터 적용 전 조회 건수로 잔여분 여부를 기록** (**어느 한 DB라도** 상한 1,000건을 채웠으면 그 DB에 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 영수증/크기 상한으로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
+   - 조회 직후 **영수증 필터를 적용하기 전 건수로 잔여분 여부를 기록** (**어느 한 DB라도** 상한 1,000건을 채웠으면 그 DB에 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 필터로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
 3. **영수증 확인** — 조회 row에서 읽은 stat_desc(batch_id)를 모아 `.snapshots`와 한 번에 대조 → 커밋이 확인된 batch의 row는 DONE 정정(원천 DB별) 후 대상에서 제외 (섹션 4). **status로 거르지 않는다** — WAIT라도 커밋 후 상태 갱신만 실패한 것일 수 있고, 그 경우 재적재하면 중복이다
-4. **크기 상한 적용** — 병합된 전체 목록에서 앞(가장 오래된 것)부터 누적 16GB를 넘기 직전까지만 담는다. 잘린 뒤쪽은 상태를 건드리지 않고 이월 (loop 회차 또는 다음날 회수)
-   - **담긴 게 0건인데 조회 결과나 잔여분 신호가 있으면 알림** — ① 선두 job 하나가 16GB 초과(매일 반복 skip될 데이터) ② 조회분이 전부 영수증 정정으로 소진(DB에 더 남았는데 meta가 없어 loop 신호 유실). 정상적인 빈 조회는 무음 skip
-5. **XCom(meta) 기록** — 복합키 목록(conn별 dict)·batch_id·잔여분 여부·적재 ts 범위를 **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, meta가 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. meta가 먼저 있으면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task의 `WHERE status='IN_PROGRESS'` 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
+4. **파일 목록 수집** — 조회한 row 전부의 `param.files`를 순서대로 모은다. 별도 크기 상한은 두지 않는다 — 한 회차 물량은 `ROW_LIMIT`으로만 통제한다
+
+> **크기 기준 상한을 두지 않는 이유**: 처리량 통제 수단이 둘이면 둘 사이가 어긋난다. `ROW_LIMIT`이 만드는 최대 물량은 약 22GB로 추정되는데(아래 환산), 여기에 16GB 같은 크기 상한을 겹치면 크기 쪽이 항상 먼저 걸려 `ROW_LIMIT` 값이 무의미해진다. 상한을 하나로 두고 그 값을 실측으로 조정하는 편이 낫다.
+>
+> | 근거 | 값 |
+> |------|-----|
+> | 벤치마크 (CLAUDE.md) | 10분치 ≈ 8GB |
+> | 유입량 | 5분치 ≈ 200 rows → 10분치 ≈ 400 rows |
+> | ⇒ row 1건 | ≈ 20MB |
+> | DB별 물량 | DB2는 DB1의 1/10 미만 → 최대 ≈ 1,100 rows |
+> | ⇒ 한 회차 최대 | ≈ **22GB** ≈ Spark 2분 (처리량 8GB/44초 선형 외삽) |
+>
+> 백로그가 크게 쌓인 날에만 이 규모에 도달하며, 그때의 Spark job 크기를 실측해 `ROW_LIMIT`을 조정한다 (섹션 9-8).
+5. **XCom 기록 (2건)** — **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, XCom이 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. 순서가 반대면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
+
+| key | 내용 | 소비자 |
+|-----|------|--------|
+| `meta` | `batch_id`, `keys`(conn별 복합키 목록) | **부모** update_success / update_failure — 형식은 append get_jobs와 맞춘다 |
+| `reprocess` | `ts_min`, `ts_max`, `has_more` | **재처리 DAG** compaction_targets / next_loop |
+
+   - `ts_min`/`ts_max`는 **이번에 적재한 데이터의 시간 범위**다. 이 범위만 Compaction하도록 기존 Compaction DAG에 넘긴다 (섹션 6.3)
+   - `has_more`는 **상한에 걸려 못 담은 대상이 남았는지** 여부다. 남았으면 DAG을 한 번 더 trigger한다 (5.5)
+   - 테이블명·Compaction 그룹은 XCom에 넣지 않는다 — 수집 측이 Enum을 순회하므로 그 자리에서 붙이면 된다
 6. **IN_PROGRESS 마킹** — 원천 DB별로 상태 UPDATE를 **executemany**로 일괄 실행 + `stat_desc = 새 batch_id` 기록. IN 절에 placeholder를 건수만큼 펼치지 않는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고, IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며(ROW_LIMIT 상향 시에도 안전), 라운드트립이 1회다
 
 ```sql
@@ -322,15 +342,16 @@ UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id
 ```
    - **WHERE에 status 조건을 두지 않는다**: 복합키가 row를 유일하게 식별하므로 대상 특정에 불필요하다. 이전 상태를 조건으로 거는 낙관적 잠금도 의미가 없다 — 조회~UPDATE 사이에 상태를 바꿀 주체가 없고(append는 조회 경계가 겹치지 않고, 재처리는 `max_active_runs=1`, 같은 run 내 테이블은 `table_name`으로 분리), 반영 건수를 검증하지도 않으므로 조건이 걸리면 조용히 누락될 뿐이다
    - DONE 정정(3번)은 `batch_id`를 넘기지 않아 row의 기존 `stat_desc`(영수증)를 그대로 유지한다
-7. **Spark 입력 준비** — `base_path` + `param`의 파일명을 결합한 경로 문자열 배열을 텍스트 파일로 만들어 S3 업로드(양쪽 DB 분을 합쳐 1개 파일). 크기 상한 판정과 num_executors 산정에 쓰는 파일 크기도 같은 `param` JSON에서 꺼낸다 (append DAG과 동일 산정식: `ceil(총크기/128MB × 1.5 / 4)`, 상한 24)
+7. **Spark 입력 준비 — 기존 함수에 위임** — 재처리 조회 로직은 담기로 한 파일 목록을 반환하는 데서 끝난다. avro 경로 텍스트 파일 S3 업로드와 size 총합 XCom push(Spark operator가 pull)는 **ConvertFileTaskGroup에 이미 있는 함수가 그대로 수행**하므로 재구현하지 않는다
+
+> **`param` 구조**: `{"files": [{"file_path": ..., "size": ...}, ...]}` — **row 1건에 파일이 여러 개**일 수 있다. 재처리가 이 목록을 가공 없이 모아 부모 함수에 넘기므로, 경로 조합 규칙·size 단위 해석이 append와 자동으로 일치한다. 재처리는 이 목록의 내용을 들여다보지 않는다 — `size`도 부모 함수가 합산한다.
 
 ### 5.4 처리 상한
 
 | 항목 | 값 | 보호 대상 | 근거 수준 |
 |------|-----|----------|----------|
 | 테이블당·**DB당** 조회 row 수 | 1,000 (ROWNUM) | Oracle SELECT 성능, XCom 크기, avro 경로 목록 파일 크기. DB 2개이므로 테이블당 최대 2,000건이 병합될 수 있음 | ⚠️ 러프 설정 — 재검증 필요 |
-| 테이블당 처리 총 크기 | 16GB | Spark 리소스, 처리 소요시간. 벤치마크 검증 범위(~8GB, 24 executors)의 2배 이내 | ⚠️ 러프 설정 — 재검증 필요 |
-| num_executors | 24 | 벤치마크에서 32 이상은 성능 저하 확인 (spark-tuning-guide.md 2.2.3) | ✅ 벤치마크 검증 |
+| num_executors | — | 재처리가 산정하지 않는다. size 총합을 XCom에 올리는 기존 함수를 그대로 쓰므로 Spark operator의 기존 산정 경로를 탄다 | — |
 
 **규모 감각**: append는 약 5분 주기에 조회 상한 200 rows(DB당). 재처리 상한 1,000 rows(DB당) ≈ 약 25분치 물량. 정상 운영의 하루 잔여분은 이보다 훨씬 적을 것으로 예상하지만, 상한값은 검증된 값이 아니므로 운영 데이터로 재조정한다.
 
@@ -342,13 +363,13 @@ UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id
 
 ```
 run N: 테이블별 최대 1,000건(DB당) 처리
-       → 잔여분(상한 초과 이월)이 있는 테이블이 하나라도 있으면 자기 자신을 trigger
+       → 조회 상한을 채운(= DB에 더 남은) 테이블이 하나라도 있으면 자기 자신을 trigger
          (첫 회차가 확정한 조회 범위·tables·loop_count를 conf로 승계)
 run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 후 즉시 skip
 종료: 잔여분 있는 테이블 없음 또는 loop_count 상한 도달 → trigger 안 함
 ```
 
-- **재trigger 조건 = 잔여분(상한 초과 이월)이 있는 테이블 존재.** 잔여분 판정은 **어느 한 DB라도 필터 전 조회 건수가 상한(1,000) 도달, 또는 크기 상한 이월 발생** 기준 (섹션 5.3). 상한을 채우지 못한 테이블(실패 포함)은 잔여분이 없으므로 loop를 유발하지 않는다
+- **재trigger 조건 = 조회 상한을 채운 테이블 존재.** **어느 한 DB라도 필터 전 조회 건수가 상한(1,000)에 도달**하면 그 DB에 더 남았다는 뜻이다 (섹션 5.3). 상한을 채우지 못한 테이블(실패 포함)은 loop를 유발하지 않는다
 - **지속 실패의 유한 종료**: 상한을 채운 테이블의 Spark가 계속 실패하면 다음 회차가 같은 row를 다시 집을 수 있으나, `loop_count` 상한 10회로 그날 밤 안에 종료되고 알림 후 수동 전환된다. 대부분의 실패는 상한 미달이라 애초에 loop를 만들지 않는다
 - 집계용 meta는 **get_jobs가 push한 XCom**에서 읽는다 (Airflow 3 worker는 task 상태 DB 조회 불가). meta 존재 = 그 테이블이 이번 회차에 처리 대상을 선점했다는 뜻
 - `max_active_runs=1`이므로 회차는 자동으로 순차 실행된다
@@ -424,7 +445,6 @@ append DAG의 조회 로직(최근 1일, WAIT만, ts ASC, DB당 ROWNUM 200, conn
 |------|------|------|
 | 자동 재처리 범위 초과 | 그저께 이전(3~7일 전) `ts` 범위에 `WAIT` 또는 `FAILED` 존재 | 원인 확인 → 재처리 DAG 수동 실행 (8.3) |
 | loop 상한 도달 | `loop_count` 10회 초과 | append DAG 장애 등 대량 밀림 상황 → 원인 확인 후 수동 판단 |
-| 처리 대상 구성 불가 | 조회 결과는 있는데 담긴 게 0건 — 선두 job이 크기 상한 초과, 또는 조회분 전부가 영수증 정정으로 소진 (섹션 5.3) | 해당 테이블·범위 확인 → 크기 초과 건은 수동 분할 처리, 영수증 소진 건은 다음 회차/수동 실행으로 잔여분 회수 |
 
 > 잔류 알림 쿼리도 하루 단위 `ts` 범위 조회를 날짜별로 반복한다 (Partition Pruning 유지). 잔류가 매일 꾸준히 증가하면 스케줄링 문제가 아니라 **처리량 부족(capacity)** 신호 — append 조회 상한(DB당 200/5분)이 유입량과 같은 수준이므로 리소스 증설/주기/상한 조정을 검토한다.
 
@@ -460,7 +480,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | 6 | 시간대 | 모든 DAG `Asia/Seoul` timezone 명시. `ts` 경계 계산 KST 기준 |
 | 7 | stat_desc 컬럼 | batch_id 용도 전환 공유. **WHERE 조건 사용 금지** (CLOB — 값 기록/읽기만) |
 | 7-1 | Oracle conn 목록 | append DAG의 conn_list와 동일 소스 사용. 조회·상태 UPDATE·좀비 탐지 모두 DB 2개 대상 |
-| 8 | 처리 상한 재검증 | 테이블당·DB당 row 1,000 / 테이블당 16GB / loop 10회는 러프 설정 — 운영 데이터로 재조정 |
+| 8 | 처리 상한 재검증 | 테이블당·DB당 row 1,000 / loop 10회는 러프 설정 — 운영 데이터로 재조정. 한 회차 최대 물량은 ≈22GB(Spark 약 2분)로 **추정**일 뿐이므로, 백로그가 크게 쌓인 날의 실제 크기·소요시간을 측정해 판단한다 (섹션 5.4) |
 
 ---
 
@@ -473,11 +493,11 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | # | 포인트 | 설계 근거 |
 |---|--------|----------|
 | 1 | ShortCircuit task는 `ignore_downstream_trigger_rules=False` 필수 — 기본값이면 첫 skip에서 뒤 테이블 그룹 전체가 skip됨 | 5.2 |
-| 2 | 조회 결과는 `{conn_id: rows}` dict로 보관 (row 태깅·재그룹핑 없음). 크기 상한 적용 시에만 `(row, conn_id)`로 펼쳐 `ts` 정렬 | 5.3 |
+| 2 | 조회 결과는 `{conn_id: rows}` dict로 보관 (row 태깅·재그룹핑 없음). 정렬 시에만 `(ts, row, conn_id)`로 펼친다 | 5.3 |
 | 2-1 | 상태 UPDATE는 XCom의 `keys`(conn별 복합키 목록)로만, **원천 DB에 각각** executemany 실행. SQL은 **1개**(status·batch_id만 바인딩이 다름), WHERE는 복합키 AND 조건만 — status 조건 없음. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 / 5.2 |
-| 3 | 잔여분 판정은 필터 적용 전 조회 건수(ROW_LIMIT 도달) + 크기 상한 이월 기준 | 5.3 |
+| 3 | 잔여분 판정은 영수증 필터 적용 **전** 조회 건수(ROW_LIMIT 도달) 기준 | 5.3 |
 | 4 | XCom(meta) 기록 → IN_PROGRESS 마킹 → S3 업로드 순서 (마킹 중간 실패 시 좀비 방지) | 5.3 |
-| 5 | loop 재trigger 조건 = 잔여분(상한 초과 이월) 있는 테이블 존재. 지속 실패는 MAX_LOOP(10회) 상한으로 유한 종료. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |
+| 5 | loop 재trigger 조건 = 조회 상한을 채운 테이블 존재. 지속 실패는 MAX_LOOP(10회) 상한으로 유한 종료. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |
 | 6 | 수동 `start_time`/`end_time`은 함께 지정 + `end_time ≤ 전날 00:00` (전날/당일 거부) — prepare_run에서 검증 | 5.1 |
 | 7 | Compaction trigger는 적재분 전부, `tables` 필터 포함. 날짜/시간 형식은 기존 Compaction DAG params 형식과 일치 확인 | 6.3 |
 

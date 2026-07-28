@@ -10,8 +10,8 @@ append DAG 조회 범위(최근 1일)에서 밀려난 WAIT/FAILED를 전날+그�
 """
 
 import json
-import math
 from enum import Enum
+from operator import itemgetter
 from pathlib import Path
 
 import pendulum
@@ -30,11 +30,10 @@ DAG_ID = Path(__file__).stem  # 조직 컨벤션: dag_id는 파일명에서 파�
 # TODO(연결): append DAG이 쓰는 conn_list와 동일 소스 사용
 ORACLE_CONN_IDS = ["oracle_a", "oracle_b"]
 
-ROW_LIMIT = 1000              # 테이블당·DB당 조회 상한 (설계 5.4 — 러프 설정, 재검증 필요)
-SIZE_LIMIT_MB = 16 * 1024     # 테이블당 크기 상한 16GB (설계 5.4 — 러프 설정, 재검증 필요)
-MAX_EXECUTORS = 24            # 벤치마크 검증 상한 (spark-tuning-guide.md 2.2.3)
-MAX_LOOP = 10                 # 자기 재trigger 상한 (설계 5.5)
-ZOMBIE_HOURS = 2              # 좀비 IN_PROGRESS 판정 임계 (설계 8.2)
+ROW_LIMIT = 1000     # 테이블당·DB당 조회 상한 — 한 회차 물량은 이것만으로 통제한다
+                     # (설계 5.4 — 러프 설정, 운영 데이터로 재검증 필요)
+MAX_LOOP = 10        # 자기 재trigger 상한 (설계 5.5)
+ZOMBIE_HOURS = 2     # 좀비 IN_PROGRESS 판정 임계 (설계 8.2)
 
 DAILY_COMPACTION_DAG_ID = "daily_compaction_dag"    # TODO(연결): 실제 DAG id
 HOURLY_COMPACTION_DAG_ID = "hourly_compaction_dag"  # TODO(연결): 실제 DAG id
@@ -103,6 +102,8 @@ KEY_COLUMNS = ("k_1", "k_2", "k_3", "ts")
 # stat_desc(CLOB)를 그냥 조회하면 LOB 객체로 와 문자열 비교·set 연산이 안 되므로
 # VARCHAR2로 변환해 받는다 (batch_id는 짧아 4000바이트로 충분).
 # 컬럼명이 곧 row의 키가 되므로 변환 컬럼에는 `AS stat_desc` 별칭이 반드시 필요하다.
+# TODO(연결): base_path는 이 모듈에서 쓰지 않는다(경로는 param의 file_path).
+#             부모 파일 목록 함수가 필요로 하면 넘기고, 아니면 SELECT에서 뺄 것.
 SELECT_TARGETS_SQL = """
 SELECT * FROM (
     SELECT k_1, k_2, k_3, ts, base_path, param, status,
@@ -166,15 +167,14 @@ def update_jobs(conn_id: str, rows: list[dict], status: str,
         conn.commit()
 
 
-def parse_param(param) -> tuple[str, float]:
-    """param(VARCHAR2, JSON 문자열) → (파일명, 파일 크기 MB).
+def param_files(param: str) -> list[dict]:
+    """param(VARCHAR2 JSON) → 파일 목록. row 1건에 파일이 여러 개일 수 있다.
 
-    TODO(연결): 실제 JSON 키 이름과 크기 단위를 append DAG의 파싱 로직과 맞출 것
-                (아래는 {"file_name": ..., "file_size": <bytes>} 가정).
-                base_path와의 결합 규칙(구분자·prefix)도 append와 동일해야 한다.
+    형태: {"files": [{"file_path": ..., "size": ...}, ...]}
+    목록을 그대로 부모의 파일 목록 함수에 넘기므로 여기서 가공하지 않는다.
+    TODO(연결): 키 이름을 부모 파싱 함수가 기대하는 형태와 대조할 것.
     """
-    data = json.loads(param)
-    return data["file_name"], float(data["file_size"]) / 1024 / 1024
+    return json.loads(param)["files"]
 
 
 # --- 기존 구현 연결 스텁 ------------------------------------------------------
@@ -192,12 +192,6 @@ def committed_batch_ids(table_name: str, batch_ids: set[str]) -> set[str]:
     raise NotImplementedError
 
 
-def upload_path_list_to_s3(table_name: str, paths: list[str], batch_id: str) -> None:
-    """경로 문자열 배열을 텍스트 파일로 만들어 S3에 업로드 (Spark 입력 목록).
-    TODO(연결): 기존 get_jobs의 업로드 로직 재사용 (파일 경로 규칙 포함)."""
-    raise NotImplementedError
-
-
 def send_alert(message: str, detail=None) -> None:
     """TODO(연결): 기존 알림 채널 재사용."""
     raise NotImplementedError
@@ -205,18 +199,22 @@ def send_alert(message: str, detail=None) -> None:
 
 # --- 재처리 조회 로직 (부모 __init__의 재처리 분기가 task로 감싼다) ----------
 
-def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
-    """append get_jobs의 재처리 버전 — 조회 범위·상한·영수증 확인만 다르다.
+def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> list[dict]:
+    """재처리 대상 선정 — append get_jobs와 조회 범위·영수증 확인·크기 상한만 다르다.
 
-    반환 False = 처리 대상 없음 (short_circuit → 그룹 내 하류 skip).
-    meta(key="meta")는 하류 Spark·update task와 집계 task가 소비한다.
+    여기서 하는 일은 조회 → 영수증 확인 → 크기 상한 적용 → IN_PROGRESS 마킹까지고,
+    **적재할 파일 목록을 반환한다**. 반환값을 부모의 기존 파일 목록 함수
+    (avro 경로 텍스트 파일 S3 업로드 + size 총합 XCom push)에 그대로 넘기면 된다 —
+    그 처리는 이미 있으므로 여기서 다시 구현하지 않는다.
+
+    빈 목록 = 처리 대상 없음 (부모가 short_circuit으로 그룹 내 하류를 skip).
     """
     if not cfg:
         raise ValueError("prepare_run 결과 없음 — 선행 task 실패")
 
     table_name = table.get_name()
     if table_name not in cfg["tables"]:
-        return False  # 수동 실행에서 미선택 → skip
+        return []  # 수동 실행에서 미선택 → skip
 
     # 조회는 DB별로 실행하고 결과도 conn_id를 키로 보관한다 — 상태 UPDATE가
     # 이 키로 원천 DB를 찾아가므로 row 태깅·재그룹핑이 필요 없다
@@ -225,7 +223,8 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
              "ts_to": cfg["ts_to"], "wait_bound": cfg["wait_bound"]}
     jobs_by_conn = {conn_id: select_rows(conn_id, SELECT_TARGETS_SQL, binds)
                     for conn_id in ORACLE_CONN_IDS}
-    # 잔여분 신호는 반드시 필터 적용 "전"에 기록한다 (필터 후 건수로 보면 놓침)
+    # 조회 상한을 꽉 채웠다면 그 DB에 더 남아 있다는 뜻이다. 아래 필터를 거치면
+    # 건수가 줄어 이 신호를 알 수 없으므로 지금 기록해 둔다 (loop 판단에 사용)
     fetched_full = any(len(rows) >= ROW_LIMIT for rows in jobs_by_conn.values())
 
     # 영수증 확인 (설계 4): status는 커밋 여부의 증거가 아니다. Airflow가 실패로
@@ -241,64 +240,50 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
             update_jobs(conn_id, done, "DONE")   # batch_id 미지정 → 영수증 보존
             jobs_by_conn[conn_id] = [r for r in rows if r not in done]
 
-    # 크기 상한 (설계 5.4): DB별 결과를 합쳐 오래된 것부터 담고, 잘린 뒤쪽은
-    # 상태를 건드리지 않고 이월한다 (loop 회차/다음날 회수).
-    # row에 conn_id를 짝지어 다니는 이유는 상태 UPDATE가 원천 DB로 나가야 해서다.
-    candidates = [(row, conn_id)
+    # DB별 결과를 하나로 합쳐 오래된 것부터 처리한다 (append와 같은 순서).
+    # 항목은 (ts, row, conn_id) — conn_id를 함께 드는 이유는 합치고 나면 어느 DB에서
+    # 왔는지 잃어버리는데, 상태 UPDATE는 원천 DB로 나가야 하기 때문이다.
+    candidates = [(row["ts"], row, conn_id)
                   for conn_id, rows in jobs_by_conn.items() for row in rows]
-    candidates.sort(key=lambda pair: pair[0]["ts"])  # DB별로 정렬돼 있어도 합치면 깨진다
-    picked_ts = []                            # Compaction 범위 산출용
-    picked_paths = []                         # base_path+파일명 (S3 목록)
+    candidates.sort(key=itemgetter(0))   # ts 오름차순. DB별로 정렬돼 있어도 합치면 깨진다
+
+    picked_files = []                         # 부모 파일 목록 함수에 그대로 넘길 목록
     picked_by_conn: dict[str, list[dict]] = {}   # 상태 UPDATE는 원천 DB별로 나가야 한다
-    total_mb = 0.0                            # NUMBER는 Decimal이라 float으로 누적
-    for row, conn_id in candidates:
-        file_name, size_mb = parse_param(row["param"])
-        if total_mb + size_mb > SIZE_LIMIT_MB:
-            break
-        picked_ts.append(row["ts"])
-        picked_paths.append(f"{row['base_path'].rstrip('/')}/{file_name}")
+    for _, row, conn_id in candidates:
+        picked_files += param_files(row["param"])   # row 1건에 파일이 여러 개일 수 있다
         picked_by_conn.setdefault(conn_id, []).append(row)
-        total_mb += size_mb
 
-    if not picked_paths:
-        # 조회가 비어 담을 게 없는 건 정상(무음 skip). 그 외는 비정상 신호라 알린다:
-        #   candidates 있음 → 선두 job 하나가 크기 상한 초과 (매일 반복 skip될 데이터)
-        #   fetched_full   → 조회분이 전부 영수증 정정으로 소진 (잔여분 신호 유실)
-        if candidates or fetched_full:
-            send_alert(
-                f"재처리 {table_name}: 처리 대상 구성 불가 — 수동 확인 필요 "
-                f"(조회 상한 도달={fetched_full}, 크기 상한 초과 잔여 {len(candidates)}건)"
-            )
-        return False
+    if not picked_files:
+        return []   # 적재할 파일 없음 → 아무것도 마킹하지 않고 빠져나간다
 
-    # 잔여분: 어느 한 DB라도 조회 상한을 채웠거나, 크기 상한으로 뒤쪽이 잘린 경우
-    leftover = fetched_full or len(picked_paths) < len(candidates)
+    batch_id = f"{run_id}_{table_name}"   # 배치당 1개 (Spark 커밋 1회 = 영수증 1개)
 
-    # batch_id는 배치당 1개 — 두 DB의 row가 하나의 Spark 커밋으로 적재되므로
-    # 양쪽이 같은 값을 달고, 영수증 확인도 snapshot 1곳에서 끝난다
-    batch_id = f"{run_id}_{table_name}"
+    # ── XCom 2건. 마킹보다 먼저 남긴다 (설계 5.3): 마킹 도중 실패해도
+    #    update task가 meta로 대상을 되찾을 수 있다 (반대 순서면 좀비가 된다) ──
 
-    # meta는 반드시 마킹보다 먼저 기록한다 (설계 5.3). 마킹 도중 실패해도
-    # update_failure가 meta로 회수할 수 있다 (반대 순서면 좀비 발생).
-    # TODO(연결): meta 필드명을 append get_jobs 스키마와 일치시킬 것
+    # ① 부모 update_success/update_failure가 상태를 되돌릴 때 쓴다.
+    # TODO(연결): key 이름·필드명을 부모 append get_jobs가 push하는 형식과 맞출 것
     ti.xcom_push(key="meta", value={
-        "table": table_name,
-        "group": "hourly" if isinstance(table, HourlyIcebergTable) else "daily",
         "batch_id": batch_id,
-        # 하류 update task가 쓸 복합키만 conn_id별로 (row 전체는 XCom에 넣지 않는다)
         "keys": {conn_id: [{k: r[k] for k in KEY_COLUMNS} for r in rows]
                  for conn_id, rows in picked_by_conn.items()},
-        "leftover": leftover,
-        "ts_min": picked_ts[0], "ts_max": picked_ts[-1],
-        # append DAG과 동일 산정식: ceil(총크기/128MB × 1.5 / executor-cores 4)
-        "num_executors": min(max(math.ceil(total_mb / 128 * 1.5 / 4), 1), MAX_EXECUTORS),
+    })
+
+    # ② 재처리 DAG 자신의 마무리 task 2개만 쓴다 (부모와 무관).
+    #    ts_min/ts_max = 이번에 적재한 데이터의 시간 범위. compaction_targets가
+    #      이 범위만 Compaction하도록 기존 Compaction DAG에 넘긴다 (설계 6.3).
+    #    has_more = 조회 상한에 걸려 못 가져온 대상이 DB에 남았는가.
+    #      next_loop이 이 값으로 DAG을 한 번 더 trigger할지 정한다 (설계 5.5).
+    ti.xcom_push(key="reprocess", value={
+        "ts_min": candidates[0][0],    # candidates는 ts 오름차순, 전부 담았다
+        "ts_max": candidates[-1][0],
+        "has_more": fetched_full,
     })
 
     for conn_id, rows in picked_by_conn.items():
         update_jobs(conn_id, rows, "IN_PROGRESS", batch_id)
 
-    upload_path_list_to_s3(table_name, picked_paths, batch_id)
-    return True
+    return picked_files
 
 
 # TODO(연결): 기존 ConvertFileTaskGroup에 reprocess_cfg 인자와 조회 분기를 추가한다.
@@ -308,13 +293,22 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
 
 
 def collect_metas(ti) -> list[dict]:
-    """처리 대상을 선점한 테이블들의 meta 수집 (설계 6.3 / 5.5).
+    """이번 run에서 실제로 적재한 테이블들의 재처리 meta 수집 (설계 6.3 / 5.5).
 
     Airflow 3 worker는 메타데이터 DB 접근이 불가하므로 task 상태 조회 대신 XCom만 쓴다.
+    테이블명과 Compaction 그룹은 Enum에서 바로 붙인다 (XCom으로 나를 필요가 없다).
     """
-    metas = [ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.get_jobs", key="meta")
-             for t in ALL_TABLES]
-    return [m for m in metas if m]   # 조회 0건이라 skip된 테이블은 meta가 없다
+    metas = []
+    for t in ALL_TABLES:
+        meta = ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.get_jobs",
+                            key="reprocess")
+        if meta:   # 대상 0건이라 skip된 테이블은 XCom이 없다
+            metas.append({
+                **meta,
+                "table": t.get_name(),
+                "group": "hourly" if isinstance(t, HourlyIcebergTable) else "daily",
+            })
+    return metas
 
 
 # ---------------------------------------------------------------------------
@@ -435,10 +429,10 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     @task(trigger_rule="all_done")
     def next_loop(cfg: dict, ti=None) -> list[dict]:
         """재trigger 판단 (설계 5.5) → TriggerDagRunOperator kwargs 0/1건.
-        잔여분(상한 초과 이월) 있는 테이블이 하나라도 있으면 재trigger.
-        지속 실패도 leftover + MAX_LOOP 상한으로 유한하게 종료된다."""
-        # 종료 ①: prepare_run 실패(cfg 없음) 또는 잔여분 없음
-        if not cfg or not any(m["leftover"] for m in collect_metas(ti)):
+        상한에 걸려 못 담은 대상이 남은 테이블이 하나라도 있으면 한 번 더 돈다.
+        지속 실패도 has_more + MAX_LOOP 상한으로 유한하게 종료된다."""
+        # 종료 ①: prepare_run 실패(cfg 없음) 또는 남은 대상 없음
+        if not cfg or not any(m["has_more"] for m in collect_metas(ti)):
             return []
         # 종료 ②: 회차 상한 — 자동으로 다 못 푸는 물량 → 알림 후 수동 (설계 8.1)
         if cfg["loop_count"] >= MAX_LOOP:

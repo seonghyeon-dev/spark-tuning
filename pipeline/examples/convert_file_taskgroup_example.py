@@ -51,6 +51,13 @@ class ConvertFileTaskGroup(TaskGroup):
             """Job History 상태 update — 기존 지역 헬퍼 그대로."""
             ...                   # 기존 구현
 
+        def _upload_file_list(files):
+            """param에서 뽑은 파일 목록을 받아
+               ① avro 경로 텍스트 파일을 S3에 저장하고
+               ② size 총합을 구해 XCom push (Spark operator가 pull)
+               → **기존 함수 그대로**. 재처리도 이 함수를 그대로 쓴다."""
+            ...                   # 기존 구현
+
         def _other_helper(*args):  # 다른 지역 함수들도 그대로
             ...
 
@@ -77,12 +84,17 @@ class ConvertFileTaskGroup(TaskGroup):
             )
             def get_jobs(cfg, run_id=None, ti=None):
                 logger.info("reprocess get_jobs: %s", table.get_name())
-                # 조회 범위·상한·영수증 확인 등 순수 로직은 재처리 모듈에 있다.
-                # 부모 헬퍼가 필요하면 여기서 그냥 호출하면 된다:
-                #   _update_jobs(job_ids, "IN_PROGRESS")
-                return reprocess_get_jobs(  # noqa: F821
+                # 재처리 모듈은 "무엇을 적재할지"만 정한다 —
+                # 조회 범위, 영수증 확인(중복 적재 방지), 크기 상한, IN_PROGRESS 마킹.
+                # 반환값은 param에서 뽑은 파일 목록이고, 그 다음 처리(S3 텍스트 파일
+                # 업로드 + size 총합 XCom push)는 **기존 함수를 그대로 쓴다**.
+                files = reprocess_get_jobs(  # noqa: F821
                     cfg, table=table, run_id=run_id, ti=ti,
                 )
+                if not files:
+                    return False              # 대상 없음 → 그룹 내 하류 skip
+                _upload_file_list(files)      # ← 부모 기존 함수, 재구현하지 않음
+                return True
 
             jobs = get_jobs(reprocess_cfg)
 
