@@ -32,7 +32,7 @@
 | 구성 요소 | 내용 |
 |----------|------|
 | Iceberg 테이블 | **20개 이상**. 첫 파티션 기준 hourly 그룹(`hour` hidden partition)과 daily 그룹(`day` hidden partition)으로 분류 |
-| Job History (Oracle) | 처리 대상 상태 관리 테이블. **Oracle DB 2개(a/b)에 동일 스키마로 존재** — append DAG은 conn_list(conn_id 2개) loop로 같은 쿼리를 DB별로 실행. **키는 복합키 4개**(예: `k_1`, `k_2`, `k_3`, `ts`) — `ts`(string, `YYYYMMDDHHmmSSsss` 밀리세컨즈)도 그중 하나이며 날짜 파티셔닝 키이자 조회 기준이다. 그 외 컬럼: `table_name`(대상 테이블), `base_path`, `param`(JSON — 파일명·파일 크기), `status`, `stat_desc`(CLOB, 현재 미사용). 복합키 값은 DB 간 유일 보장 없음 |
+| Job History (Oracle) | 처리 대상 상태 관리 테이블. **Oracle DB 2개(a/b)에 동일 스키마로 존재** — append DAG은 conn_list(conn_id 2개) loop로 같은 쿼리를 DB별로 실행. **키는 복합키 4개**(예: `k_1`, `k_2`, `k_3`, `ts`) — `ts`(string, `YYYYMMDDHHmmSSsss` 밀리세컨즈)도 그중 하나이며 날짜 파티셔닝 키이자 조회 기준이다. 그 외 컬럼: `table_name`(대상 테이블), `base_path`, `param`(JSON — `{"files": [{"file_path", "size"}, ...]}`, row당 파일 여러 개 가능), `status`, `stat_desc`(CLOB, 현재 미사용). 복합키 값은 DB 간 유일 보장 없음 |
 | append DAG | py 파일 1개에서 loop로 **테이블별 DAG 동적 생성** (테이블당 1개 실행). 약 5분 주기. `get_jobs`가 conn_list의 **DB별로** `table_name` 조건 + `ts` 최근 1일 범위 + `status='WAIT'`을 `ORDER BY ts ASC`, `ROWNUM <= 200`으로 조회 |
 | Compaction DAG | **hourly DAG 1개**(`15 * * * *`, 직전 1시간치) + **daily DAG 1개**(현재 `35 0 * * *`, 전일치). 각 DAG 내부에서 소속 테이블 task가 순차 실행. `max_active_runs=1`. UI 수동 실행용 params: daily는 `target_dt`, hourly는 `start_time`/`end_time` |
 | DB 상태 처리 | callback이 아닌 `update_success`(`trigger_rule=all_success`) / `update_failure`(`all_failed`) task 방식 — callback은 DB update 지연 시 작업이 kill되는 문제가 있었음 |
@@ -311,7 +311,16 @@ SELECT * FROM (
 3. **영수증 확인** — 조회 row에서 읽은 stat_desc(batch_id)를 모아 `.snapshots`와 한 번에 대조 → 커밋이 확인된 batch의 row는 DONE 정정(원천 DB별) 후 대상에서 제외 (섹션 4). **status로 거르지 않는다** — WAIT라도 커밋 후 상태 갱신만 실패한 것일 수 있고, 그 경우 재적재하면 중복이다
 4. **크기 상한 적용** — 병합된 전체 목록에서 앞(가장 오래된 것)부터 누적 16GB를 넘기 직전까지만 담는다. 잘린 뒤쪽은 상태를 건드리지 않고 이월 (loop 회차 또는 다음날 회수)
    - **담긴 게 0건인데 조회 결과나 잔여분 신호가 있으면 알림** — ① 선두 job 하나가 16GB 초과(매일 반복 skip될 데이터) ② 조회분이 전부 영수증 정정으로 소진(DB에 더 남았는데 meta가 없어 loop 신호 유실). 정상적인 빈 조회는 무음 skip
-5. **XCom(meta) 기록** — 복합키 목록(conn별 dict)·batch_id·잔여분 여부·적재 ts 범위를 **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, meta가 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. meta가 먼저 있으면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task의 `WHERE status='IN_PROGRESS'` 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
+5. **XCom 기록 (2건)** — **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, XCom이 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. 순서가 반대면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
+
+| key | 내용 | 소비자 |
+|-----|------|--------|
+| `meta` | `batch_id`, `keys`(conn별 복합키 목록) | **부모** update_success / update_failure — 형식은 append get_jobs와 맞춘다 |
+| `reprocess` | `ts_min`, `ts_max`, `has_more` | **재처리 DAG** compaction_targets / next_loop |
+
+   - `ts_min`/`ts_max`는 **이번에 적재한 데이터의 시간 범위**다. 이 범위만 Compaction하도록 기존 Compaction DAG에 넘긴다 (섹션 6.3)
+   - `has_more`는 **상한에 걸려 못 담은 대상이 남았는지** 여부다. 남았으면 DAG을 한 번 더 trigger한다 (5.5)
+   - 테이블명·Compaction 그룹은 XCom에 넣지 않는다 — 수집 측이 Enum을 순회하므로 그 자리에서 붙이면 된다
 6. **IN_PROGRESS 마킹** — 원천 DB별로 상태 UPDATE를 **executemany**로 일괄 실행 + `stat_desc = 새 batch_id` 기록. IN 절에 placeholder를 건수만큼 펼치지 않는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고, IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며(ROW_LIMIT 상향 시에도 안전), 라운드트립이 1회다
 
 ```sql
@@ -322,7 +331,9 @@ UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id
 ```
    - **WHERE에 status 조건을 두지 않는다**: 복합키가 row를 유일하게 식별하므로 대상 특정에 불필요하다. 이전 상태를 조건으로 거는 낙관적 잠금도 의미가 없다 — 조회~UPDATE 사이에 상태를 바꿀 주체가 없고(append는 조회 경계가 겹치지 않고, 재처리는 `max_active_runs=1`, 같은 run 내 테이블은 `table_name`으로 분리), 반영 건수를 검증하지도 않으므로 조건이 걸리면 조용히 누락될 뿐이다
    - DONE 정정(3번)은 `batch_id`를 넘기지 않아 row의 기존 `stat_desc`(영수증)를 그대로 유지한다
-7. **Spark 입력 준비** — `base_path` + `param`의 파일명을 결합한 경로 문자열 배열을 텍스트 파일로 만들어 S3 업로드(양쪽 DB 분을 합쳐 1개 파일). 크기 상한 판정과 num_executors 산정에 쓰는 파일 크기도 같은 `param` JSON에서 꺼낸다 (append DAG과 동일 산정식: `ceil(총크기/128MB × 1.5 / 4)`, 상한 24)
+7. **Spark 입력 준비 — 기존 함수에 위임** — 재처리 조회 로직은 담기로 한 파일 목록을 반환하는 데서 끝난다. avro 경로 텍스트 파일 S3 업로드와 size 총합 XCom push(Spark operator가 pull)는 **ConvertFileTaskGroup에 이미 있는 함수가 그대로 수행**하므로 재구현하지 않는다
+
+> **`param` 구조**: `{"files": [{"file_path": ..., "size": ...}, ...]}` — **row 1건에 파일이 여러 개**일 수 있다. 재처리가 이 목록을 가공 없이 모아 부모 함수에 넘기므로, 경로 조합 규칙·size 단위 해석이 append와 자동으로 일치한다. 재처리가 직접 쓰는 값은 크기 상한 판정에 필요한 `size` 합계뿐이다.
 
 ### 5.4 처리 상한
 
@@ -330,7 +341,7 @@ UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id
 |------|-----|----------|----------|
 | 테이블당·**DB당** 조회 row 수 | 1,000 (ROWNUM) | Oracle SELECT 성능, XCom 크기, avro 경로 목록 파일 크기. DB 2개이므로 테이블당 최대 2,000건이 병합될 수 있음 | ⚠️ 러프 설정 — 재검증 필요 |
 | 테이블당 처리 총 크기 | 16GB | Spark 리소스, 처리 소요시간. 벤치마크 검증 범위(~8GB, 24 executors)의 2배 이내 | ⚠️ 러프 설정 — 재검증 필요 |
-| num_executors | 24 | 벤치마크에서 32 이상은 성능 저하 확인 (spark-tuning-guide.md 2.2.3) | ✅ 벤치마크 검증 |
+| num_executors | — | 재처리가 산정하지 않는다. size 총합을 XCom에 올리는 기존 함수를 그대로 쓰므로 Spark operator의 기존 산정 경로를 탄다 | — |
 
 **규모 감각**: append는 약 5분 주기에 조회 상한 200 rows(DB당). 재처리 상한 1,000 rows(DB당) ≈ 약 25분치 물량. 정상 운영의 하루 잔여분은 이보다 훨씬 적을 것으로 예상하지만, 상한값은 검증된 값이 아니므로 운영 데이터로 재조정한다.
 
