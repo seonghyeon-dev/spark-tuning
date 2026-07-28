@@ -71,7 +71,11 @@ def ts_str(dt: pendulum.DateTime) -> str:
 
 
 def param_to_ts(value: str) -> str:
-    """date-time param → ts 문자열. offset이 와도 KST로 통일."""
+    """date-time param → ts 문자열.
+
+    `tz=KST`는 offset 없는 문자열에만 적용되므로 `in_timezone`이 반드시 필요하다.
+    빼면 '2026-07-01T15:00:00Z'가 KST 00:00이 아닌 15:00으로 읽혀 경계가 어긋난다.
+    """
     return ts_str(pendulum.parse(value, tz=KST).in_timezone(KST))
 
 
@@ -236,13 +240,12 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
             update_jobs(conn_id, done, "DONE")
             jobs_by_conn[conn_id] = [r for r in rows if r not in done]
 
-    # 크기 상한 (설계 5.4): DB별 결과를 전체 ts 오름차순으로 합쳐 오래된 것부터
-    # 담고, 잘린 뒤쪽은 상태를 건드리지 않고 이월한다 (loop 회차/다음날 회수).
-    # DB마다 정렬돼 있어도 합치면 순서가 깨지므로 여기서 한 번 정렬한다.
-    candidates = sorted(
-        ((r, conn_id) for conn_id, rows in jobs_by_conn.items() for r in rows),
-        key=lambda pair: pair[0]["ts"],
-    )
+    # 크기 상한 (설계 5.4): DB별 결과를 합쳐 오래된 것부터 담고, 잘린 뒤쪽은
+    # 상태를 건드리지 않고 이월한다 (loop 회차/다음날 회수).
+    # row에 conn_id를 짝지어 다니는 이유는 상태 UPDATE가 원천 DB로 나가야 해서다.
+    candidates = [(row, conn_id)
+                  for conn_id, rows in jobs_by_conn.items() for row in rows]
+    candidates.sort(key=lambda pair: pair[0]["ts"])  # DB별로 정렬돼 있어도 합치면 깨진다
     picked_ts = []                            # Compaction 범위 산출용
     picked_paths = []                         # base_path+파일명 (S3 목록)
     picked_by_conn: dict[str, list[dict]] = {}   # 상태 UPDATE는 원천 DB별로 나가야 한다
@@ -308,12 +311,9 @@ def collect_metas(ti) -> list[dict]:
 
     Airflow 3 worker는 메타데이터 DB 접근이 불가하므로 task 상태 조회 대신 XCom만 쓴다.
     """
-    metas = []
-    for t in ALL_TABLES:
-        meta = ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.get_jobs", key="meta")
-        if meta:
-            metas.append(meta)
-    return metas
+    metas = [ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.get_jobs", key="meta")
+             for t in ALL_TABLES]
+    return [m for m in metas if m]   # 조회 0건이라 skip된 테이블은 meta가 없다
 
 
 # ---------------------------------------------------------------------------
@@ -363,15 +363,9 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         """params 검증·정규화 1회 (append DAG의 get_time 패턴). 이후 task는 XCom만 소비."""
         conf = dag_run.conf or {}
 
-        # loop 재trigger 회차: 첫 회차가 확정한 값을 그대로 승계 (설계 5.5)
+        # loop 재trigger 회차: conf가 곧 직전 회차의 반환값이므로 그대로 승계 (설계 5.5)
         if conf.get("ts_from"):
-            return {
-                "tables": conf["tables"],
-                "ts_from": conf["ts_from"],
-                "ts_to": conf["ts_to"],
-                "wait_bound": conf["wait_bound"],
-                "loop_count": int(conf.get("loop_count", 0)),
-            }
+            return {**conf, "loop_count": int(conf.get("loop_count", 0))}
 
         base = pendulum.now(KST).start_of("day")  # 오늘 00:00 (오늘=4일 01:00 실행이면 4일 00:00)
         st, et = params.get("start_time"), params.get("end_time")
@@ -471,9 +465,9 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     chain(run_cfg, *groups)
     tail = groups[-1] if groups else run_cfg  # 빈 Enum 상태에서도 파싱 가능
 
-    comp, nxt = compaction_targets(), next_loop(run_cfg)
-    tail >> comp
-    tail >> nxt
+    comp = compaction_targets()
+    nxt = next_loop(run_cfg)
+    tail >> [comp, nxt]
     # trigger 건수가 가변이라 dynamic task mapping.
     # TriggerDagRunOperator는 wait_for_completion 기본 False (설계 6.3)
     TriggerDagRunOperator.partial(task_id="trigger_compaction").expand_kwargs(comp)
