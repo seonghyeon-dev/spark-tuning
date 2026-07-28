@@ -301,7 +301,7 @@ SELECT * FROM (
 5. **XCom(meta) 기록** — 복합키 목록(conn별 dict)·batch_id·잔여분 여부·적재 ts 범위를 **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, meta가 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. meta가 먼저 있으면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task의 `WHERE status='IN_PROGRESS'` 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
 6. **IN_PROGRESS 마킹** — 원천 DB별로 `WHERE k_1=:k_1 AND k_2=:k_2 AND k_3=:k_3 AND ts=:ts AND status IN ('WAIT','FAILED')` UPDATE를 **executemany**로 일괄 실행 + `stat_desc = 새 batch_id` 기록. IN 절에 placeholder를 건수만큼 펼치지 않는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고, IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며(ROW_LIMIT 상향 시에도 안전), 라운드트립이 1회다
    - `status IN ('WAIT','FAILED')` 조건은 만약의 이중 실행에 대한 방어선이다. 반영 건수를 검증하지는 않는다 — 조회~UPDATE 사이에 상태를 바꿀 주체가 없기 때문(append는 조회 경계가 겹치지 않고, 재처리는 `max_active_runs=1`, 같은 run 내 테이블은 `table_name`으로 분리). 발생하지 않는 조건 때문에 하드 실패 경로를 만들면 오히려 정상 재처리가 막힐 위험만 생긴다
-7. **Spark 입력 준비** — `base_path` + `param`의 파일명을 결합한 경로 문자열 배열을 텍스트 파일로 만들어 S3 업로드(양쪽 DB 분을 합쳐 1개 파일). 크기 상한·num_executors 산정에 쓰는 파일 크기도 `param` JSON에서 꺼낸다, num_executors 산정 (append DAG과 동일 산정식: `ceil(총크기/128MB × 1.5 / 4)`, 상한 24)
+7. **Spark 입력 준비** — `base_path` + `param`의 파일명을 결합한 경로 문자열 배열을 텍스트 파일로 만들어 S3 업로드(양쪽 DB 분을 합쳐 1개 파일). 크기 상한 판정과 num_executors 산정에 쓰는 파일 크기도 같은 `param` JSON에서 꺼낸다 (append DAG과 동일 산정식: `ceil(총크기/128MB × 1.5 / 4)`, 상한 24)
 
 ### 5.4 처리 상한
 
@@ -465,10 +465,13 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 
 ```sql
 -- DB 2개 각각에 실행. 3~7일 전을 하루 단위 ts 범위로 반복 조회 (Partition Pruning 유지)
-SELECT table_name, status, COUNT(*) AS cnt, SUM(file_size_mb) AS total_mb
+SELECT table_name, status, COUNT(*) AS cnt
   FROM JOB_HISTORY
  WHERE ts >= :day_start AND ts < :day_end      -- 예: '20260701000000000' ~ '20260702000000000'
    AND status IN ('WAIT', 'FAILED')
  GROUP BY table_name, status;
+-- 파일 크기는 param(VARCHAR2 JSON) 안에 있어 단순 SUM이 불가하다.
+-- 총 크기까지 보려면 JSON_VALUE(param, '$.<크기 키>' RETURNING NUMBER)로 꺼내 집계한다
+-- (키 이름은 append DAG 파싱 로직과 맞출 것).
 -- 결과 존재 시: 알림 → 수동 재처리 절차(8.3)
 ```
