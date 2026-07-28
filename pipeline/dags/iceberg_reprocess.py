@@ -30,11 +30,10 @@ DAG_ID = Path(__file__).stem  # 조직 컨벤션: dag_id는 파일명에서 파�
 # TODO(연결): append DAG이 쓰는 conn_list와 동일 소스 사용
 ORACLE_CONN_IDS = ["oracle_a", "oracle_b"]
 
-ROW_LIMIT = 1000                     # 테이블당·DB당 조회 상한 (설계 5.4 — 재검증 필요)
-SIZE_LIMIT = 16 * 1024 ** 3          # 테이블당 처리 크기 상한 16GB (설계 5.4 — 재검증 필요)
-                                     # TODO(연결): param의 size 단위 확인 (byte 가정)
-MAX_LOOP = 10                        # 자기 재trigger 상한 (설계 5.5)
-ZOMBIE_HOURS = 2                     # 좀비 IN_PROGRESS 판정 임계 (설계 8.2)
+ROW_LIMIT = 1000     # 테이블당·DB당 조회 상한 — 한 회차 물량은 이것만으로 통제한다
+                     # (설계 5.4 — 러프 설정, 운영 데이터로 재검증 필요)
+MAX_LOOP = 10        # 자기 재trigger 상한 (설계 5.5)
+ZOMBIE_HOURS = 2     # 좀비 IN_PROGRESS 판정 임계 (설계 8.2)
 
 DAILY_COMPACTION_DAG_ID = "daily_compaction_dag"    # TODO(연결): 실제 DAG id
 HOURLY_COMPACTION_DAG_ID = "hourly_compaction_dag"  # TODO(연결): 실제 DAG id
@@ -241,8 +240,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> list[dict]:
             update_jobs(conn_id, done, "DONE")   # batch_id 미지정 → 영수증 보존
             jobs_by_conn[conn_id] = [r for r in rows if r not in done]
 
-    # 크기 상한 (설계 5.4): DB별 결과를 하나로 합쳐 오래된 것부터 담고, 잘린
-    # 뒤쪽은 상태를 건드리지 않고 이월한다 (loop 회차/다음날 회수).
+    # DB별 결과를 하나로 합쳐 오래된 것부터 처리한다 (append와 같은 순서).
     # 항목은 (ts, row, conn_id) — conn_id를 함께 드는 이유는 합치고 나면 어느 DB에서
     # 왔는지 잃어버리는데, 상태 UPDATE는 원천 DB로 나가야 하기 때문이다.
     candidates = [(row["ts"], row, conn_id)
@@ -250,36 +248,13 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> list[dict]:
     candidates.sort(key=itemgetter(0))   # ts 오름차순. DB별로 정렬돼 있어도 합치면 깨진다
 
     picked_files = []                         # 부모 파일 목록 함수에 그대로 넘길 목록
-    picked_ts = []                            # 담은 row의 ts (Compaction 범위 산출용)
     picked_by_conn: dict[str, list[dict]] = {}   # 상태 UPDATE는 원천 DB별로 나가야 한다
-    total_size = 0
-    for ts, row, conn_id in candidates:
-        files = param_files(row["param"])     # row 1건에 파일이 여러 개일 수 있다
-        size = sum(f["size"] for f in files)
-        if total_size + size > SIZE_LIMIT:
-            break                             # 여기서부터는 다음 회차로 이월
-        picked_files += files
-        picked_ts.append(ts)
+    for _, row, conn_id in candidates:
+        picked_files += param_files(row["param"])   # row 1건에 파일이 여러 개일 수 있다
         picked_by_conn.setdefault(conn_id, []).append(row)
-        total_size += size
 
     if not picked_files:
-        # 조회 결과가 없으면 처리할 게 없다는 뜻이다 → 조용히 skip.
-        #
-        # 조회 결과는 있는데 하나도 못 담는 경우는 하나뿐이다: 맨 앞(가장 오래된)
-        # 1건이 혼자서 상한보다 크면 첫 검사에서 바로 멈춰 0건이 된다. 줄 세우는
-        # 순서가 항상 오래된 순이라 이 건은 다음 실행에도 계속 맨 앞에 서고,
-        # 뒤에 있는 정상 대상까지 영원히 막는다 → 사람이 처리해야 한다.
-        if candidates:
-            oldest = candidates[0][1]
-            size_gb = sum(f["size"] for f in param_files(oldest["param"])) / 1024 ** 3
-            send_alert(
-                f"재처리 {table_name}: 가장 오래된 대상 1건(ts={oldest['ts']})이 "
-                f"{size_gb:.1f}GB로 상한 {SIZE_LIMIT // 1024 ** 3}GB를 초과. "
-                f"이 건이 빠지지 않으면 이 테이블의 재처리가 계속 막힌다 "
-                f"— 배치 분할 또는 상한 조정 필요"
-            )
-        return []
+        return []   # 적재할 파일 없음 → 아무것도 마킹하지 않고 빠져나간다
 
     batch_id = f"{run_id}_{table_name}"   # 배치당 1개 (Spark 커밋 1회 = 영수증 1개)
 
@@ -297,12 +272,12 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> list[dict]:
     # ② 재처리 DAG 자신의 마무리 task 2개만 쓴다 (부모와 무관).
     #    ts_min/ts_max = 이번에 적재한 데이터의 시간 범위. compaction_targets가
     #      이 범위만 Compaction하도록 기존 Compaction DAG에 넘긴다 (설계 6.3).
-    #    has_more = 상한에 걸려 못 담은 대상이 남았는가. next_loop이 이 값으로
-    #      DAG을 한 번 더 trigger할지 정한다 (설계 5.5).
+    #    has_more = 조회 상한에 걸려 못 가져온 대상이 DB에 남았는가.
+    #      next_loop이 이 값으로 DAG을 한 번 더 trigger할지 정한다 (설계 5.5).
     ti.xcom_push(key="reprocess", value={
-        "ts_min": picked_ts[0],
-        "ts_max": picked_ts[-1],
-        "has_more": fetched_full or len(picked_ts) < len(candidates),
+        "ts_min": candidates[0][0],    # candidates는 ts 오름차순, 전부 담았다
+        "ts_max": candidates[-1][0],
+        "has_more": fetched_full,
     })
 
     for conn_id, rows in picked_by_conn.items():
