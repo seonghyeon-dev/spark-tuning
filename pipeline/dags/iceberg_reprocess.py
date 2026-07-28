@@ -264,12 +264,21 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> list[dict]:
         total_size += size
 
     if not picked_files:
-        # 조회 결과가 아예 없으면 정상(처리할 게 없음) → 조용히 skip.
-        # 조회 결과가 있는데 하나도 못 담았다면 선두 job 하나가 상한을 넘는다는
-        # 뜻이고, 다음 실행도 같은 자리에서 막히므로 사람이 나눠 처리해야 한다.
+        # 조회 결과가 없으면 처리할 게 없다는 뜻이다 → 조용히 skip.
+        #
+        # 조회 결과는 있는데 하나도 못 담는 경우는 하나뿐이다: 맨 앞(가장 오래된)
+        # 1건이 혼자서 상한보다 크면 첫 검사에서 바로 멈춰 0건이 된다. 줄 세우는
+        # 순서가 항상 오래된 순이라 이 건은 다음 실행에도 계속 맨 앞에 서고,
+        # 뒤에 있는 정상 대상까지 영원히 막는다 → 사람이 처리해야 한다.
         if candidates:
-            send_alert(f"재처리 {table_name}: 선두 job이 크기 상한"
-                       f"({SIZE_LIMIT // 1024 ** 3}GB) 초과 — 수동 분할 필요")
+            oldest = candidates[0][1]
+            size_gb = sum(f["size"] for f in param_files(oldest["param"])) / 1024 ** 3
+            send_alert(
+                f"재처리 {table_name}: 가장 오래된 대상 1건(ts={oldest['ts']})이 "
+                f"{size_gb:.1f}GB로 상한 {SIZE_LIMIT // 1024 ** 3}GB를 초과. "
+                f"이 건이 빠지지 않으면 이 테이블의 재처리가 계속 막힌다 "
+                f"— 배치 분할 또는 상한 조정 필요"
+            )
         return []
 
     batch_id = f"{run_id}_{table_name}"   # 배치당 1개 (Spark 커밋 1회 = 영수증 1개)
