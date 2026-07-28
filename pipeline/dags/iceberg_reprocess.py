@@ -124,11 +124,9 @@ KEY_COLUMNS = ("k_1", "k_2", "k_3", "ts")
 #            + status(WAIT/FAILED 필터) + stat_desc(영수증 확인용)
 JOB_COLUMNS = (*KEY_COLUMNS, "base_path", "param", "status", "stat_desc")
 
-# stat_desc는 CLOB이라 드라이버가 LOB 객체로 돌려준다 — 문자열 비교·set 연산이
+# stat_desc만 CLOB이라 드라이버가 LOB 객체로 돌려준다 — 문자열 비교·set 연산이
 # 되지 않아 영수증 확인이 오작동하므로, 조회 시점에 VARCHAR2로 변환해서 받는다
-# (batch_id는 짧은 값이라 4000바이트로 충분).
-# TODO(연결): param 컬럼이 CLOB이면 동일하게 변환할 것 (JSON이 4000바이트를
-#             넘길 수 있으면 변환 대신 LOB.read()로 읽어야 한다)
+# (batch_id는 짧은 값이라 4000바이트로 충분). 나머지 컬럼은 변환 불필요.
 JOB_SELECT_EXPRS = (
     *KEY_COLUMNS,
     "base_path",
@@ -152,6 +150,10 @@ SELECT * FROM (
 # 복합키 전체를 AND로 묶은 조건 (executemany 바인딩용 — 건수와 무관하게 고정 SQL)
 KEY_WHERE = " AND ".join(f"{k} = :{k}" for k in KEY_COLUMNS)
 
+# TODO(연결): ① 갱신 시각 컬럼명 확인(updated_at 가정) ② 이 쿼리는 조회 조건에
+#             ts 범위가 없어 파티션 전체를 스캔한다. status 인덱스가 없다면
+#             (IN_PROGRESS는 소수라 인덱스가 효과적) 인덱스 추가나 ts 하한
+#             추가를 검토할 것 — 하루 1회 실행이지만 테이블이 크면 부담이 된다.
 ZOMBIE_COLUMNS = ("table_name", *KEY_COLUMNS, "updated_at")
 
 ZOMBIE_SQL = f"""
@@ -220,13 +222,13 @@ def _claim_jobs(conn_id: str, keys: list[dict], batch_id: str) -> None:
 
 
 def parse_param(param) -> tuple[str, float]:
-    """param(JSON) → (파일명, 파일 크기 MB).
+    """param(VARCHAR2, JSON 문자열) → (파일명, 파일 크기 MB).
 
     TODO(연결): 실제 JSON 키 이름과 크기 단위를 append DAG의 파싱 로직과 맞출 것
                 (아래는 {"file_name": ..., "file_size": <bytes>} 가정).
                 base_path와의 결합 규칙(구분자·prefix)도 append와 동일해야 한다.
     """
-    data = json.loads(param) if isinstance(param, str) else param
+    data = json.loads(param)
     return data["file_name"], float(data["file_size"]) / 1024 / 1024
 
 
