@@ -182,9 +182,12 @@ def parse_param(param) -> tuple[str, float]:
 def committed_batch_ids(table_name: str, batch_ids: set[str]) -> set[str]:
     """영수증 확인 (설계 4.2): batch_ids 중 테이블 snapshot에 실제로 있는 것만 반환.
 
-    batch당 1회가 아니라 한 번에 조회한다 — 조회 row 수만큼 질의가 늘지 않는다.
+    batch당 1회씩 조회하지 않고 IN 조건으로 한 번에 대조한다. 반환도 넘긴 값의
+    부분집합이어야 한다 — snapshot 전체를 긁어오면 안 된다.
     TODO(연결): 기존 Trino/Spark 조회 경로 재사용.
-      SELECT element_at(summary, 'batch_id') FROM <catalog>.<db>.<table>.snapshots
+      SELECT element_at(summary, 'batch_id')
+        FROM <catalog>.<db>.<table>.snapshots
+       WHERE element_at(summary, 'batch_id') IN (:batch_ids)
     """
     raise NotImplementedError
 
