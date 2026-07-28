@@ -12,6 +12,7 @@ append DAG 조회 범위(최근 1일)에서 밀려난 WAIT/FAILED를 전날+그�
 import json
 import math
 from enum import Enum
+from operator import itemgetter
 from pathlib import Path
 
 import pendulum
@@ -241,21 +242,23 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
             update_jobs(conn_id, done, "DONE")   # batch_id 미지정 → 영수증 보존
             jobs_by_conn[conn_id] = [r for r in rows if r not in done]
 
-    # 크기 상한 (설계 5.4): DB별 결과를 합쳐 오래된 것부터 담고, 잘린 뒤쪽은
-    # 상태를 건드리지 않고 이월한다 (loop 회차/다음날 회수).
-    # row에 conn_id를 짝지어 다니는 이유는 상태 UPDATE가 원천 DB로 나가야 해서다.
-    candidates = [(row, conn_id)
+    # 크기 상한 (설계 5.4): DB별 결과를 하나로 합쳐 오래된 것부터 담고, 잘린
+    # 뒤쪽은 상태를 건드리지 않고 이월한다 (loop 회차/다음날 회수).
+    # 항목은 (ts, row, conn_id) — conn_id를 함께 드는 이유는 합치고 나면 어느 DB에서
+    # 왔는지 잃어버리는데, 상태 UPDATE는 원천 DB로 나가야 하기 때문이다.
+    candidates = [(row["ts"], row, conn_id)
                   for conn_id, rows in jobs_by_conn.items() for row in rows]
-    candidates.sort(key=lambda pair: pair[0]["ts"])  # DB별로 정렬돼 있어도 합치면 깨진다
+    candidates.sort(key=itemgetter(0))   # ts 오름차순. DB별로 정렬돼 있어도 합치면 깨진다
+
     picked_ts = []                            # Compaction 범위 산출용
     picked_paths = []                         # base_path+파일명 (S3 목록)
     picked_by_conn: dict[str, list[dict]] = {}   # 상태 UPDATE는 원천 DB별로 나가야 한다
     total_mb = 0.0                            # NUMBER는 Decimal이라 float으로 누적
-    for row, conn_id in candidates:
+    for ts, row, conn_id in candidates:
         file_name, size_mb = parse_param(row["param"])
         if total_mb + size_mb > SIZE_LIMIT_MB:
             break
-        picked_ts.append(row["ts"])
+        picked_ts.append(ts)
         picked_paths.append(f"{row['base_path'].rstrip('/')}/{file_name}")
         picked_by_conn.setdefault(conn_id, []).append(row)
         total_mb += size_mb
