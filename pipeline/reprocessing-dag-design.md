@@ -280,6 +280,7 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 ```sql
 -- conn_list의 DB 2개에 각각 실행 (결과는 {conn_id: rows}로 보관)
 -- 조회 컬럼 = 복합키 4개 + base_path + param(JSON) + status + stat_desc(영수증용)
+-- 컬럼명은 커서(description)에서 받아 그대로 row의 키로 쓴다 → 변환 컬럼에는 별칭 필수
 SELECT * FROM (
     SELECT k_1, k_2, k_3, ts, base_path, param, status,
            DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc  -- CLOB → VARCHAR2 (아래 주의)

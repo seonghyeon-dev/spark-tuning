@@ -100,12 +100,9 @@ def dates_between(ts_min: str, ts_max: str) -> list[str]:
 # TODO(연결): 실제 컬럼명으로 교체 — 아래 SQL 3개의 컬럼명도 함께 고칠 것
 KEY_COLUMNS = ("k_1", "k_2", "k_3", "ts")
 
-# SELECT 순서와 일치해야 한다 (조회 결과를 이 이름으로 dict 매핑)
-JOB_COLUMNS = (*KEY_COLUMNS, "base_path", "param", "status", "stat_desc")
-ZOMBIE_COLUMNS = ("table_name", *KEY_COLUMNS, "updated_at")
-
 # stat_desc(CLOB)를 그냥 조회하면 LOB 객체로 와 문자열 비교·set 연산이 안 되므로
-# VARCHAR2로 변환해 받는다 (batch_id는 짧아 4000바이트로 충분)
+# VARCHAR2로 변환해 받는다 (batch_id는 짧아 4000바이트로 충분).
+# 컬럼명이 곧 row의 키가 되므로 변환 컬럼에는 `AS stat_desc` 별칭이 반드시 필요하다.
 SELECT_TARGETS_SQL = """
 SELECT * FROM (
     SELECT k_1, k_2, k_3, ts, base_path, param, status,
@@ -135,11 +132,16 @@ SELECT table_name, k_1, k_2, k_3, ts, updated_at
 """
 
 
-def select_rows(conn_id: str, sql: str, binds: dict,
-                columns: tuple[str, ...]) -> list[dict]:
-    """조회 결과를 컬럼명 dict로 매핑. columns는 SELECT 순서와 일치해야 한다."""
-    records = OracleHook(oracle_conn_id=conn_id).get_records(sql, parameters=binds)
-    return [dict(zip(columns, r)) for r in records]
+def select_rows(conn_id: str, sql: str, binds: dict) -> list[dict]:
+    """조회 결과를 컬럼명 dict로 매핑.
+
+    컬럼명은 커서에서 그대로 받는다 — SELECT와 컬럼 목록을 따로 맞출 필요가 없다
+    (Oracle이 대문자로 주므로 소문자로 통일).
+    """
+    with OracleHook(oracle_conn_id=conn_id).get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, binds)
+        columns = [d[0].lower() for d in cur.description]
+        return [dict(zip(columns, row)) for row in cur]
 
 
 def update_jobs(conn_id: str, rows: list[dict], status: str,
@@ -153,11 +155,12 @@ def update_jobs(conn_id: str, rows: list[dict], status: str,
     """
     if not rows:
         return
-    binds = [
-        {"status": status, "batch_id": batch_id or r["stat_desc"],
-         **{k: r[k] for k in KEY_COLUMNS}}
-        for r in rows
-    ]
+    binds = []
+    for row in rows:
+        bind = {k: row[k] for k in KEY_COLUMNS}
+        bind["status"] = status
+        bind["batch_id"] = batch_id or row["stat_desc"]
+        binds.append(bind)
     with OracleHook(oracle_conn_id=conn_id).get_conn() as conn, conn.cursor() as cur:
         cur.executemany(UPDATE_STATUS_SQL, binds)
         conn.commit()
@@ -214,15 +217,10 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     # 조회는 DB별로 실행하고 결과도 conn_id를 키로 보관한다 — 상태 UPDATE가
     # 이 키로 원천 DB를 찾아가므로 row 태깅·재그룹핑이 필요 없다
     # (복합키 값은 DB 간 유일 보장 없음). ROW_LIMIT은 DB당 적용.
-    jobs_by_conn = {
-        conn_id: select_rows(
-            conn_id, SELECT_TARGETS_SQL,
-            {"tbl": table_name, "ts_from": cfg["ts_from"], "ts_to": cfg["ts_to"],
-             "wait_bound": cfg["wait_bound"], "row_limit": ROW_LIMIT},
-            JOB_COLUMNS,
-        )
-        for conn_id in ORACLE_CONN_IDS
-    }
+    binds = {"tbl": table_name, "row_limit": ROW_LIMIT, "ts_from": cfg["ts_from"],
+             "ts_to": cfg["ts_to"], "wait_bound": cfg["wait_bound"]}
+    jobs_by_conn = {conn_id: select_rows(conn_id, SELECT_TARGETS_SQL, binds)
+                    for conn_id in ORACLE_CONN_IDS}
     # 잔여분 신호는 반드시 필터 적용 "전"에 기록한다 (필터 후 건수로 보면 놓침)
     fetched_full = any(len(rows) >= ROW_LIMIT for rows in jobs_by_conn.values())
 
@@ -350,7 +348,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         알림에 그대로 넘긴다 (수동 정정 시 대상 DB 식별용).
         """
         zombies_by_conn = {
-            conn_id: select_rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS}, ZOMBIE_COLUMNS)
+            conn_id: select_rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS})
             for conn_id in ORACLE_CONN_IDS
         }
         total = sum(len(rows) for rows in zombies_by_conn.values())
