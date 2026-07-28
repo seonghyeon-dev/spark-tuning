@@ -184,11 +184,17 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 
 [재처리 시 — 영수증 확인]
 ③ 조회한 row를 집기 전, row에서 읽어온 stat_desc 값(batch_id)으로 확인:
-   SELECT element_at(summary, 'batch_id') FROM db.TABLE_X.snapshots
-   → snapshot에 있음: 이미 커밋됨 → 재적재하지 않고 DONE으로 정정
-   → 없음:            진짜 미적재 → 정상 재적재
-   (조회한 batch_id를 한 번에 대조한다 — row 수만큼 질의가 늘지 않도록)
+   SELECT element_at(summary, 'batch_id')
+     FROM db.TABLE_X.snapshots
+    WHERE element_at(summary, 'batch_id') IN (:batch_ids)   -- 대조 대상만
+   → 결과에 있음: 이미 커밋됨 → 재적재하지 않고 DONE으로 정정
+   → 없음:        진짜 미적재 → 정상 재적재
 ```
+
+> batch_id를 **한 번에 대조한다** — 건별로 질의하면 조회 row 수만큼 질의가 늘어난다.
+> 반대로 `WHERE` 없이 snapshot 전체를 긁어오는 것도 안 된다. 보존 기간(3일) 안의
+> 모든 batch_id가 반환되며, 이는 대조에 필요한 양보다 훨씬 크다 (append 약 5분 주기
+> → 테이블당 수백~수천 snapshot). 넘긴 `batch_ids`의 부분집합만 받아야 한다.
 
 > **확인 대상은 status와 무관하게 batch_id를 가진 row 전부다.** `status`는 커밋
 > 여부의 증거가 아니다. Airflow가 실패로 판정해 FAILED가 된 경우뿐 아니라,
@@ -208,7 +214,7 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 |------|------|
 | Oracle 변경 | 없음 (기존 `stat_desc` CLOB 컬럼 재사용 — 과거 Airflow log URL 용도, 현재 미사용) |
 | Spark 변경 | write option 1줄 |
-| `.snapshots` 조회 부하 | 없음. snapshot 목록은 테이블 metadata.json 파일 1개에 포함 — S3 GET 1회, manifest/데이터 파일 접근 없음. 3일 보존 기준 테이블당 snapshot 수백 개 수준, 실행 빈도는 하루 1회(FAILED 존재 테이블만) |
+| `.snapshots` 조회 부하 | 없음. snapshot 목록은 테이블 metadata.json 파일 1개에 포함 — S3 GET 1회, manifest/데이터 파일 접근 없음. **테이블당 1회**(batch_id를 IN으로 묶어 대조), 실행 빈도는 하루 1회(batch_id를 가진 row가 있는 테이블만) |
 
 ### 4.4 제약: snapshot 보존 기간
 
