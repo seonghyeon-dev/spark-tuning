@@ -93,7 +93,7 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 >
 > **그저께까지 조회하는 이유(안전망)**: 재처리가 하룻밤 통째로 실패하거나 상한으로 이월이 생겨도, 다음날 실행이 그저께 범위로 자동 회수한다. 이틀 연속 실패부터 수동 영역이다.
 >
-> **방어선**: 설계상 겹침이 없더라도, IN_PROGRESS 전환 UPDATE는 `WHERE status = ...` 조건을 포함한 원자적 전환으로 수행한다 (만약의 이중 실행에서도 한쪽만 성공).
+> 겹침이 없다는 것이 이 설계의 유일한 경합 방지 수단이다. 상태 UPDATE에 이전 상태를 조건으로 거는 낙관적 잠금은 두지 않는다 (섹션 5.3-6).
 
 **잔류 데이터 회수 타임라인**:
 
@@ -295,12 +295,20 @@ SELECT * FROM (
 ```
    - 수동 실행 시: prepare_run이 검증한 `start_time`~`end_time` 범위의 WAIT+FAILED 전체
    - 조회 직후 **필터 적용 전 조회 건수로 잔여분 여부를 기록** (**어느 한 DB라도** 상한 1,000건을 채웠으면 그 DB에 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 영수증/크기 상한으로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
-3. **영수증 확인** — FAILED row에서 읽은 stat_desc(batch_id)별로 `.snapshots` 조회 → 이미 커밋된 batch의 row는 DONE 정정(원천 DB별) 후 대상에서 제외 (섹션 4)
+3. **영수증 확인** — FAILED row에서 읽은 stat_desc(batch_id)별로 `.snapshots` 조회 → 이미 커밋된 batch의 row는 DONE 정정(원천 DB별) 후 대상에서 제외 (섹션 4). 정정 대상은 **FAILED인 row만** — WAIT는 batch_id가 남아 있어도 적재된 적이 없다(수동 복구로 WAIT가 된 경우 등)
 4. **크기 상한 적용** — 병합된 전체 목록에서 앞(가장 오래된 것)부터 누적 16GB를 넘기 직전까지만 담는다. 잘린 뒤쪽은 상태를 건드리지 않고 이월 (loop 회차 또는 다음날 회수)
    - **담긴 게 0건인데 조회 결과나 잔여분 신호가 있으면 알림** — ① 선두 job 하나가 16GB 초과(매일 반복 skip될 데이터) ② 조회분이 전부 영수증 정정으로 소진(DB에 더 남았는데 meta가 없어 loop 신호 유실). 정상적인 빈 조회는 무음 skip
 5. **XCom(meta) 기록** — 복합키 목록(conn별 dict)·batch_id·잔여분 여부·적재 ts 범위를 **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, meta가 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. meta가 먼저 있으면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task의 `WHERE status='IN_PROGRESS'` 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
-6. **IN_PROGRESS 마킹** — 원천 DB별로 `WHERE k_1=:k_1 AND k_2=:k_2 AND k_3=:k_3 AND ts=:ts AND status IN ('WAIT','FAILED')` UPDATE를 **executemany**로 일괄 실행 + `stat_desc = 새 batch_id` 기록. IN 절에 placeholder를 건수만큼 펼치지 않는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고, IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며(ROW_LIMIT 상향 시에도 안전), 라운드트립이 1회다
-   - `status IN ('WAIT','FAILED')` 조건은 만약의 이중 실행에 대한 방어선이다. 반영 건수를 검증하지는 않는다 — 조회~UPDATE 사이에 상태를 바꿀 주체가 없기 때문(append는 조회 경계가 겹치지 않고, 재처리는 `max_active_runs=1`, 같은 run 내 테이블은 `table_name`으로 분리). 발생하지 않는 조건 때문에 하드 실패 경로를 만들면 오히려 정상 재처리가 막힐 위험만 생긴다
+6. **IN_PROGRESS 마킹** — 원천 DB별로 상태 UPDATE를 **executemany**로 일괄 실행 + `stat_desc = 새 batch_id` 기록. IN 절에 placeholder를 건수만큼 펼치지 않는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고, IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며(ROW_LIMIT 상향 시에도 안전), 라운드트립이 1회다
+
+```sql
+-- 상태 UPDATE는 이 SQL 하나뿐이다 (IN_PROGRESS 마킹 / DONE 정정 공용).
+-- set할 status와 batch_id만 바인딩이 다르다
+UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id
+ WHERE k_1 = :k_1 AND k_2 = :k_2 AND k_3 = :k_3 AND ts = :ts
+```
+   - **WHERE에 status 조건을 두지 않는다**: 복합키가 row를 유일하게 식별하므로 대상 특정에 불필요하다. 이전 상태를 조건으로 거는 낙관적 잠금도 의미가 없다 — 조회~UPDATE 사이에 상태를 바꿀 주체가 없고(append는 조회 경계가 겹치지 않고, 재처리는 `max_active_runs=1`, 같은 run 내 테이블은 `table_name`으로 분리), 반영 건수를 검증하지도 않으므로 조건이 걸리면 조용히 누락될 뿐이다
+   - DONE 정정(3번)은 `batch_id`를 넘기지 않아 row의 기존 `stat_desc`(영수증)를 그대로 유지한다
 7. **Spark 입력 준비** — `base_path` + `param`의 파일명을 결합한 경로 문자열 배열을 텍스트 파일로 만들어 S3 업로드(양쪽 DB 분을 합쳐 1개 파일). 크기 상한 판정과 num_executors 산정에 쓰는 파일 크기도 같은 `param` JSON에서 꺼낸다 (append DAG과 동일 산정식: `ceil(총크기/128MB × 1.5 / 4)`, 상한 24)
 
 ### 5.4 처리 상한
@@ -453,7 +461,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 |---|--------|----------|
 | 1 | ShortCircuit task는 `ignore_downstream_trigger_rules=False` 필수 — 기본값이면 첫 skip에서 뒤 테이블 그룹 전체가 skip됨 | 5.2 |
 | 2 | 조회 결과는 `{conn_id: rows}` dict로 보관 (row 태깅·재그룹핑 없음). 크기 상한 적용 시에만 `(row, conn_id)`로 펼쳐 `ts` 정렬 | 5.3 |
-| 2-1 | 상태 UPDATE는 XCom의 `keys`(conn별 복합키 목록)로만, **원천 DB에 각각** executemany 실행(복합키 AND 조건 고정 SQL — parse 재사용, ORA-01795 회피). `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 / 5.2 |
+| 2-1 | 상태 UPDATE는 XCom의 `keys`(conn별 복합키 목록)로만, **원천 DB에 각각** executemany 실행. SQL은 **1개**(status·batch_id만 바인딩이 다름), WHERE는 복합키 AND 조건만 — status 조건 없음. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 / 5.2 |
 | 3 | 잔여분 판정은 필터 적용 전 조회 건수(ROW_LIMIT 도달) + 크기 상한 이월 기준 | 5.3 |
 | 4 | XCom(meta) 기록 → IN_PROGRESS 마킹 → S3 업로드 순서 (마킹 중간 실패 시 좀비 방지) | 5.3 |
 | 5 | loop 재trigger 조건 = 잔여분(상한 초과 이월) 있는 테이블 존재. 지속 실패는 MAX_LOOP(10회) 상한으로 유한 종료. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |
