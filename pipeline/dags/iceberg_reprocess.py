@@ -179,11 +179,12 @@ def parse_param(param) -> tuple[str, float]:
 
 # --- 기존 구현 연결 스텁 ------------------------------------------------------
 
-def snapshot_exists(table_name: str, batch_id: str) -> bool:
-    """영수증 확인 (설계 4.2): 테이블 snapshot summary에 batch_id 존재 여부.
+def committed_batch_ids(table_name: str, batch_ids: set[str]) -> set[str]:
+    """영수증 확인 (설계 4.2): batch_ids 중 테이블 snapshot에 실제로 있는 것만 반환.
+
+    batch당 1회가 아니라 한 번에 조회한다 — 조회 row 수만큼 질의가 늘지 않는다.
     TODO(연결): 기존 Trino/Spark 조회 경로 재사용.
-      SELECT 1 FROM <catalog>.<db>.<table>.snapshots
-       WHERE element_at(summary, 'batch_id') = :batch_id
+      SELECT element_at(summary, 'batch_id') FROM <catalog>.<db>.<table>.snapshots
     """
     raise NotImplementedError
 
@@ -224,18 +225,17 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     # 잔여분 신호는 반드시 필터 적용 "전"에 기록한다 (필터 후 건수로 보면 놓침)
     fetched_full = any(len(rows) >= ROW_LIMIT for rows in jobs_by_conn.values())
 
-    # 영수증 확인 (설계 4): Airflow가 실패로 판정했어도 커밋은 성공했을 수 있다.
-    # batch_id를 set으로 모아 batch당 snapshot 조회 1회로 확인하고,
-    # 이미 커밋된 건은 DONE 정정 후 대상에서 제외한다.
-    failed_batches = {r["stat_desc"] for rows in jobs_by_conn.values() for r in rows
-                      if r["status"] == "FAILED" and r["stat_desc"]}
-    committed = {b for b in failed_batches if snapshot_exists(table_name, b)}
+    # 영수증 확인 (설계 4): status는 커밋 여부의 증거가 아니다. Airflow가 실패로
+    # 판정했든(FAILED), 커밋 후 상태 갱신이 실패했든(WAIT로 잔류) Spark 커밋은
+    # 성공했을 수 있다. batch_id가 snapshot에 있으면 그 데이터는 이미 Iceberg에
+    # 있으므로 재적재하면 중복이다 → status와 무관하게 DONE 정정 후 대상에서 뺀다.
+    batch_ids = {r["stat_desc"] for rows in jobs_by_conn.values() for r in rows
+                 if r["stat_desc"]}
+    committed = committed_batch_ids(table_name, batch_ids) if batch_ids else set()
     if committed:
         for conn_id, rows in jobs_by_conn.items():
-            # WAIT는 batch_id가 남아 있어도 적재된 적이 없으므로 정정 대상이 아니다
-            done = [r for r in rows
-                    if r["status"] == "FAILED" and r["stat_desc"] in committed]
-            update_jobs(conn_id, done, "DONE")
+            done = [r for r in rows if r["stat_desc"] in committed]
+            update_jobs(conn_id, done, "DONE")   # batch_id 미지정 → 영수증 보존
             jobs_by_conn[conn_id] = [r for r in rows if r not in done]
 
     # 크기 상한 (설계 5.4): DB별 결과를 합쳐 오래된 것부터 담고, 잘린 뒤쪽은

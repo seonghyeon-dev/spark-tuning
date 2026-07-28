@@ -183,12 +183,18 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
    → commit 성공 시 해당 테이블 snapshot summary에 batch_id가 남음
 
 [재처리 시 — 영수증 확인]
-③ FAILED row를 집기 전, row에서 읽어온 stat_desc 값(batch_id)으로 확인:
-   SELECT snapshot_id FROM db.TABLE_X.snapshots
-    WHERE summary['batch_id'] = :batch_id
-   → 결과 있음: 이미 커밋됨 → 재적재하지 않고 DONE으로 정정
-   → 결과 없음: 진짜 실패 → 정상 재적재
+③ 조회한 row를 집기 전, row에서 읽어온 stat_desc 값(batch_id)으로 확인:
+   SELECT element_at(summary, 'batch_id') FROM db.TABLE_X.snapshots
+   → snapshot에 있음: 이미 커밋됨 → 재적재하지 않고 DONE으로 정정
+   → 없음:            진짜 미적재 → 정상 재적재
+   (조회한 batch_id를 한 번에 대조한다 — row 수만큼 질의가 늘지 않도록)
 ```
+
+> **확인 대상은 status와 무관하게 batch_id를 가진 row 전부다.** `status`는 커밋
+> 여부의 증거가 아니다. Airflow가 실패로 판정해 FAILED가 된 경우뿐 아니라,
+> **Spark 커밋은 성공했는데 그 뒤 상태 갱신이 실패해 row가 WAIT로 남는 경우**도
+> 있다. 판단 기준은 오직 영수증이며, snapshot에 batch_id가 있으면 status가
+> 무엇이든 그 데이터는 이미 Iceberg에 있다 — 재적재하면 중복이다.
 
 > **stat_desc 사용 제약 (중요)**: stat_desc는 CLOB이므로 **Oracle WHERE 조건으로 사용하는 것은 금지**한다 (등호 비교·인덱스 불가). 허용되는 사용은 두 가지뿐이다 — ① UPDATE 시 값 기록 ② SELECT 결과에서 개별 row의 값 읽기. 읽을 때는 **`DBMS_LOB.SUBSTR(stat_desc, 4000, 1)`로 VARCHAR2 변환해서 조회**해야 한다 — 그냥 조회하면 드라이버가 LOB 객체를 돌려주어 문자열 비교·set 연산이 되지 않고 영수증 확인이 오작동한다. 영수증 확인은 "row에서 batch_id를 읽어 → Iceberg `.snapshots`를 조회"하는 방향이므로 이 제약에 걸리지 않는다.
 >
@@ -296,7 +302,7 @@ SELECT * FROM (
 ```
    - 수동 실행 시: prepare_run이 검증한 `start_time`~`end_time` 범위의 WAIT+FAILED 전체
    - 조회 직후 **필터 적용 전 조회 건수로 잔여분 여부를 기록** (**어느 한 DB라도** 상한 1,000건을 채웠으면 그 DB에 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 영수증/크기 상한으로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
-3. **영수증 확인** — FAILED row에서 읽은 stat_desc(batch_id)별로 `.snapshots` 조회 → 이미 커밋된 batch의 row는 DONE 정정(원천 DB별) 후 대상에서 제외 (섹션 4). 정정 대상은 **FAILED인 row만** — WAIT는 batch_id가 남아 있어도 적재된 적이 없다(수동 복구로 WAIT가 된 경우 등)
+3. **영수증 확인** — 조회 row에서 읽은 stat_desc(batch_id)를 모아 `.snapshots`와 한 번에 대조 → 커밋이 확인된 batch의 row는 DONE 정정(원천 DB별) 후 대상에서 제외 (섹션 4). **status로 거르지 않는다** — WAIT라도 커밋 후 상태 갱신만 실패한 것일 수 있고, 그 경우 재적재하면 중복이다
 4. **크기 상한 적용** — 병합된 전체 목록에서 앞(가장 오래된 것)부터 누적 16GB를 넘기 직전까지만 담는다. 잘린 뒤쪽은 상태를 건드리지 않고 이월 (loop 회차 또는 다음날 회수)
    - **담긴 게 0건인데 조회 결과나 잔여분 신호가 있으면 알림** — ① 선두 job 하나가 16GB 초과(매일 반복 skip될 데이터) ② 조회분이 전부 영수증 정정으로 소진(DB에 더 남았는데 meta가 없어 loop 신호 유실). 정상적인 빈 조회는 무음 skip
 5. **XCom(meta) 기록** — 복합키 목록(conn별 dict)·batch_id·잔여분 여부·적재 ts 범위를 **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, meta가 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. meta가 먼저 있으면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task의 `WHERE status='IN_PROGRESS'` 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
