@@ -63,11 +63,6 @@ class DailyIcebergTable(str, Enum):
 ALL_TABLES = [*HourlyIcebergTable, *DailyIcebergTable]
 
 
-def compaction_group(table) -> str:
-    """Compaction 그룹: 소속 Enum 클래스가 곧 분류다."""
-    return "hourly" if isinstance(table, HourlyIcebergTable) else "daily"
-
-
 # --- 시간 유틸 --------------------------------------------------------------
 
 def ts_str(dt: pendulum.DateTime) -> str:
@@ -76,7 +71,11 @@ def ts_str(dt: pendulum.DateTime) -> str:
 
 
 def param_to_ts(value: str) -> str:
-    """date-time param → ts 문자열. offset이 와도 KST로 통일."""
+    """date-time param → ts 문자열.
+
+    `tz=KST`는 offset 없는 문자열에만 적용되므로 `in_timezone`이 반드시 필요하다.
+    빼면 '2026-07-01T15:00:00Z'가 KST 00:00이 아닌 15:00으로 읽혀 경계가 어긋난다.
+    """
     return ts_str(pendulum.parse(value, tz=KST).in_timezone(KST))
 
 
@@ -97,25 +96,17 @@ def dates_between(ts_min: str, ts_max: str) -> list[str]:
 
 # --- Oracle -----------------------------------------------------------------
 
-# 복합키 4개 (ts도 그중 하나 — 조회 범위·정렬·Compaction 범위에도 사용)
-# TODO(연결): 실제 복합키 컬럼명으로 교체
+# 복합키 4개 (ts도 그중 하나 — 조회 범위·정렬·Compaction 범위에도 사용).
+# TODO(연결): 실제 컬럼명으로 교체 — 아래 SQL 3개의 컬럼명도 함께 고칠 것
 KEY_COLUMNS = ("k_1", "k_2", "k_3", "ts")
 
-JOB_COLUMNS = (*KEY_COLUMNS, "base_path", "param", "status", "stat_desc")
-
-# stat_desc(CLOB)는 그냥 조회하면 LOB 객체로 와 문자열 비교·set 연산이 안 되므로
-# VARCHAR2로 변환해서 받는다 (batch_id는 짧아 4000바이트로 충분)
-JOB_SELECT_EXPRS = (
-    *KEY_COLUMNS,
-    "base_path",
-    "param",
-    "status",
-    "DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc",
-)
-
-SELECT_TARGETS_SQL = f"""
+# stat_desc(CLOB)를 그냥 조회하면 LOB 객체로 와 문자열 비교·set 연산이 안 되므로
+# VARCHAR2로 변환해 받는다 (batch_id는 짧아 4000바이트로 충분).
+# 컬럼명이 곧 row의 키가 되므로 변환 컬럼에는 `AS stat_desc` 별칭이 반드시 필요하다.
+SELECT_TARGETS_SQL = """
 SELECT * FROM (
-    SELECT {", ".join(JOB_SELECT_EXPRS)}
+    SELECT k_1, k_2, k_3, ts, base_path, param, status,
+           DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc
       FROM JOB_HISTORY
      WHERE table_name = :tbl
        AND ts >= :ts_from AND ts < :ts_to
@@ -125,69 +116,54 @@ SELECT * FROM (
 ) WHERE ROWNUM <= :row_limit
 """
 
-# 복합키 전체를 AND로 묶은 조건 (executemany 바인딩용 — 건수와 무관하게 고정 SQL)
-KEY_WHERE = " AND ".join(f"{k} = :{k}" for k in KEY_COLUMNS)
+# 복합키가 row를 유일하게 식별하므로 WHERE에 status 조건은 두지 않는다.
+UPDATE_STATUS_SQL = """
+UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id
+ WHERE k_1 = :k_1 AND k_2 = :k_2 AND k_3 = :k_3 AND ts = :ts
+"""
 
 # TODO(연결): ① 갱신 시각 컬럼명 확인(updated_at 가정) ② ts 범위 조건이 없어
 #             파티션 전체 스캔 — status 인덱스 유무 확인 필요
-ZOMBIE_COLUMNS = ("table_name", *KEY_COLUMNS, "updated_at")
-
-ZOMBIE_SQL = f"""
-SELECT {", ".join(ZOMBIE_COLUMNS)}
+ZOMBIE_SQL = """
+SELECT table_name, k_1, k_2, k_3, ts, updated_at
   FROM JOB_HISTORY
  WHERE status = 'IN_PROGRESS'
    AND updated_at < SYSTIMESTAMP - NUMTODSINTERVAL(:h, 'HOUR')
 """
 
 
-def _rows(conn_id: str, sql: str, binds: dict, columns: tuple[str, ...]) -> list[dict]:
-    """OracleHook.get_records → 컬럼명 dict 매핑. columns는 SELECT 순서와 일치해야 한다."""
-    records = OracleHook(oracle_conn_id=conn_id).get_records(sql, parameters=binds)
-    return [dict(zip(columns, r)) for r in records]
+def select_rows(conn_id: str, sql: str, binds: dict) -> list[dict]:
+    """조회 결과를 컬럼명 dict로 매핑.
+
+    컬럼명은 커서에서 그대로 받는다 — SELECT와 컬럼 목록을 따로 맞출 필요가 없다
+    (Oracle이 대문자로 주므로 소문자로 통일).
+    """
+    with OracleHook(oracle_conn_id=conn_id).get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, binds)
+        columns = [d[0].lower() for d in cur.description]
+        return [dict(zip(columns, row)) for row in cur]
 
 
-def _execute_many(conn_id: str, sql: str, rows: list[dict]) -> None:
-    """고정 SQL + 바인딩 배열로 일괄 실행.
+def update_jobs(conn_id: str, rows: list[dict], status: str,
+                batch_id: str | None = None) -> None:
+    """rows의 복합키로 status를 일괄 UPDATE — rows의 원천 DB를 conn_id로 지정한다.
 
-    동적 IN 절 대신 executemany를 쓰는 이유: SQL이 고정이라 parse 재사용이 되고,
-    IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않는다.
-    OracleHook.run()은 executemany를 노출하지 않아 커서를 직접 쓰고 commit도 명시한다.
+    batch_id를 주면 영수증으로 stat_desc에 기록하고, 없으면 row의 기존 값을 유지한다.
+    executemany를 쓰는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고,
+    IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며, 라운드트립이 1회다.
+    OracleHook.run()이 executemany를 노출하지 않아 커서를 직접 쓰고 commit도 명시한다.
     """
     if not rows:
         return
-    hook = OracleHook(oracle_conn_id=conn_id)
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.executemany(sql, rows)
+    binds = []
+    for row in rows:
+        bind = {k: row[k] for k in KEY_COLUMNS}
+        bind["status"] = status
+        bind["batch_id"] = batch_id or row["stat_desc"]
+        binds.append(bind)
+    with OracleHook(oracle_conn_id=conn_id).get_conn() as conn, conn.cursor() as cur:
+        cur.executemany(UPDATE_STATUS_SQL, binds)
         conn.commit()
-
-
-MARK_DONE_SQL = f"""
-UPDATE JOB_HISTORY SET status = 'DONE'
- WHERE {KEY_WHERE} AND status = 'FAILED'
-"""
-
-CLAIM_SQL = f"""
-UPDATE JOB_HISTORY SET status = 'IN_PROGRESS', stat_desc = :batch_id
- WHERE {KEY_WHERE} AND status IN ('WAIT', 'FAILED')
-"""
-
-
-def key_of(row: dict) -> dict:
-    """row에서 복합키만 뽑아낸다 — UPDATE 바인딩과 XCom 전달에 그대로 쓴다."""
-    return {k: row[k] for k in KEY_COLUMNS}
-
-
-def _mark_done(conn_id: str, keys: list[dict]) -> None:
-    """영수증으로 커밋이 확인된 FAILED row를 DONE으로 정정 (설계 4.2)."""
-    _execute_many(conn_id, MARK_DONE_SQL, keys)
-
-
-def _claim_jobs(conn_id: str, keys: list[dict], batch_id: str) -> None:
-    """IN_PROGRESS 전환 + batch_id(영수증) 기록 (설계 5.3).
-
-    CLAIM_SQL의 status 조건은 만약의 이중 실행 방어선 (설계상 발생하지 않음).
-    """
-    _execute_many(conn_id, CLAIM_SQL, [{"batch_id": batch_id, **k} for k in keys])
 
 
 def parse_param(param) -> tuple[str, float]:
@@ -241,15 +217,10 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     # 조회는 DB별로 실행하고 결과도 conn_id를 키로 보관한다 — 상태 UPDATE가
     # 이 키로 원천 DB를 찾아가므로 row 태깅·재그룹핑이 필요 없다
     # (복합키 값은 DB 간 유일 보장 없음). ROW_LIMIT은 DB당 적용.
-    jobs_by_conn = {
-        conn_id: _rows(
-            conn_id, SELECT_TARGETS_SQL,
-            {"tbl": table_name, "ts_from": cfg["ts_from"], "ts_to": cfg["ts_to"],
-             "wait_bound": cfg["wait_bound"], "row_limit": ROW_LIMIT},
-            JOB_COLUMNS,
-        )
-        for conn_id in ORACLE_CONN_IDS
-    }
+    binds = {"tbl": table_name, "row_limit": ROW_LIMIT, "ts_from": cfg["ts_from"],
+             "ts_to": cfg["ts_to"], "wait_bound": cfg["wait_bound"]}
+    jobs_by_conn = {conn_id: select_rows(conn_id, SELECT_TARGETS_SQL, binds)
+                    for conn_id in ORACLE_CONN_IDS}
     # 잔여분 신호는 반드시 필터 적용 "전"에 기록한다 (필터 후 건수로 보면 놓침)
     fetched_full = any(len(rows) >= ROW_LIMIT for rows in jobs_by_conn.values())
 
@@ -261,23 +232,21 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     committed = {b for b in failed_batches if snapshot_exists(table_name, b)}
     if committed:
         for conn_id, rows in jobs_by_conn.items():
-            _mark_done(conn_id, [key_of(r) for r in rows
-                                 if r["stat_desc"] in committed])
-        jobs_by_conn = {
-            conn_id: [r for r in rows if r["stat_desc"] not in committed]
-            for conn_id, rows in jobs_by_conn.items()
-        }
+            # WAIT는 batch_id가 남아 있어도 적재된 적이 없으므로 정정 대상이 아니다
+            done = [r for r in rows
+                    if r["status"] == "FAILED" and r["stat_desc"] in committed]
+            update_jobs(conn_id, done, "DONE")
+            jobs_by_conn[conn_id] = [r for r in rows if r not in done]
 
-    # 크기 상한 (설계 5.4): DB별 결과를 전체 ts 오름차순으로 합쳐 오래된 것부터
-    # 담고, 잘린 뒤쪽은 상태를 건드리지 않고 이월한다 (loop 회차/다음날 회수).
-    # DB마다 정렬돼 있어도 합치면 순서가 깨지므로 여기서 한 번 정렬한다.
-    candidates = sorted(
-        ((r, conn_id) for conn_id, rows in jobs_by_conn.items() for r in rows),
-        key=lambda pair: pair[0]["ts"],
-    )
+    # 크기 상한 (설계 5.4): DB별 결과를 합쳐 오래된 것부터 담고, 잘린 뒤쪽은
+    # 상태를 건드리지 않고 이월한다 (loop 회차/다음날 회수).
+    # row에 conn_id를 짝지어 다니는 이유는 상태 UPDATE가 원천 DB로 나가야 해서다.
+    candidates = [(row, conn_id)
+                  for conn_id, rows in jobs_by_conn.items() for row in rows]
+    candidates.sort(key=lambda pair: pair[0]["ts"])  # DB별로 정렬돼 있어도 합치면 깨진다
     picked_ts = []                            # Compaction 범위 산출용
     picked_paths = []                         # base_path+파일명 (S3 목록)
-    picked_keys: dict[str, list[dict]] = {}   # {conn_id: [복합키, ...]} — 상태 UPDATE용
+    picked_by_conn: dict[str, list[dict]] = {}   # 상태 UPDATE는 원천 DB별로 나가야 한다
     total_mb = 0.0                            # NUMBER는 Decimal이라 float으로 누적
     for row, conn_id in candidates:
         file_name, size_mb = parse_param(row["param"])
@@ -285,7 +254,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
             break
         picked_ts.append(row["ts"])
         picked_paths.append(f"{row['base_path'].rstrip('/')}/{file_name}")
-        picked_keys.setdefault(conn_id, []).append(key_of(row))
+        picked_by_conn.setdefault(conn_id, []).append(row)
         total_mb += size_mb
 
     if not picked_paths:
@@ -311,17 +280,19 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
     # TODO(연결): meta 필드명을 append get_jobs 스키마와 일치시킬 것
     ti.xcom_push(key="meta", value={
         "table": table_name,
-        "group": compaction_group(table),
+        "group": "hourly" if isinstance(table, HourlyIcebergTable) else "daily",
         "batch_id": batch_id,
-        "keys": picked_keys,               # {conn_id: [복합키 dict, ...]} — 원천 DB별
+        # 하류 update task가 쓸 복합키만 conn_id별로 (row 전체는 XCom에 넣지 않는다)
+        "keys": {conn_id: [{k: r[k] for k in KEY_COLUMNS} for r in rows]
+                 for conn_id, rows in picked_by_conn.items()},
         "leftover": leftover,
         "ts_min": picked_ts[0], "ts_max": picked_ts[-1],
         # append DAG과 동일 산정식: ceil(총크기/128MB × 1.5 / executor-cores 4)
         "num_executors": min(max(math.ceil(total_mb / 128 * 1.5 / 4), 1), MAX_EXECUTORS),
     })
 
-    for conn_id, keys in picked_keys.items():  # 마킹은 원천 DB별로
-        _claim_jobs(conn_id, keys, batch_id)
+    for conn_id, rows in picked_by_conn.items():
+        update_jobs(conn_id, rows, "IN_PROGRESS", batch_id)
 
     upload_path_list_to_s3(table_name, picked_paths, batch_id)
     return True
@@ -330,7 +301,7 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> bool:
 # TODO(연결): 기존 ConvertFileTaskGroup에 reprocess_cfg 인자와 조회 분기를 추가한다.
 #             변경 예시: pipeline/examples/convert_file_taskgroup_example.py
 #             마킹을 부모 _update_jobs로 대체할지는 시그니처 확인 후 결정
-#             (대체 시 이 파일의 _mark_done/_claim_jobs 제거)
+#             (대체 시 이 파일의 update_jobs 제거)
 
 
 def collect_metas(ti) -> list[dict]:
@@ -338,12 +309,9 @@ def collect_metas(ti) -> list[dict]:
 
     Airflow 3 worker는 메타데이터 DB 접근이 불가하므로 task 상태 조회 대신 XCom만 쓴다.
     """
-    metas = []
-    for t in ALL_TABLES:
-        meta = ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.get_jobs", key="meta")
-        if meta:
-            metas.append(meta)
-    return metas
+    metas = [ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.get_jobs", key="meta")
+             for t in ALL_TABLES]
+    return [m for m in metas if m]   # 조회 0건이라 skip된 테이블은 meta가 없다
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +348,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         알림에 그대로 넘긴다 (수동 정정 시 대상 DB 식별용).
         """
         zombies_by_conn = {
-            conn_id: _rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS}, ZOMBIE_COLUMNS)
+            conn_id: select_rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS})
             for conn_id in ORACLE_CONN_IDS
         }
         total = sum(len(rows) for rows in zombies_by_conn.values())
@@ -393,15 +361,9 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         """params 검증·정규화 1회 (append DAG의 get_time 패턴). 이후 task는 XCom만 소비."""
         conf = dag_run.conf or {}
 
-        # loop 재trigger 회차: 첫 회차가 확정한 값을 그대로 승계 (설계 5.5)
+        # loop 재trigger 회차: conf가 곧 직전 회차의 반환값이므로 그대로 승계 (설계 5.5)
         if conf.get("ts_from"):
-            return {
-                "tables": conf["tables"],
-                "ts_from": conf["ts_from"],
-                "ts_to": conf["ts_to"],
-                "wait_bound": conf["wait_bound"],
-                "loop_count": int(conf.get("loop_count", 0)),
-            }
+            return {**conf, "loop_count": int(conf.get("loop_count", 0))}
 
         base = pendulum.now(KST).start_of("day")  # 오늘 00:00 (오늘=4일 01:00 실행이면 4일 00:00)
         st, et = params.get("start_time"), params.get("end_time")
@@ -501,9 +463,9 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     chain(run_cfg, *groups)
     tail = groups[-1] if groups else run_cfg  # 빈 Enum 상태에서도 파싱 가능
 
-    comp, nxt = compaction_targets(), next_loop(run_cfg)
-    tail >> comp
-    tail >> nxt
+    comp = compaction_targets()
+    nxt = next_loop(run_cfg)
+    tail >> [comp, nxt]
     # trigger 건수가 가변이라 dynamic task mapping.
     # TriggerDagRunOperator는 wait_for_completion 기본 False (설계 6.3)
     TriggerDagRunOperator.partial(task_id="trigger_compaction").expand_kwargs(comp)
