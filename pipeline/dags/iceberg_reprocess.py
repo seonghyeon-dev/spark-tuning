@@ -306,7 +306,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         {"table": t.get_name(),
          "group": "hourly" if isinstance(t, HourlyIcebergTable) else "daily",
          "task_id": f"{g.group_id}.get_jobs"}
-        for t, g in zip(ALL_TABLES, groups)
+        for t, g in zip(ALL_TABLES, groups, strict=True)
     ]
 
     comp = compaction_targets(table_tasks)
