@@ -20,19 +20,16 @@ DAG 구조
       ├─ compaction_targets → trigger_compaction   # 적재 범위만 Compaction
       └─ next_loop          → retrigger_self       # 남았으면 한 번 더
 
-파일 구성 — import 방향이 한쪽이다
-  이 파일(DAG)              조회 범위 계산, 테이블 그룹 배치, Compaction 연계,
-                            loop 판단, 좀비 탐지
-      │ import
-      ▼
-  ConvertFileTaskGroup(기존) 재처리 조회 task 생성, 상태 UPDATE(_update_jobs),
-                            파일 목록 → S3 + executor 산정, Spark 실행
-      │ import
-      ▼
-  reprocess_jobs.py         재처리 대상 조회·영수증 확인 (부모가 호출한다)
+역할 분담
+  이 파일(DAG)               조회 범위 계산, 테이블 그룹 배치, Compaction 연계,
+                             loop 판단, 좀비 탐지
+  ConvertFileTaskGroup(기존)  재처리 조회 task, 상태 UPDATE, 파일 목록 처리,
+                             Spark 실행 — **기존 파일을 고쳐서 쓴다**
 
-  조회 로직을 DAG 파일에 두면 공통 모듈이 DAG을 import해야 해서 성립하지 않는다.
-  연결 방법: pipeline/examples/convert_file_taskgroup_example.py
+  재처리 조회 task는 부모 __init__ 안에서 만들어진다(지역 함수 _update_jobs 등을
+  써야 하므로). 그래서 조회 로직도 부모 파일에 둔다 — 이 DAG 파일에 두면
+  공통 모듈이 DAG을 import해야 해서 성립하지 않는다.
+  부모 변경 내용 전체: pipeline/examples/convert_file_taskgroup_example.py
 
 기존 구현과 연결할 지점은 `TODO(연결)` 주석으로 표시했다.
 """
@@ -41,16 +38,17 @@ from enum import Enum
 from pathlib import Path
 
 import pendulum
+from airflow.providers.oracle.hooks.oracle import OracleHook
 from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sdk import Param, chain, dag, task
 
 # TODO(연결): 기존 append DAG 공통 모듈에서 import
 # from <공통 모듈>.taskgroups import ConvertFileTaskGroup
 # from <공통 모듈>.iceberg import HourlyIcebergTable, DailyIcebergTable
-#
-# 좀비 조회에 쓰는 Oracle 접근은 재처리 조회 모듈과 같은 것을 쓴다.
-# TODO(연결): reprocess_jobs.py를 옮긴 실제 경로로 교체
-from pipeline.reprocess_jobs import ORACLE_CONN_IDS, select_rows  # noqa: F401
+
+# Job History가 Oracle DB 2개에 동일 스키마로 있어 좀비 조회도 DB별로 반복한다.
+# TODO(연결): append DAG이 쓰는 conn_list와 동일 소스 사용
+ORACLE_CONN_IDS = ["oracle_a", "oracle_b"]
 
 KST = pendulum.timezone("Asia/Seoul")
 DAG_ID = Path(__file__).stem  # 조직 컨벤션: dag_id는 파일명에서 파생 (단일 소스)
@@ -180,9 +178,12 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
 
         독립 실행이라 알림 실패가 본류를 막지 않는다. conn_id를 키로 담아
         알림에 그대로 넘긴다 (수동 정정 시 대상 DB 식별용).
+        row는 ZOMBIE_SQL의 SELECT 순서 그대로인 tuple이다 — 알림에 실어 보낼 뿐
+        개별 컬럼을 꺼내 쓰지 않으므로 dict로 만들지 않는다.
         """
         zombies_by_conn = {
-            conn_id: select_rows(conn_id, ZOMBIE_SQL, {"h": ZOMBIE_HOURS})
+            conn_id: OracleHook(oracle_conn_id=conn_id).get_records(
+                ZOMBIE_SQL, parameters={"h": ZOMBIE_HOURS})
             for conn_id in ORACLE_CONN_IDS
         }
         total = sum(len(rows) for rows in zombies_by_conn.values())
