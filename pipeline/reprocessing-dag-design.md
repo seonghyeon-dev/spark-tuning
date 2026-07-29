@@ -93,7 +93,7 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 >
 > **그저께까지 조회하는 이유(안전망)**: 재처리가 하룻밤 통째로 실패하거나 조회 상한으로 이월이 생겨도, 다음날 실행이 그저께 범위로 자동 회수한다. 이틀 연속 실패부터 수동 영역이다.
 >
-> 겹침이 없다는 것이 이 설계의 유일한 경합 방지 수단이다. 상태 UPDATE에 이전 상태를 조건으로 거는 낙관적 잠금은 두지 않는다 (섹션 5.3-6).
+> 겹침이 없다는 것이 이 설계의 유일한 경합 방지 수단이다. 선점·잠금 로직은 두지 않는다.
 
 **잔류 데이터 회수 타임라인**:
 
@@ -279,7 +279,7 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
 - **상태 update의 대상 식별은 XCom의 복합키 목록으로만**: `stat_desc`(batch_id)는 CLOB이라 WHERE 조건 사용 금지 (섹션 4.2 제약). update_success/update_failure는 get_jobs가 XCom(`meta.keys`)에 남긴 복합키 목록으로 UPDATE한다
-- **모든 상태 UPDATE는 row의 원천 DB로, 복합키 4개 AND 조건으로 수행한다**: Job History의 키는 복합키 4개이고 그 값은 DB 간 유일 보장이 없으므로, 조회 결과를 담은 `{conn_id: rows}` 구조를 그대로 사용해 각 DB에 UPDATE한다. `meta.keys`는 **`{conn_id: [복합키 dict, ...]}` 형태**이며, update task도 conn별 loop + 복합키 조건으로 처리한다
+- **모든 상태 UPDATE는 row의 원천 DB로 나간다**: 복합키 값은 DB 간 유일 보장이 없으므로 어느 DB에서 온 row인지가 UPDATE 대상을 결정한다. 조회 결과를 담은 `{conn_id: rows}` 구조를 그대로 이어받아 `meta.keys`를 **`{conn_id: [복합키 값 tuple, ...]}`** 형태로 만들고, update task는 conn별 loop로 부모 `_update_jobs`를 호출한다
 - **params는 prepare_run에서만 읽는다**: 기존 append DAG의 get_time 패턴과 동일. 검증·형식 변환(`ts` 경계 계산, 수동 범위 검증, date-time → ts 문자열 변환)을 첫 task에서 1회 수행하고, 이후 task들은 정규화된 XCom 값만 소비한다. 잘못된 입력은 파이프라인 중간이 아닌 첫 task에서 즉시 실패하고, TaskGroup 템플릿이 DAG params에 결합되지 않아 재사용이 가능해진다
 
 ### 5.3 get_jobs(재처리 조회) 처리 순서 (테이블별)
@@ -326,22 +326,16 @@ SELECT * FROM (
 
 | key | 내용 | 소비자 |
 |-----|------|--------|
-| `meta` | `batch_id`, `keys`(conn별 복합키 목록) | **부모** update_success / update_failure — 형식은 append get_jobs와 맞춘다 |
+| `meta` | `batch_id`, `keys`, `done_keys` — keys는 **`{conn_id: [복합키 값 tuple]}`** | **부모** update_success / update_failure |
 | `reprocess` | `ts_min`, `ts_max`, `has_more` | **재처리 DAG** compaction_targets / next_loop |
+| `num_executors` | 파일 목록 함수가 산정해 반환한 값 | **Spark operator** (pull) |
 
    - `ts_min`/`ts_max`는 **이번에 적재한 데이터의 시간 범위**다. 이 범위만 Compaction하도록 기존 Compaction DAG에 넘긴다 (섹션 6.3)
    - `has_more`는 **상한에 걸려 못 담은 대상이 남았는지** 여부다. 남았으면 DAG을 한 번 더 trigger한다 (5.5)
    - 테이블명·Compaction 그룹은 XCom에 넣지 않는다 — 수집 측이 Enum을 순회하므로 그 자리에서 붙이면 된다
-6. **IN_PROGRESS 마킹** — 원천 DB별로 상태 UPDATE를 **executemany**로 일괄 실행 + `stat_desc = 새 batch_id` 기록. IN 절에 placeholder를 건수만큼 펼치지 않는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고, IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며(ROW_LIMIT 상향 시에도 안전), 라운드트립이 1회다
+   - `keys`는 **복합키 값 tuple**로 올린다. row마다 컬럼명을 풀어 담으면 같은 이름 4개가 건수만큼 반복돼 XCom만 커진다
+6. **IN_PROGRESS 마킹 — 기존 함수에 위임** — 상태 UPDATE는 ConvertFileTaskGroup의 `_update_jobs`가 이미 수행한다. 재처리는 `{conn_id: [복합키 tuple]}`과 `batch_id`를 만들어 넘길 뿐, UPDATE 문을 따로 갖지 않는다 (영수증 정정도 같은 함수 사용)
 
-```sql
--- 상태 UPDATE는 이 SQL 하나뿐이다 (IN_PROGRESS 마킹 / DONE 정정 공용).
--- set할 status와 batch_id만 바인딩이 다르다
-UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id
- WHERE k_1 = :k_1 AND k_2 = :k_2 AND k_3 = :k_3 AND ts = :ts
-```
-   - **WHERE에 status 조건을 두지 않는다**: 복합키가 row를 유일하게 식별하므로 대상 특정에 불필요하다. 이전 상태를 조건으로 거는 낙관적 잠금도 의미가 없다 — 조회~UPDATE 사이에 상태를 바꿀 주체가 없고(append는 조회 경계가 겹치지 않고, 재처리는 `max_active_runs=1`, 같은 run 내 테이블은 `table_name`으로 분리), 반영 건수를 검증하지도 않으므로 조건이 걸리면 조용히 누락될 뿐이다
-   - DONE 정정(3번)은 `batch_id`를 넘기지 않아 row의 기존 `stat_desc`(영수증)를 그대로 유지한다
 7. **Spark 입력 준비 — 기존 함수에 위임** — 재처리 조회 로직은 담기로 한 파일 목록을 반환하는 데서 끝난다. avro 경로 텍스트 파일 S3 업로드와 size 총합 XCom push(Spark operator가 pull)는 **ConvertFileTaskGroup에 이미 있는 함수가 그대로 수행**하므로 재구현하지 않는다
 
 > **`param` 구조**: `{"files": [{"file_path": ..., "size": ...}, ...]}` — **row 1건에 파일이 여러 개**일 수 있다. 재처리가 이 목록을 가공 없이 모아 부모 함수에 넘기므로, 경로 조합 규칙·size 단위 해석이 append와 자동으로 일치한다. 재처리는 이 목록의 내용을 들여다보지 않는다 — `size`도 부모 함수가 합산한다.
@@ -494,7 +488,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 |---|--------|----------|
 | 1 | ShortCircuit task는 `ignore_downstream_trigger_rules=False` 필수 — 기본값이면 첫 skip에서 뒤 테이블 그룹 전체가 skip됨 | 5.2 |
 | 2 | 조회 결과는 `{conn_id: rows}` dict로 보관 (row 태깅·재그룹핑 없음). 정렬 시에만 `(ts, row, conn_id)`로 펼친다 | 5.3 |
-| 2-1 | 상태 UPDATE는 XCom의 `keys`(conn별 복합키 목록)로만, **원천 DB에 각각** executemany 실행. SQL은 **1개**(status·batch_id만 바인딩이 다름), WHERE는 복합키 AND 조건만 — status 조건 없음. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 / 5.2 |
+| 2-1 | 상태 UPDATE·파일 목록 처리는 **부모 ConvertFileTaskGroup의 기존 함수**를 쓴다. 재처리는 `{conn_id: [복합키 tuple]}`·`batch_id`·파일 목록을 만들어 넘길 뿐이다. `stat_desc`(CLOB)는 WHERE 조건 사용 금지 | 4.2 / 5.2 |
 | 3 | 잔여분 판정은 영수증 필터 적용 **전** 조회 건수(ROW_LIMIT 도달) 기준 | 5.3 |
 | 4 | XCom(meta) 기록 → IN_PROGRESS 마킹 → S3 업로드 순서 (마킹 중간 실패 시 좀비 방지) | 5.3 |
 | 5 | loop 재trigger 조건 = 조회 상한을 채운 테이블 존재. 지속 실패는 MAX_LOOP(10회) 상한으로 유한 종료. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |

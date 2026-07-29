@@ -94,16 +94,18 @@ def dates_between(ts_min: str, ts_max: str) -> list[str]:
 
 
 # --- Oracle -----------------------------------------------------------------
+#
+# 상태 UPDATE(_update_jobs)는 부모 ConvertFileTaskGroup에 이미 있다. 이 모듈은
+# 재처리 고유 조회만 담당하고, UPDATE는 부모 함수를 호출한다 (예시 파일 참조).
 
-# 복합키 4개 (ts도 그중 하나 — 조회 범위·정렬·Compaction 범위에도 사용).
-# TODO(연결): 실제 컬럼명으로 교체 — 아래 SQL 3개의 컬럼명도 함께 고칠 것
-KEY_COLUMNS = ("k_1", "k_2", "k_3", "ts")
+# 복합키 4개 (ts도 그중 하나). XCom에 올릴 때는 이 순서의 값 tuple로 만든다.
+# TODO(연결): 실제 컬럼명으로 교체 — 아래 SQL 2개의 컬럼명도 함께 고칠 것
+PK_COLUMNS = ("k_1", "k_2", "k_3", "ts")
 
+#
 # stat_desc(CLOB)를 그냥 조회하면 LOB 객체로 와 문자열 비교·set 연산이 안 되므로
 # VARCHAR2로 변환해 받는다 (batch_id는 짧아 4000바이트로 충분).
 # 컬럼명이 곧 row의 키가 되므로 변환 컬럼에는 `AS stat_desc` 별칭이 반드시 필요하다.
-# TODO(연결): base_path는 이 모듈에서 쓰지 않는다(경로는 param의 file_path).
-#             부모 파일 목록 함수가 필요로 하면 넘기고, 아니면 SELECT에서 뺄 것.
 SELECT_TARGETS_SQL = """
 SELECT * FROM (
     SELECT k_1, k_2, k_3, ts, base_path, param, status,
@@ -115,12 +117,6 @@ SELECT * FROM (
              OR (status = 'WAIT' AND ts < :wait_bound) )
      ORDER BY ts ASC
 ) WHERE ROWNUM <= :row_limit
-"""
-
-# 복합키가 row를 유일하게 식별하므로 WHERE에 status 조건은 두지 않는다.
-UPDATE_STATUS_SQL = """
-UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id
- WHERE k_1 = :k_1 AND k_2 = :k_2 AND k_3 = :k_3 AND ts = :ts
 """
 
 # TODO(연결): ① 갱신 시각 컬럼명 확인(updated_at 가정) ② ts 범위 조건이 없어
@@ -145,26 +141,9 @@ def select_rows(conn_id: str, sql: str, binds: dict) -> list[dict]:
         return [dict(zip(columns, row)) for row in cur]
 
 
-def update_jobs(conn_id: str, rows: list[dict], status: str,
-                batch_id: str | None = None) -> None:
-    """rows의 복합키로 status를 일괄 UPDATE — rows의 원천 DB를 conn_id로 지정한다.
-
-    batch_id를 주면 영수증으로 stat_desc에 기록하고, 없으면 row의 기존 값을 유지한다.
-    executemany를 쓰는 이유: SQL이 고정이라 Oracle이 parse 1회 후 재사용하고,
-    IN 리스트 1,000개 제한(ORA-01795)에 걸리지 않으며, 라운드트립이 1회다.
-    OracleHook.run()이 executemany를 노출하지 않아 커서를 직접 쓰고 commit도 명시한다.
-    """
-    if not rows:
-        return
-    binds = []
-    for row in rows:
-        bind = {k: row[k] for k in KEY_COLUMNS}
-        bind["status"] = status
-        bind["batch_id"] = batch_id or row["stat_desc"]
-        binds.append(bind)
-    with OracleHook(oracle_conn_id=conn_id).get_conn() as conn, conn.cursor() as cur:
-        cur.executemany(UPDATE_STATUS_SQL, binds)
-        conn.commit()
+def pk_of(row: dict) -> tuple:
+    """row → 복합키 값 tuple. 부모 `_update_jobs` 인자이자 XCom에 올릴 형태다."""
+    return tuple(row[c] for c in PK_COLUMNS)
 
 
 def param_files(param: str) -> list[dict]:
@@ -199,22 +178,25 @@ def send_alert(message: str, detail=None) -> None:
 
 # --- 재처리 조회 로직 (부모 __init__의 재처리 분기가 task로 감싼다) ----------
 
-def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> list[dict]:
-    """재처리 대상 선정 — append get_jobs와 조회 범위·영수증 확인·크기 상한만 다르다.
+def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> tuple[list[dict], dict]:
+    """재처리 대상 조회 — append get_jobs와 조회 범위·영수증 확인만 다르다.
 
-    여기서 하는 일은 조회 → 영수증 확인 → 크기 상한 적용 → IN_PROGRESS 마킹까지고,
-    **적재할 파일 목록을 반환한다**. 반환값을 부모의 기존 파일 목록 함수
-    (avro 경로 텍스트 파일 S3 업로드 + size 총합 XCom push)에 그대로 넘기면 된다 —
-    그 처리는 이미 있으므로 여기서 다시 구현하지 않는다.
+    반환 `(files, marks)`:
+      files — 적재할 파일 목록. 부모의 파일 목록 함수에 그대로 넘긴다
+              (S3 텍스트 파일 업로드 + executor 개수 산정). 빈 목록 = 처리 대상 없음
+      marks — 부모 `_update_jobs`로 내보낼 상태 변경 지시
+              `{"batch_id", "keys", "done_keys"}`, keys는 `{conn_id: [복합키 tuple]}`
 
-    빈 목록 = 처리 대상 없음 (부모가 short_circuit으로 그룹 내 하류를 skip).
+    Oracle 상태 UPDATE와 파일 처리는 부모에 이미 있으므로 여기서 하지 않는다.
+    호출 예시: pipeline/examples/convert_file_taskgroup_example.py
     """
     if not cfg:
         raise ValueError("prepare_run 결과 없음 — 선행 task 실패")
 
+    empty = ([], {"batch_id": None, "keys": {}, "done_keys": {}})
     table_name = table.get_name()
     if table_name not in cfg["tables"]:
-        return []  # 수동 실행에서 미선택 → skip
+        return empty   # 수동 실행에서 미선택 → skip
 
     # 조회는 DB별로 실행하고 결과도 conn_id를 키로 보관한다 — 상태 UPDATE가
     # 이 키로 원천 DB를 찾아가므로 row 태깅·재그룹핑이 필요 없다
@@ -234,10 +216,12 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> list[dict]:
     batch_ids = {r["stat_desc"] for rows in jobs_by_conn.values() for r in rows
                  if r["stat_desc"]}
     committed = committed_batch_ids(table_name, batch_ids) if batch_ids else set()
+    done_keys: dict[str, list[tuple]] = {}
     if committed:
         for conn_id, rows in jobs_by_conn.items():
             done = [r for r in rows if r["stat_desc"] in committed]
-            update_jobs(conn_id, done, "DONE")   # batch_id 미지정 → 영수증 보존
+            if done:
+                done_keys[conn_id] = [pk_of(r) for r in done]
             jobs_by_conn[conn_id] = [r for r in rows if r not in done]
 
     # DB별 결과를 하나로 합쳐 오래된 것부터 처리한다 (append와 같은 순서).
@@ -247,49 +231,33 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> list[dict]:
                   for conn_id, rows in jobs_by_conn.items() for row in rows]
     candidates.sort(key=itemgetter(0))   # ts 오름차순. DB별로 정렬돼 있어도 합치면 깨진다
 
-    picked_files = []                         # 부모 파일 목록 함수에 그대로 넘길 목록
-    picked_by_conn: dict[str, list[dict]] = {}   # 상태 UPDATE는 원천 DB별로 나가야 한다
+    files = []                            # 부모 파일 목록 함수에 그대로 넘길 목록
+    keys: dict[str, list[tuple]] = {}     # {conn_id: [복합키 tuple]} — 원천 DB별
     for _, row, conn_id in candidates:
-        picked_files += param_files(row["param"])   # row 1건에 파일이 여러 개일 수 있다
-        picked_by_conn.setdefault(conn_id, []).append(row)
+        files += param_files(row["param"])   # row 1건에 파일이 여러 개일 수 있다
+        keys.setdefault(conn_id, []).append(pk_of(row))
 
-    if not picked_files:
-        return []   # 적재할 파일 없음 → 아무것도 마킹하지 않고 빠져나간다
+    if not files:
+        return ([], {"batch_id": None, "keys": {}, "done_keys": done_keys})
 
     batch_id = f"{run_id}_{table_name}"   # 배치당 1개 (Spark 커밋 1회 = 영수증 1개)
 
-    # ── XCom 2건. 마킹보다 먼저 남긴다 (설계 5.3): 마킹 도중 실패해도
-    #    update task가 meta로 대상을 되찾을 수 있다 (반대 순서면 좀비가 된다) ──
-
-    # ① 부모 update_success/update_failure가 상태를 되돌릴 때 쓴다.
-    # TODO(연결): key 이름·필드명을 부모 append get_jobs가 push하는 형식과 맞출 것
-    ti.xcom_push(key="meta", value={
-        "batch_id": batch_id,
-        "keys": {conn_id: [{k: r[k] for k in KEY_COLUMNS} for r in rows]
-                 for conn_id, rows in picked_by_conn.items()},
-    })
-
-    # ② 재처리 DAG 자신의 마무리 task 2개만 쓴다 (부모와 무관).
-    #    ts_min/ts_max = 이번에 적재한 데이터의 시간 범위. compaction_targets가
-    #      이 범위만 Compaction하도록 기존 Compaction DAG에 넘긴다 (설계 6.3).
-    #    has_more = 조회 상한에 걸려 못 가져온 대상이 DB에 남았는가.
-    #      next_loop이 이 값으로 DAG을 한 번 더 trigger할지 정한다 (설계 5.5).
+    # 재처리 DAG 자신의 마무리 task 2개만 쓰는 값 (부모와 무관).
+    #   ts_min/ts_max = 이번에 적재한 데이터의 시간 범위. compaction_targets가
+    #     이 범위만 Compaction하도록 기존 Compaction DAG에 넘긴다 (설계 6.3).
+    #   has_more = 조회 상한에 걸려 못 가져온 대상이 DB에 남았는가.
+    #     next_loop이 이 값으로 DAG을 한 번 더 trigger할지 정한다 (설계 5.5).
     ti.xcom_push(key="reprocess", value={
         "ts_min": candidates[0][0],    # candidates는 ts 오름차순, 전부 담았다
         "ts_max": candidates[-1][0],
         "has_more": fetched_full,
     })
 
-    for conn_id, rows in picked_by_conn.items():
-        update_jobs(conn_id, rows, "IN_PROGRESS", batch_id)
-
-    return picked_files
+    return files, {"batch_id": batch_id, "keys": keys, "done_keys": done_keys}
 
 
 # TODO(연결): 기존 ConvertFileTaskGroup에 reprocess_cfg 인자와 조회 분기를 추가한다.
 #             변경 예시: pipeline/examples/convert_file_taskgroup_example.py
-#             마킹을 부모 _update_jobs로 대체할지는 시그니처 확인 후 결정
-#             (대체 시 이 파일의 update_jobs 제거)
 
 
 def collect_metas(ti) -> list[dict]:
