@@ -20,41 +20,41 @@ DAG 구조
       ├─ compaction_targets → trigger_compaction   # 적재 범위만 Compaction
       └─ next_loop          → retrigger_self       # 남았으면 한 번 더
 
-역할 분담 — 이 파일은 "무엇을 적재할지"만 정한다
-  이 파일     조회 범위 계산, 대상 조회, 영수증 확인(중복 적재 방지),
-              Compaction 연계, loop 판단
-  부모 TaskGroup(기존)
-              파일 목록 → S3 텍스트 파일 업로드 + executor 개수 산정,
-              Job History 상태 UPDATE(_update_jobs), Spark 실행
-              → 재처리 전용 조회 task를 부모 __init__ 안에 두어 그대로 재사용한다
-                (연결 방법: pipeline/examples/convert_file_taskgroup_example.py)
+파일 구성 — import 방향이 한쪽이다
+  이 파일(DAG)              조회 범위 계산, 테이블 그룹 배치, Compaction 연계,
+                            loop 판단, 좀비 탐지
+      │ import
+      ▼
+  ConvertFileTaskGroup(기존) 재처리 조회 task 생성, 상태 UPDATE(_update_jobs),
+                            파일 목록 → S3 + executor 산정, Spark 실행
+      │ import
+      ▼
+  reprocess_jobs.py         재처리 대상 조회·영수증 확인 (부모가 호출한다)
+
+  조회 로직을 DAG 파일에 두면 공통 모듈이 DAG을 import해야 해서 성립하지 않는다.
+  연결 방법: pipeline/examples/convert_file_taskgroup_example.py
 
 기존 구현과 연결할 지점은 `TODO(연결)` 주석으로 표시했다.
 """
 
-import json
 from enum import Enum
-from operator import itemgetter
 from pathlib import Path
 
 import pendulum
-from airflow.providers.oracle.hooks.oracle import OracleHook
 from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sdk import Param, chain, dag, task
 
 # TODO(연결): 기존 append DAG 공통 모듈에서 import
 # from <공통 모듈>.taskgroups import ConvertFileTaskGroup
 # from <공통 모듈>.iceberg import HourlyIcebergTable, DailyIcebergTable
+#
+# 좀비 조회에 쓰는 Oracle 접근은 재처리 조회 모듈과 같은 것을 쓴다.
+# TODO(연결): reprocess_jobs.py를 옮긴 실제 경로로 교체
+from pipeline.reprocess_jobs import ORACLE_CONN_IDS, select_rows  # noqa: F401
 
 KST = pendulum.timezone("Asia/Seoul")
 DAG_ID = Path(__file__).stem  # 조직 컨벤션: dag_id는 파일명에서 파생 (단일 소스)
 
-# Oracle DB 2개(a/b)에 동일 스키마의 Job History가 있어 같은 쿼리를 DB별로 반복한다.
-# TODO(연결): append DAG이 쓰는 conn_list와 동일 소스 사용
-ORACLE_CONN_IDS = ["oracle_a", "oracle_b"]
-
-ROW_LIMIT = 1000     # 테이블당·DB당 조회 상한 — 한 회차 물량은 이것만으로 통제한다
-                     # (설계 5.4 — 러프 설정, 운영 데이터로 재검증 필요)
 MAX_LOOP = 10        # 자기 재trigger 상한 (설계 5.5)
 ZOMBIE_HOURS = 2     # 좀비 IN_PROGRESS 판정 임계 (설계 8.2)
 
@@ -116,32 +116,6 @@ def dates_between(ts_min: str, ts_max: str) -> list[str]:
     return days
 
 
-# --- Oracle -----------------------------------------------------------------
-#
-# 상태 UPDATE(_update_jobs)는 부모 ConvertFileTaskGroup에 이미 있다. 이 모듈은
-# 재처리 고유 조회만 담당하고, UPDATE는 부모 함수를 호출한다 (예시 파일 참조).
-
-# 복합키 4개 (ts도 그중 하나). XCom에 올릴 때는 이 순서의 값 tuple로 만든다.
-# TODO(연결): 실제 컬럼명으로 교체 — 아래 SQL 2개의 컬럼명도 함께 고칠 것
-PK_COLUMNS = ("k_1", "k_2", "k_3", "ts")
-
-#
-# stat_desc(CLOB)를 그냥 조회하면 LOB 객체로 와 문자열 비교·set 연산이 안 되므로
-# VARCHAR2로 변환해 받는다 (batch_id는 짧아 4000바이트로 충분).
-# 컬럼명이 곧 row의 키가 되므로 변환 컬럼에는 `AS stat_desc` 별칭이 반드시 필요하다.
-SELECT_TARGETS_SQL = """
-SELECT * FROM (
-    SELECT k_1, k_2, k_3, ts, base_path, param, status,
-           DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc
-      FROM JOB_HISTORY
-     WHERE table_name = :tbl
-       AND ts >= :ts_from AND ts < :ts_to
-       AND ( status = 'FAILED'
-             OR (status = 'WAIT' AND ts < :wait_bound) )
-     ORDER BY ts ASC
-) WHERE ROWNUM <= :row_limit
-"""
-
 # TODO(연결): ① 갱신 시각 컬럼명 확인(updated_at 가정) ② ts 범위 조건이 없어
 #             파티션 전체 스캔 — status 인덱스 유무 확인 필요
 ZOMBIE_SQL = """
@@ -152,145 +126,9 @@ SELECT table_name, k_1, k_2, k_3, ts, updated_at
 """
 
 
-def select_rows(conn_id: str, sql: str, binds: dict) -> list[dict]:
-    """조회 결과를 컬럼명 dict로 매핑.
-
-    컬럼명은 커서에서 그대로 받는다 — SELECT와 컬럼 목록을 따로 맞출 필요가 없다
-    (Oracle이 대문자로 주므로 소문자로 통일).
-    """
-    with OracleHook(oracle_conn_id=conn_id).get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, binds)
-        columns = [d[0].lower() for d in cur.description]
-        return [dict(zip(columns, row)) for row in cur]
-
-
-def pk_of(row: dict) -> tuple:
-    """row → 복합키 값 tuple. 부모 `_update_jobs` 인자이자 XCom에 올릴 형태다."""
-    return tuple(row[c] for c in PK_COLUMNS)
-
-
-def param_files(param: str) -> list[dict]:
-    """param(VARCHAR2 JSON) → 파일 목록. row 1건에 파일이 여러 개일 수 있다.
-
-    형태: {"files": [{"file_path": ..., "size": ...}, ...]}
-    목록을 그대로 부모의 파일 목록 함수에 넘기므로 여기서 가공하지 않는다.
-    TODO(연결): 키 이름을 부모 파싱 함수가 기대하는 형태와 대조할 것.
-    """
-    return json.loads(param)["files"]
-
-
-# --- 기존 구현 연결 스텁 ------------------------------------------------------
-
-def committed_batch_ids(table_name: str, batch_ids: set[str]) -> set[str]:
-    """영수증 확인 (설계 4.2): batch_ids 중 테이블 snapshot에 실제로 있는 것만 반환.
-
-    batch당 1회씩 조회하지 않고 IN 조건으로 한 번에 대조한다. 반환도 넘긴 값의
-    부분집합이어야 한다 — snapshot 전체를 긁어오면 안 된다.
-    TODO(연결): 기존 Trino/Spark 조회 경로 재사용.
-      SELECT element_at(summary, 'batch_id')
-        FROM <catalog>.<db>.<table>.snapshots
-       WHERE element_at(summary, 'batch_id') IN (:batch_ids)
-    """
-    raise NotImplementedError
-
-
 def send_alert(message: str, detail=None) -> None:
     """TODO(연결): 기존 알림 채널 재사용."""
     raise NotImplementedError
-
-
-# --- 재처리 조회 로직 (부모 __init__의 재처리 분기가 task로 감싼다) ----------
-
-def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> dict:
-    """재처리 대상 조회. append get_jobs와 조회 범위·영수증 확인만 다르다.
-
-    처리 순서
-      ① DB 2개에서 대상 조회 (전날+그저께, WAIT는 append 범위 밖만)
-      ② 영수증 확인 — 이미 Iceberg에 커밋된 건은 재적재하면 중복이므로 골라낸다
-      ③ 남은 것을 ts 오름차순으로 세워 파일 목록과 복합키 목록을 만든다
-      ④ 재처리 DAG 자신이 쓸 값(적재 시간 범위·잔여 여부)을 XCom에 남긴다
-
-    반환 dict — 호출부(부모 task)가 각 항목을 기존 함수에 그대로 넘긴다
-      files      적재할 avro 파일 목록 → 부모 파일 목록 함수
-                 (S3 텍스트 파일 업로드 + executor 개수 산정). 비었으면 처리 대상 없음
-      to_done    영수증 확인으로 커밋이 확인된 대상 → `_update_jobs(..., "DONE")`
-      to_mark    이번에 적재할 대상 → `_update_jobs(..., "IN_PROGRESS", batch_id)`
-      batch_id   이번 배치의 영수증 값 (Spark 쓰기 옵션에도 같은 값을 쓴다)
-
-    to_done/to_mark는 `{conn_id: [복합키 값 tuple, ...]}` 형태다. 복합키 값은 DB 간
-    유일 보장이 없어 어느 DB에서 온 row인지가 UPDATE 대상을 결정하기 때문이다.
-
-    호출 예시: pipeline/examples/convert_file_taskgroup_example.py
-    """
-    if not cfg:
-        raise ValueError("prepare_run 결과 없음 — 선행 task 실패")
-
-    result = {"files": [], "to_done": {}, "to_mark": {}, "batch_id": None}
-    table_name = table.get_name()
-    if table_name not in cfg["tables"]:
-        return result   # 수동 실행에서 미선택 → skip
-
-    # ── ① 조회 ────────────────────────────────────────────────────────────
-    # DB별로 실행하고 결과도 conn_id를 키로 보관한다. 상태 UPDATE가 이 키로
-    # 원천 DB를 찾아가므로 row에 출처를 따로 붙일 필요가 없다. ROW_LIMIT은 DB당 적용.
-    binds = {"tbl": table_name, "row_limit": ROW_LIMIT, "ts_from": cfg["ts_from"],
-             "ts_to": cfg["ts_to"], "wait_bound": cfg["wait_bound"]}
-    jobs_by_conn = {conn_id: select_rows(conn_id, SELECT_TARGETS_SQL, binds)
-                    for conn_id in ORACLE_CONN_IDS}
-
-    # 상한을 꽉 채운 DB가 있으면 거기에 더 남았다는 뜻이다. ②에서 건수가 줄면
-    # 알 수 없게 되므로 지금 기록해 둔다 (loop를 한 번 더 돌지 판단하는 근거)
-    fetched_full = any(len(rows) >= ROW_LIMIT for rows in jobs_by_conn.values())
-
-    # ── ② 영수증 확인 (설계 4) ────────────────────────────────────────────
-    # status는 커밋 여부의 증거가 아니다. Airflow가 실패로 판정했든(FAILED),
-    # 커밋 뒤 상태 갱신만 실패했든(WAIT로 잔류) Spark 커밋은 성공했을 수 있다.
-    # batch_id가 snapshot에 있으면 그 데이터는 이미 Iceberg에 있다 → 재적재 금지.
-    batch_ids = {r["stat_desc"] for rows in jobs_by_conn.values() for r in rows
-                 if r["stat_desc"]}
-    committed = committed_batch_ids(table_name, batch_ids) if batch_ids else set()
-    if committed:
-        for conn_id, rows in jobs_by_conn.items():
-            done = [r for r in rows if r["stat_desc"] in committed]
-            if done:
-                result["to_done"][conn_id] = [pk_of(r) for r in done]
-                jobs_by_conn[conn_id] = [r for r in rows
-                                         if r["stat_desc"] not in committed]
-
-    # ── ③ 적재 대상 구성 ──────────────────────────────────────────────────
-    # DB별 결과를 합쳐 오래된 것부터 세운다 (append와 같은 순서). 항목에 conn_id를
-    # 함께 두는 이유는 합치고 나면 어느 DB에서 왔는지 잃어버리기 때문이다.
-    candidates = [(row["ts"], row, conn_id)
-                  for conn_id, rows in jobs_by_conn.items() for row in rows]
-    candidates.sort(key=itemgetter(0))   # DB별로 정렬돼 있어도 합치면 깨진다
-
-    for _, row, conn_id in candidates:
-        result["files"] += param_files(row["param"])   # row 1건에 파일 여러 개 가능
-        result["to_mark"].setdefault(conn_id, []).append(pk_of(row))
-
-    if not result["files"]:
-        # 조회가 비었거나 전부 영수증 정정으로 빠진 경우.
-        # 후자에서 fetched_full이 살아 있어도 loop를 돌지 않는데, 정정된 건은
-        # DONE으로 확정돼 다시 조회되지 않으므로 다음날 실행이 나머지를 이어받는다.
-        return result
-
-    # ── ④ 재처리 DAG 자신이 쓸 값 (부모와 무관) ──────────────────────────
-    #   ts_min/ts_max  이번에 적재한 데이터의 시간 범위. compaction_targets가
-    #                  이 범위만 Compaction하도록 기존 DAG에 넘긴다 (설계 6.3)
-    #   has_more       상한에 걸려 못 가져온 대상이 DB에 남았는가.
-    #                  next_loop이 이 값으로 재trigger 여부를 정한다 (설계 5.5)
-    ti.xcom_push(key="reprocess", value={
-        "ts_min": candidates[0][0],    # ts 오름차순이고 전부 담았으므로 양 끝이 범위
-        "ts_max": candidates[-1][0],
-        "has_more": fetched_full,
-    })
-
-    result["batch_id"] = f"{run_id}_{table_name}"   # 배치당 1개 = 커밋 1회 = 영수증 1개
-    return result
-
-
-# TODO(연결): 기존 ConvertFileTaskGroup에 reprocess_cfg 인자와 조회 분기를 추가한다.
-#             변경 예시: pipeline/examples/convert_file_taskgroup_example.py
 
 
 def collect_metas(ti, table_tasks: list[dict]) -> list[dict]:

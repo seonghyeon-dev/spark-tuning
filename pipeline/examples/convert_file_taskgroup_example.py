@@ -16,15 +16,15 @@
 기존 append 경로는 코드가 if 안으로 들여쓰기만 되며 closure 포함 동작이 완전히
 동일하다 (reprocess_cfg 미지정 → if 분기).
 
-재처리 조회 본문은 pipeline/dags/iceberg_reprocess.py의 reprocess_get_jobs 참조.
+재처리 조회 본문은 pipeline/reprocess_jobs.py의 reprocess_get_jobs 참조.
 """
 
 import logging
 
 from airflow.sdk import TaskGroup, task
 
-# 재처리 DAG이 제공하는 순수 조회 로직 (스코프와 무관한 부분만 분리되어 있음)
-# from <재처리 모듈>.iceberg_reprocess import reprocess_get_jobs
+# 재처리 대상 조회 — 공통 모듈이다 (DAG 파일이 아니다).
+# from <공통 모듈>.reprocess_jobs import reprocess_get_jobs
 
 
 class ConvertFileTaskGroup(TaskGroup):
