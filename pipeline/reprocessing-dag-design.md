@@ -486,7 +486,26 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 
 ## 10. DAG 구현 파일
 
-구현 스켈레톤: **`pipeline/dags/iceberg_reprocess.py`**
+**새로 만드는 파일은 DAG 하나뿐이다.** 재처리 조회 로직은 기존 ConvertFileTaskGroup 파일에 들어간다.
+
+| 파일 | 구분 | 역할 |
+|------|------|------|
+| `pipeline/dags/iceberg_reprocess.py` | **신규** | DAG 정의. 조회 범위 계산(`prepare_run`), 테이블 그룹 배치, Compaction 연계, loop 판단, 좀비 탐지 |
+| ConvertFileTaskGroup 파일 | **기존 수정** | 재처리 조회 SQL·함수 + `reprocess_cfg` 분기. 변경 내용 전체: `pipeline/examples/convert_file_taskgroup_example.py` |
+
+> **조회 로직을 왜 부모 파일에 두는가**: 재처리 조회 task는 `__init__` 안에서 만들어야 한다(조회 뒤 처리가 전부 `__init__` 지역 함수라, 밖으로 빼면 그것들을 일일이 넘겨야 하고 헬퍼가 늘 때마다 시그니처가 깨진다). 그렇다고 조회 로직을 DAG 파일에 두면 **공통 모듈이 DAG 파일을 import해야 해서 성립하지 않는다.** 별도 공통 모듈로 빼는 것도 파일만 늘 뿐 이득이 없다.
+
+**`reprocess_select_jobs` 반환값과 처리 방법**
+
+| 항목 | 무엇인가 | 호출부가 할 일 |
+|------|---------|---------------|
+| `to_done` | 영수증 확인으로 **이미 커밋이 확인된** 대상 | `_update_jobs(conn_id, pks, "DONE")` — 재적재하지 않는다. `batch_id`는 넘기지 않아 기존 `stat_desc`(영수증)를 유지한다. **`files`가 비어 있어도 먼저 처리해야 한다** |
+| `files` | 이번에 적재할 avro 파일 목록 | 기존 파일 목록 함수에 넘기고, **반환된 executor 개수를 XCom push** (Spark operator가 pull). **비었으면 `False` 반환 → short_circuit으로 하류 skip** |
+| `to_mark` | 이번에 적재할 대상 | XCom에 먼저 남긴 뒤(update_failure 회수용) `_update_jobs(conn_id, pks, "IN_PROGRESS", batch_id)` |
+| `batch_id` | 이번 배치의 영수증 값 | 위 마킹에 쓰고, Spark 쓰기 옵션 `option("snapshot-property.batch_id", batch_id)`에도 같은 값 |
+| `ts_min`/`ts_max`/`has_more` | 적재 시간 범위와 잔여 여부 | `reprocess` 키로 XCom push — 재처리 DAG의 `compaction_targets`·`next_loop`가 가져간다 |
+
+`to_done`/`to_mark`는 `{conn_id: [복합키 값 tuple, ...]}` 형태다 — 복합키 값은 DB 간 유일 보장이 없어 어느 DB에서 온 row인지가 UPDATE 대상을 결정한다.
 
 기존 인프라(Oracle 커넥션/Hook, SparkKubernetesOperator 템플릿, 알림 채널, 테이블 설정 소스)에 연결해야 하는 지점은 파일 내 `TODO(연결):` 주석으로 표시되어 있다 (`grep "TODO(연결)"`). 구현 시 반드시 지켜야 하는 핵심 포인트:
 
