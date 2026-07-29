@@ -260,22 +260,20 @@ def reprocess_get_jobs(cfg: dict, *, table, run_id, ti) -> tuple[list[dict], dic
 #             변경 예시: pipeline/examples/convert_file_taskgroup_example.py
 
 
-def collect_metas(ti) -> list[dict]:
+def collect_metas(ti, sources: list[dict]) -> list[dict]:
     """이번 run에서 실제로 적재한 테이블들의 재처리 meta 수집 (설계 6.3 / 5.5).
 
     Airflow 3 worker는 메타데이터 DB 접근이 불가하므로 task 상태 조회 대신 XCom만 쓴다.
-    테이블명과 Compaction 그룹은 Enum에서 바로 붙인다 (XCom으로 나를 필요가 없다).
+    XCom은 push한 task의 task_id로만 꺼낼 수 있는데, 조회 task는 테이블별
+    TaskGroup 안에 있어 task_id가 `{group_id}.get_jobs`다. 그 값을 여기서 다시
+    조립하면 group_id 규칙이 바뀔 때 조용히 어긋나므로(pull이 None을 돌려줄 뿐
+    에러가 나지 않는다), DAG 조립 시점에 실제 TaskGroup에서 뽑아 sources로 받는다.
     """
     metas = []
-    for t in ALL_TABLES:
-        meta = ti.xcom_pull(task_ids=f"reprocess_{t.get_name()}.get_jobs",
-                            key="reprocess")
+    for s in sources:
+        meta = ti.xcom_pull(task_ids=s["task_id"], key="reprocess")
         if meta:   # 대상 0건이라 skip된 테이블은 XCom이 없다
-            metas.append({
-                **meta,
-                "table": t.get_name(),
-                "group": "hourly" if isinstance(t, HourlyIcebergTable) else "daily",
-            })
+            metas.append({**meta, "table": s["table"], "group": s["group"]})
     return metas
 
 
@@ -361,11 +359,11 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         }
 
     @task(trigger_rule="all_done")
-    def compaction_targets(ti=None) -> list[dict]:
+    def compaction_targets(sources: list[dict], ti=None) -> list[dict]:
         """적재 결과 집계 → TriggerDagRunOperator kwargs 목록 (설계 6.3).
         적재분 전부 trigger — tables 필터로 비용 최소, 중복은 no-op.
         TODO(연결): conf 날짜/시간 형식을 기존 Compaction DAG UI params와 일치시킬 것."""
-        metas = collect_metas(ti)
+        metas = collect_metas(ti, sources)
         daily = [m for m in metas if m["group"] == "daily"]
         hourly = [m for m in metas if m["group"] == "hourly"]
 
@@ -395,12 +393,12 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         return targets  # 빈 목록이면 mapped operator는 skip
 
     @task(trigger_rule="all_done")
-    def next_loop(cfg: dict, ti=None) -> list[dict]:
+    def next_loop(cfg: dict, sources: list[dict], ti=None) -> list[dict]:
         """재trigger 판단 (설계 5.5) → TriggerDagRunOperator kwargs 0/1건.
         상한에 걸려 못 담은 대상이 남은 테이블이 하나라도 있으면 한 번 더 돈다.
         지속 실패도 has_more + MAX_LOOP 상한으로 유한하게 종료된다."""
         # 종료 ①: prepare_run 실패(cfg 없음) 또는 남은 대상 없음
-        if not cfg or not any(m["has_more"] for m in collect_metas(ti)):
+        if not cfg or not any(m["has_more"] for m in collect_metas(ti, sources)):
             return []
         # 종료 ②: 회차 상한 — 자동으로 다 못 푸는 물량 → 알림 후 수동 (설계 8.1)
         if cfg["loop_count"] >= MAX_LOOP:
@@ -428,8 +426,18 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     chain(run_cfg, *groups)
     tail = groups[-1] if groups else run_cfg  # 빈 Enum 상태에서도 파싱 가능
 
-    comp = compaction_targets()
-    nxt = next_loop(run_cfg)
+    # 집계 task가 XCom을 꺼낼 대상. task_id는 실제로 만들어진 TaskGroup에서 뽑는다
+    # — 문자열을 따로 조립하면 group_id 규칙이 바뀔 때 조용히 어긋난다.
+    # TODO(연결): 조회 task 이름("get_jobs")은 부모가 정하므로 대조할 것
+    sources = [
+        {"table": t.get_name(),
+         "group": "hourly" if isinstance(t, HourlyIcebergTable) else "daily",
+         "task_id": f"{g.group_id}.get_jobs"}
+        for t, g in zip(ALL_TABLES, groups)
+    ]
+
+    comp = compaction_targets(sources)
+    nxt = next_loop(run_cfg, sources)
     tail >> [comp, nxt]
     # trigger 건수가 가변이라 dynamic task mapping.
     # TriggerDagRunOperator는 wait_for_completion 기본 False (설계 6.3)
