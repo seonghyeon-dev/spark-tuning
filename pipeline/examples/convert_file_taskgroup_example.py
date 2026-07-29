@@ -86,30 +86,34 @@ class ConvertFileTaskGroup(TaskGroup):
             )
             def get_jobs(cfg, run_id=None, ti=None):
                 logger.info("reprocess get_jobs: %s", table.get_name())
-                # 재처리 모듈이 하는 일은 "무엇을 적재할지" 정하는 것뿐이다 —
-                # 조회 범위(전날+그저께, WAIT 상한)와 영수증 확인(중복 적재 방지).
-                # S3 업로드·executor 산정·상태 UPDATE는 아래 기존 함수들이 한다.
-                files, marks = reprocess_get_jobs(  # noqa: F821
+
+                # 재처리 모듈은 "무엇을 적재할지"만 정해서 돌려준다.
+                # 아래 4줄의 실제 처리는 전부 기존 함수 그대로다.
+                r = reprocess_get_jobs(  # noqa: F821
                     cfg, table=table, run_id=run_id, ti=ti,
                 )
 
-                # 영수증으로 커밋이 확인된 건 → 재적재하지 않고 DONE 정정.
-                # batch_id를 넘기지 않아 row의 기존 stat_desc(영수증)가 유지된다
-                for conn_id, keys in marks["done_keys"].items():
-                    _update_jobs(conn_id, keys, "DONE")
+                # ① 이미 Iceberg에 커밋된 건 → 재적재 없이 DONE 정정.
+                #    batch_id를 넘기지 않아 기존 stat_desc(영수증)가 유지된다
+                for conn_id, pks in r["to_done"].items():
+                    _update_jobs(conn_id, pks, "DONE")
 
-                if not files:
+                if not r["files"]:
                     return False              # 대상 없음 → 그룹 내 하류 skip
 
-                # append 경로와 동일: 파일 목록 → S3 텍스트 파일 + executor 산정.
-                # 반환된 개수를 XCom에 올려야 Spark operator가 pull해서 쓴다
-                ti.xcom_push(key="num_executors", value=_upload_file_list(files))
+                # ② 파일 목록 → S3 텍스트 파일 + executor 개수 산정 (append와 동일).
+                #    반환된 개수를 XCom에 올려야 Spark operator가 pull해서 쓴다
+                ti.xcom_push(key="num_executors",
+                             value=_upload_file_list(r["files"]))
 
-                # 마킹은 XCom push 뒤에 (설계 5.3) — 마킹 도중 실패해도
-                # update_failure가 XCom으로 대상을 되찾을 수 있다
-                ti.xcom_push(key="meta", value=marks)   # batch_id + conn별 복합키
-                for conn_id, keys in marks["keys"].items():
-                    _update_jobs(conn_id, keys, "IN_PROGRESS", marks["batch_id"])
+                # ③ 마킹 대상을 XCom에 먼저 남긴다 (설계 5.3) — 마킹 도중 실패해도
+                #    update_failure가 이 값으로 대상을 되찾을 수 있다
+                ti.xcom_push(key="meta", value={"batch_id": r["batch_id"],
+                                                "keys": r["to_mark"]})
+
+                # ④ IN_PROGRESS 마킹 + batch_id(영수증) 기록
+                for conn_id, pks in r["to_mark"].items():
+                    _update_jobs(conn_id, pks, "IN_PROGRESS", r["batch_id"])
                 return True
 
             jobs = get_jobs(reprocess_cfg)
