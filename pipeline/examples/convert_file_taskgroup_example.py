@@ -115,15 +115,11 @@ class ConvertFileTaskGroup(TaskGroup):
             jobs = get_jobs(reprocess_cfg)
 
         # ── 이하 기존 코드 그대로 (Spark / update task / 연결) ─────────────
-        #
-        # XCom은 push한 task의 task_id로만 꺼낼 수 있고, 여기 task들은 TaskGroup
-        # 안이라 task_id가 f"{group_id}.get_jobs"다. 기존 코드가 이미 group_id로
-        # 조립하고 있으면 재처리 경로(group_id만 다름)도 그대로 동작한다.
-        # 반대로 "convert_..." 같은 접두어가 하드코딩돼 있으면 재처리에서 깨지므로
-        # ★ 확인 필요 — num_executors, meta 모두 해당.
+        # 그룹 안의 XCom 주고받기는 손댈 것이 없다 — group_id가 __init__ 인자라
+        # 재처리(group_id만 다름)에서도 기존 조립이 그대로 맞는다.
         spark = ...               # 기존 SparkKubernetesOperator 확장 operator 그대로
                                   # (task_id="append_data", task_group=self, ...)
-                                  # num_executors를 pull: f"{group_id}.get_jobs"
+                                  # num_executors를 get_jobs XCom에서 pull
 
         @task(task_id="update_success", task_group=self, trigger_rule="all_success")
         def update_success(ti=None):

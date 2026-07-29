@@ -334,11 +334,11 @@ SELECT * FROM (
    - `has_more`는 **상한에 걸려 못 담은 대상이 남았는지** 여부다. 남았으면 DAG을 한 번 더 trigger한다 (5.5)
    - 테이블명·Compaction 그룹은 XCom에 넣지 않는다 — 수집 측이 Enum을 순회하므로 그 자리에서 붙이면 된다
 
-> **XCom pull은 push한 task의 task_id로만 가능하다.** 조회 task는 테이블별 TaskGroup 안에 있으므로 task_id가 `{group_id}.get_jobs`이며(append DAG과 동일한 구분 방식), 집계 task는 이 값을 알아야 한다.
+> **XCom pull은 push한 task의 task_id로만 가능하다.** 조회 task는 테이블별 TaskGroup 안에 있으므로 task_id가 `{group_id}.get_jobs`이며(append DAG과 동일한 구분 방식), **TaskGroup 밖에 있는** 집계 task(`compaction_targets`·`next_loop`)는 이 값을 알아야 한다.
 >
 > 이 문자열을 집계 쪽에서 다시 조립하면 안 된다 — group_id 규칙이 바뀌어도 `xcom_pull`은 예외 없이 `None`을 돌려주므로, 해당 테이블이 Compaction 대상과 loop 판단에서 **조용히 빠진다**. DAG 조립 시점에 실제로 만들어진 TaskGroup의 `group_id`에서 뽑아 집계 task 인자로 넘긴다.
 >
-> 같은 이유로 부모 쪽(Spark operator의 `num_executors` pull 등)도 `group_id` 기반으로 조립되어 있어야 재처리 경로(group_id만 다름)에서 그대로 동작한다 (섹션 7).
+> 그룹 **안쪽**은 해당 없다. 부모 TaskGroup은 `group_id`를 `__init__` 인자로 받아 조립하므로(append도 테이블마다 다른 값을 넘긴다) 재처리 경로에서도 그대로 맞는다.
    - `keys`는 **복합키 값 tuple**로 올린다. row마다 컬럼명을 풀어 담으면 같은 이름 4개가 건수만큼 반복돼 XCom만 커진다
 6. **IN_PROGRESS 마킹 — 기존 함수에 위임** — 상태 UPDATE는 ConvertFileTaskGroup의 `_update_jobs`가 이미 수행한다. 재처리는 `{conn_id: [복합키 tuple]}`과 `batch_id`를 만들어 넘길 뿐, UPDATE 문을 따로 갖지 않는다 (영수증 정정도 같은 함수 사용)
 
