@@ -47,16 +47,18 @@ class ConvertFileTaskGroup(TaskGroup):
         logger = logging.getLogger(__name__)
         config = ...              # 기존 설정값 로딩 그대로
 
-        def _update_jobs(job_ids, status):
-            """Job History 상태 update — 기존 지역 헬퍼 그대로."""
+        def _update_jobs(conn_id, keys, status, batch_id=None):
+            """Job History 상태 update — **기존 지역 헬퍼 그대로**.
+               재처리도 이 함수를 쓴다 (자체 UPDATE 구현 없음)."""
             ...                   # 기존 구현
 
         def _upload_file_list(files):
-            """param에서 뽑은 파일 목록을 받아
+            """param에서 뽑은 파일 목록([{file_name, size}, ...])을 받아
                ① avro 경로 텍스트 파일을 S3에 저장하고
-               ② size 총합을 구해 XCom push (Spark operator가 pull)
+               ② size 총합으로 executor 개수를 산정해 **반환**한다
                → **기존 함수 그대로**. 재처리도 이 함수를 그대로 쓴다."""
             ...                   # 기존 구현
+            return num_executors  # noqa: F821
 
         def _other_helper(*args):  # 다른 지역 함수들도 그대로
             ...
@@ -84,23 +86,44 @@ class ConvertFileTaskGroup(TaskGroup):
             )
             def get_jobs(cfg, run_id=None, ti=None):
                 logger.info("reprocess get_jobs: %s", table.get_name())
-                # 재처리 모듈은 "무엇을 적재할지"만 정한다 —
-                # 조회 범위, 영수증 확인(중복 적재 방지), 크기 상한, IN_PROGRESS 마킹.
-                # 반환값은 param에서 뽑은 파일 목록이고, 그 다음 처리(S3 텍스트 파일
-                # 업로드 + size 총합 XCom push)는 **기존 함수를 그대로 쓴다**.
-                files = reprocess_get_jobs(  # noqa: F821
+
+                # 재처리 모듈은 "무엇을 적재할지"만 정해서 돌려준다.
+                # 아래 4줄의 실제 처리는 전부 기존 함수 그대로다.
+                r = reprocess_get_jobs(  # noqa: F821
                     cfg, table=table, run_id=run_id, ti=ti,
                 )
-                if not files:
+
+                # ① 이미 Iceberg에 커밋된 건 → 재적재 없이 DONE 정정.
+                #    batch_id를 넘기지 않아 기존 stat_desc(영수증)가 유지된다
+                for conn_id, pks in r["to_done"].items():
+                    _update_jobs(conn_id, pks, "DONE")
+
+                if not r["files"]:
                     return False              # 대상 없음 → 그룹 내 하류 skip
-                _upload_file_list(files)      # ← 부모 기존 함수, 재구현하지 않음
+
+                # ② 파일 목록 → S3 텍스트 파일 + executor 개수 산정 (append와 동일).
+                #    반환된 개수를 XCom에 올려야 Spark operator가 pull해서 쓴다
+                ti.xcom_push(key="num_executors",
+                             value=_upload_file_list(r["files"]))
+
+                # ③ 마킹 대상을 XCom에 먼저 남긴다 (설계 5.3) — 마킹 도중 실패해도
+                #    update_failure가 이 값으로 대상을 되찾을 수 있다
+                ti.xcom_push(key="meta", value={"batch_id": r["batch_id"],
+                                                "keys": r["to_mark"]})
+
+                # ④ IN_PROGRESS 마킹 + batch_id(영수증) 기록
+                for conn_id, pks in r["to_mark"].items():
+                    _update_jobs(conn_id, pks, "IN_PROGRESS", r["batch_id"])
                 return True
 
             jobs = get_jobs(reprocess_cfg)
 
         # ── 이하 기존 코드 그대로 (Spark / update task / 연결) ─────────────
+        # 그룹 안의 XCom 주고받기는 손댈 것이 없다 — group_id가 __init__ 인자라
+        # 재처리(group_id만 다름)에서도 기존 조립이 그대로 맞는다.
         spark = ...               # 기존 SparkKubernetesOperator 확장 operator 그대로
                                   # (task_id="append_data", task_group=self, ...)
+                                  # num_executors를 get_jobs XCom에서 pull
 
         @task(task_id="update_success", task_group=self, trigger_rule="all_success")
         def update_success(ti=None):
