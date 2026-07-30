@@ -209,7 +209,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
             ts_from, ts_to = param_to_ts(st), param_to_ts(et)
             if not ts_from < ts_to <= ts_str(base.subtract(days=1)):
                 raise ValueError("start < end 이고 end_time ≤ 전날 00:00 이어야 한다")
-            wait_bound = ts_to  # 범위 전체가 append 범위 밖 → WAIT 전 구간 허용
+            wait_bound = ts_to  # 범위 전체가 append 범위 밖 → WAIT_SCHEDULING 전 구간 허용
         elif st or et:
             raise ValueError("start_time과 end_time은 함께 지정해야 한다")
         else:

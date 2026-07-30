@@ -4,7 +4,7 @@
 
 | 항목 | 내용 |
 |------|------|
-| 작성 목적 | append DAG 조회 기간(최근 1일)에서 밀려난 WAIT 데이터와 FAILED 데이터를 회수하는 재처리 DAG 설계 |
+| 작성 목적 | append DAG 조회 기간(최근 1일)에서 밀려난 WAIT_SCHEDULING 데이터와 FAILURE 데이터를 회수하는 재처리 DAG 설계 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.2.2, Oracle DB |
 | 시간대 기준 | **KST (Asia/Seoul)** — 모든 날짜/시간 계산에 적용 |
@@ -33,7 +33,7 @@
 |----------|------|
 | Iceberg 테이블 | **20개 이상**. 첫 파티션 기준 hourly 그룹(`hour` hidden partition)과 daily 그룹(`day` hidden partition)으로 분류 |
 | Job History (Oracle) | 처리 대상 상태 관리 테이블. **Oracle DB 2개(a/b)에 동일 스키마로 존재** — append DAG은 conn_list(conn_id 2개) loop로 같은 쿼리를 DB별로 실행. **키는 복합키 4개**(예: `k_1`, `k_2`, `k_3`, `ts`) — `ts`(string, `YYYYMMDDHHmmSSsss` 밀리세컨즈)도 그중 하나이며 날짜 파티셔닝 키이자 조회 기준이다. 그 외 컬럼: `table_name`(대상 테이블), `base_path`, `param`(JSON — `{"files": [{"file_path", "size"}, ...]}`, row당 파일 여러 개 가능), `status`, `stat_desc`(CLOB, 현재 미사용). 복합키 값은 DB 간 유일 보장 없음 |
-| append DAG | py 파일 1개에서 loop로 **테이블별 DAG 동적 생성** (테이블당 1개 실행). 약 5분 주기. `get_jobs`가 conn_list의 **DB별로** `table_name` 조건 + `ts` 최근 1일 범위 + `status='WAIT'`을 `ORDER BY ts ASC`, `ROWNUM <= 200`으로 조회 |
+| append DAG | py 파일 1개에서 loop로 **테이블별 DAG 동적 생성** (테이블당 1개 실행). 약 5분 주기. `get_jobs`가 conn_list의 **DB별로** `table_name` 조건 + `ts` 최근 1일 범위 + `status='WAIT_SCHEDULING'`을 `ORDER BY ts ASC`, `ROWNUM <= 200`으로 조회 |
 | Compaction DAG | **hourly DAG 1개**(`15 * * * *`, 직전 1시간치) + **daily DAG 1개**(현재 `35 0 * * *`, 전일치). 각 DAG 내부에서 소속 테이블 task가 순차 실행. `max_active_runs=1`. UI 수동 실행용 params: daily는 `target_dt`, hourly는 `start_time`/`end_time` |
 | DB 상태 처리 | callback이 아닌 `update_success`(`trigger_rule=all_success`) / `update_failure`(`all_failed`) task 방식 — callback은 DB update 지연 시 작업이 kill되는 문제가 있었음 |
 
@@ -43,8 +43,8 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 
 | 케이스 | 발생 경로 |
 |--------|----------|
-| **WAIT 잔류** | append 처리 또는 DB 조회 지연으로 밀린 데이터가 최근 1일 조회 범위를 벗어남 → `get_jobs`가 다시는 조회하지 않음 |
-| **FAILED 잔류** | `get_jobs`는 WAIT만 조회하므로, `update_failure`가 FAILED로 확정한 데이터는 재시도 주체가 없음 |
+| **WAIT_SCHEDULING 잔류** | append 처리 또는 DB 조회 지연으로 밀린 데이터가 최근 1일 조회 범위를 벗어남 → `get_jobs`가 다시는 조회하지 않음 |
+| **FAILURE 잔류** | `get_jobs`는 WAIT만 조회하므로, `update_failure`가 FAILED로 확정한 데이터는 재시도 주체가 없음 |
 
 ### 1.3 설계 방향
 
@@ -60,13 +60,13 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ append DAG × 테이블 수 (약 5분 주기) — 신규 데이터 전담         │
-│   조회: ts ≥ 실행시각-24h, status='WAIT', DB당 ROWNUM ≤ 200   │
-│   재시도 없음. 실패 건은 FAILED 확정 후 재처리 DAG에 위임        │
+│   조회: ts ≥ 실행시각-24h, status='WAIT_SCHEDULING', DB당 ROWNUM ≤ 200   │
+│   재시도 없음. 실패 건은 FAILURE 확정 후 재처리 DAG에 위임        │
 └──────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────┐
 │ 재처리 DAG 1개 (1일 주기, 01:00 KST) — 잔류 데이터 회수 전담    │
 │   테이블별 task 순차 실행 (Compaction DAG과 동일 패턴)          │
-│   조회: FAILED(전날+그저께) + WAIT(append 범위 밖만), DB 2개    │
+│   조회: FAILURE(전날+그저께) + WAIT_SCHEDULING(append 범위 밖만), DB 2개    │
 │   테이블당·DB당 ROWNUM ≤ 1,000. 초과 시 자기 재trigger(loop)   │
 │   처리 후 기존 Compaction DAG trigger                          │
 └──────────────────────────────────────────────────────────────┘
@@ -79,14 +79,14 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 
 ### 2.1 조회 범위 경계 — 겹침이 원천적으로 불가능한 이유
 
-**핵심 규칙**: append는 항상 "실행 시각-24시간 이후"만 조회한다. 재처리의 WAIT 조회 상한을 **전날 01:00**(= 재처리 스케줄 시각 - 24시간)으로 잡으면, 재처리가 01:00 이후에 도는 한 append의 조회 하한은 항상 전날 01:00 이상이므로 **두 범위는 절대 겹치지 않는다.** FAILED는 append가 아예 조회하지 않으므로 겹침 걱정 없이 전날·그저께 전체를 잡는다.
+**핵심 규칙**: append는 항상 "실행 시각-24시간 이후"만 조회한다. 재처리의 WAIT_SCHEDULING 조회 상한을 **전날 01:00**(= 재처리 스케줄 시각 - 24시간)으로 잡으면, 재처리가 01:00 이후에 도는 한 append의 조회 하한은 항상 전날 01:00 이상이므로 **두 범위는 절대 겹치지 않는다.** FAILED는 append가 아예 조회하지 않으므로 겹침 걱정 없이 전날·그저께 전체를 잡는다.
 
 **오늘 = 4일** (전날 = 3일, 그저께 = 2일)로 두고, 오늘 4일 01:00 실행 기준 (`ts`는 `YYYYMMDDHHmmSSsss` 문자열 비교):
 
 | 대상 | ts 범위 | 이유 |
 |------|---------|------|
-| FAILED | `20260702000000000` ≤ ts < `20260704000000000` (그저께 00:00 ~ 전날 끝) | append는 FAILED를 조회하지 않으므로 전 구간 안전 |
-| WAIT | `20260702000000000` ≤ ts < `20260703010000000` (그저께 00:00 ~ 전날 01:00) | 전날 01:00 이후는 append가 아직 조회 가능한 영역 |
+| FAILURE | `20260702000000000` ≤ ts < `20260704000000000` (그저께 00:00 ~ 전날 끝) | append는 FAILED를 조회하지 않으므로 전 구간 안전 |
+| WAIT_SCHEDULING | `20260702000000000` ≤ ts < `20260703010000000` (그저께 00:00 ~ 전날 01:00) | 전날 01:00 이후는 append가 아직 조회 가능한 영역 |
 | 그저께 이전 | 조회 안 함 | **알림 → 수동 처리** (섹션 8) |
 
 > **경계값은 실행 시각이 아니라 그 날의 01:00 고정값으로 계산한다.** 재실행이나 loop 회차가 늦게 돌아도 경계가 append 조회 하한보다 항상 과거이므로 안전이 유지된다.
@@ -98,12 +98,12 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 **잔류 데이터 회수 타임라인**:
 
 ```
-[FAILED] 전날(3일) 15:00 배치 실패 → 오늘(4일) 01:00 재처리가 회수 (최대 하루 지연)
+[FAILURE] 전날(3일) 15:00 배치 실패 → 오늘(4일) 01:00 재처리가 회수 (최대 하루 지연)
 
-[WAIT]   전날(3일) 08:00 생성 후 계속 미처리
-         4일 01:00  재처리: WAIT 상한이 3일 01:00 → 대상 아님 (아직 append 담당)
+[WAIT_SCHEDULING]   전날(3일) 08:00 생성 후 계속 미처리
+         4일 01:00  재처리: WAIT_SCHEDULING 상한이 3일 01:00 → 대상 아님 (아직 append 담당)
          4일 08:00  생성 24시간 경과 → append 조회 범위 이탈
-         다음날(5일) 01:00  재처리: WAIT 범위 [3일 00:00 ~ 4일 01:00) → 회수 ✅ (최대 약 이틀 지연)
+         다음날(5일) 01:00  재처리: WAIT_SCHEDULING 범위 [3일 00:00 ~ 4일 01:00) → 회수 ✅ (최대 약 이틀 지연)
 ```
 
 append가 `ORDER BY ts ASC`(오래된 것부터)로 소화하므로, 조회 범위 안의 WAIT가 하루 종일 안 집히는 상황 자체가 append 처리량 이상 신호다 — 이 경우는 잔류 알림(섹션 8.1)으로 드러난다.
@@ -115,7 +115,7 @@ append가 `ORDER BY ts ASC`(오래된 것부터)로 소화하므로, 조회 범�
 | append DAG 조회를 상태 기준(시간 조건 제거)으로 변경 | `ts` 날짜 키 파티셔닝에서 전체 파티션 스캔 발생 → 조회 성능 저하 |
 | append DAG 조회 기간 확장 (1일 → 7일) | 조회 성능 저하 + 밀린 과거 데이터가 최신 데이터 처리를 지연시킴 |
 | 재처리 DAG을 테이블별로 동적 생성 (append 패턴) | 재처리는 하루 1회 청소 배치로 대부분 테이블이 no-op — DAG 20개+가 매일 빈 run을 쌓는 관리 소음. 단일 DAG + 테이블별 task(Compaction 패턴)가 관리에 유리하고, Compaction trigger도 한곳에서 날짜별로 묶어 1회씩 실행 가능 |
-| 전날 WAIT 전체를 재처리가 가져가기 (UPDATE 선점 또는 Airflow pool로 경합 제어) | UPDATE 선점 후 재조회는 stat_desc(CLOB) 조건이 필요해 성능 문제. pool은 테이블 20개+ 구조에서 테이블별 pool 난립 또는 전역 병목. 조회 범위를 겹치지 않게 하는 것이 가장 단순 (전날 01:00 이후 WAIT는 다음날 회수 — 하루 지연 허용) |
+| 전날 WAIT_SCHEDULING 전체를 재처리가 가져가기 (UPDATE 선점 또는 Airflow pool로 경합 제어) | UPDATE 선점 후 재조회는 stat_desc(CLOB) 조건이 필요해 성능 문제. pool은 테이블 20개+ 구조에서 테이블별 pool 난립 또는 전역 병목. 조회 범위를 겹치지 않게 하는 것이 가장 단순 (전날 01:00 이후 WAIT는 다음날 회수 — 하루 지연 허용) |
 | 한 DAG run 안에서 Spark task 여러 개로 분할 처리 | 일부 성공/일부 실패 시 `all_success`/`all_failed`가 모두 불충족되어 상태 update 누락. loop는 DAG 재trigger 방식으로 해결 (섹션 5.5) |
 | 재처리 DAG에서 직접 `rewrite_data_files` 실행 | 기존 Compaction DAG과 동시 실행 시 Iceberg commit 충돌. 기존 DAG trigger로 `max_active_runs=1` 직렬화 활용 (섹션 6) |
 
@@ -126,33 +126,33 @@ append가 `ORDER BY ts ASC`(오래된 것부터)로 소화하므로, 조회 범�
 ### 3.1 상태 전이도
 
 ```
-WAIT ──get_jobs(append DAG)──▶ IN_PROGRESS ──▶ update_success ──▶ DONE
+WAIT_SCHEDULING ──get_jobs(append DAG)──▶ IN_PROGRESS ──▶ update_success ──▶ SUCCESS
                                     │
-                                    └──▶ update_failure ──▶ FAILED
+                                    └──▶ update_failure ──▶ FAILURE
                                                               │
-WAIT(append 범위 이탈분) ──┐                                   │
+WAIT_SCHEDULING(append 범위 이탈분) ──┐                                   │
                           ├──재처리 DAG(전날+그저께)◀──────────┘
-FAILED ───────────────────┘        │
-                                   ├──(영수증 확인: 이미 커밋됨)──▶ DONE 정정
-                                   └──▶ IN_PROGRESS ──▶ DONE / FAILED(다음날 재시도)
+FAILURE ───────────────────┘        │
+                                   ├──(영수증 확인: 이미 커밋됨)──▶ SUCCESS 정정
+                                   └──▶ IN_PROGRESS ──▶ SUCCESS / FAILURE(다음날 재시도)
 ```
 
 ### 3.2 상태별 처리 주체
 
 | 상태 | 생성 주체 | 소비 주체 |
 |------|----------|----------|
-| WAIT | 원천 시스템 | append DAG (최근 1일) / 재처리 DAG (append 범위 이탈분) / 수동 (그저께 이전) |
+| WAIT_SCHEDULING | 원천 시스템 | append DAG (최근 1일) / 재처리 DAG (append 범위 이탈분) / 수동 (그저께 이전) |
 | IN_PROGRESS | get_jobs / 재처리 조회 task | update_success/update_failure. 임계 시간 초과 시 좀비 탐지 알림 (섹션 8.2) |
-| DONE | update_success, 영수증 정정 | 최종 상태 |
-| FAILED | update_failure | 재처리 DAG (전날+그저께) / 수동 (그저께 이전) |
+| SUCCESS | update_success, 영수증 정정 | 최종 상태 |
+| FAILURE | update_failure | 재처리 DAG (전날+그저께) / 수동 (그저께 이전) |
 
 ### 3.3 재시도 정책
 
 - **task 레벨 재시도**: Spark task의 Airflow `retries`(권장 2회, `retry_delay` 5분)가 일시적 오류(S3 순단 등)를 1차 방어
-- **배치 레벨 재시도**: task 재시도 소진 후 FAILED 확정 → 다음날 01:00 재처리 DAG이 재시도. 별도 retry 카운트는 DB에 저장하지 않음 (재시도는 task가, 배치 재시도는 상태 재조회가 담당)
+- **배치 레벨 재시도**: task 재시도 소진 후 FAILURE 확정 → 다음날 01:00 재처리 DAG이 재시도. 별도 retry 카운트는 DB에 저장하지 않음 (재시도는 task가, 배치 재시도는 상태 재조회가 담당)
 - **무한 재시도 방지**: 재처리에서도 반복 실패하는 건은 그저께 이전 잔류 알림(섹션 8.1)으로 사람에게 노출됨
 
-> **FAILED 격리 효과**: append DAG이 FAILED를 재조회하지 않으므로, 깨진 파일이 섞인 배치가 5분마다 반복 실패하며 정상 신규 데이터까지 물고 늘어지는 상황이 구조적으로 발생하지 않는다.
+> **FAILURE 격리 효과**: append DAG이 FAILED를 재조회하지 않으므로, 깨진 파일이 섞인 배치가 5분마다 반복 실패하며 정상 신규 데이터까지 물고 늘어지는 상황이 구조적으로 발생하지 않는다.
 
 ---
 
@@ -160,11 +160,11 @@ FAILED ───────────────────┘        │
 
 ### 4.1 왜 필요한가
 
-Airflow의 "task 실패" 판정이 항상 "데이터 미적재"를 의미하지 않는다. Iceberg commit은 성공했으나 직후 Driver Pod 종료 오류, Operator-Pod 통신 단절, task timeout 등으로 Airflow가 실패로 판정하는 경우(**거짓 실패**)가 있다. 이 상태에서 FAILED 건을 기계적으로 재적재하면 **같은 데이터가 두 번 들어간다.**
+Airflow의 "task 실패" 판정이 항상 "데이터 미적재"를 의미하지 않는다. Iceberg commit은 성공했으나 직후 Driver Pod 종료 오류, Operator-Pod 통신 단절, task timeout 등으로 Airflow가 실패로 판정하는 경우(**거짓 실패**)가 있다. 이 상태에서 FAILURE 건을 기계적으로 재적재하면 **같은 데이터가 두 번 들어간다.**
 
 ```
 전날(3일) 09:00  Spark job이 Iceberg commit 성공 (데이터 적재됨)
-            → 직후 Pod 통신 오류 → Airflow는 실패 판정 → FAILED 기록
+            → 직후 Pod 통신 오류 → Airflow는 실패 판정 → FAILURE 기록
 오늘(4일) 01:00  재처리 DAG이 FAILED를 재적재 → 중복!
 ```
 
@@ -220,7 +220,7 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 
 - snapshot 보존 정책: **3일** (`expire_snapshots`)
 - 자동 재처리 범위(전날+그저께 = 2일) < 보존(3일) → 자동 경로에서는 영수증 확인이 항상 가능
-- **3일을 넘긴 FAILED 건은 영수증이 expire되어 확인 불가** → 수동 처리 시 별도 검증 필요 (섹션 8.3)
+- **3일을 넘긴 FAILURE 건은 영수증이 expire되어 확인 불가** → 수동 처리 시 별도 검증 필요 (섹션 8.3)
 - snapshot 보존 정책을 단축할 경우 반드시 `보존 기간 > 재처리 조회 범위(2일)` 유지
 
 ---
@@ -242,7 +242,7 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 | param | 기본값 | 설명 |
 |-------|--------|------|
 | `tables` | 전체 테이블 | 처리 대상 테이블 multi-select — 1개/여러 개/전체 선택 가능. 정기 실행은 기본값(전체). 선택지·기본값은 append DAG과 동일한 **`iceberg.py`의 hourly/daily Enum 클래스**에서 생성 (`Param(type="array", items={"enum": [...]})`) — hourly/daily 분류는 소속 Enum 클래스로 결정되고, 테이블 추가/제거 시 Enum 한 곳만 수정하면 append/재처리가 함께 반영되는 단일 소스 |
-| `start_time` / `end_time` | 없음 | **수동 실행 시 조회 범위를 직접 정의** (WAIT+FAILED 전체). 둘 다 함께 지정해야 하며, `end_time ≤ 전날 00:00`만 허용 — 전날/당일은 append 조회 범위와 겹치므로 prepare_run이 검증 후 거부. 기존 DAG과 동일한 date-time 형식 → 내부에서 ts 문자열(`YYYYMMDDHHmmSSsss`)로 변환. 미지정 시 정기 범위(그저께 00:00 ~ 전날 끝) |
+| `start_time` / `end_time` | 없음 | **수동 실행 시 조회 범위를 직접 정의** (WAIT_SCHEDULING+FAILURE 전체). 둘 다 함께 지정해야 하며, `end_time ≤ 전날 00:00`만 허용 — 전날/당일은 append 조회 범위와 겹치므로 prepare_run이 검증 후 거부. 기존 DAG과 동일한 date-time 형식 → 내부에서 ts 문자열(`YYYYMMDDHHmmSSsss`)로 변환. 미지정 시 정기 범위(그저께 00:00 ~ 전날 끝) |
 
 ### 5.2 Task 구성
 
@@ -300,15 +300,15 @@ SELECT * FROM (
      WHERE table_name = :tbl
        AND ts >= :ts_from           -- 그저께 00:00  '20260702000000000'
        AND ts <  :ts_to             -- 전날 끝       '20260704000000000'
-       AND ( status = 'FAILED'                                   -- FAILED: 전 구간
-             OR (status = 'WAIT' AND ts < :wait_bound)           -- WAIT: 전날 01:00 이전만
+       AND ( status = 'FAILURE'                                   -- FAILURE: 전 구간
+             OR (status = 'WAIT_SCHEDULING' AND ts < :wait_bound)           -- WAIT_SCHEDULING: 전날 01:00 이전만
            )
      ORDER BY ts ASC                -- append와 동일, 오래된 것부터
 ) WHERE ROWNUM <= :row_limit        -- 1,000 (ts는 meta의 적재 범위 기록용으로 함께 조회)
 ```
-   - 수동 실행 시: prepare_run이 검증한 `start_time`~`end_time` 범위의 WAIT+FAILED 전체
+   - 수동 실행 시: prepare_run이 검증한 `start_time`~`end_time` 범위의 WAIT_SCHEDULING+FAILURE 전체
    - 조회 직후 **영수증 필터를 적용하기 전 건수로 잔여분 여부를 기록** (**어느 한 DB라도** 상한 1,000건을 채웠으면 그 DB에 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 필터로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
-3. **영수증 확인** — 조회 row에서 읽은 stat_desc(batch_id)를 모아 `.snapshots`와 한 번에 대조 → 커밋이 확인된 batch의 row는 DONE 정정(원천 DB별) 후 대상에서 제외 (섹션 4). **status로 거르지 않는다** — WAIT라도 커밋 후 상태 갱신만 실패한 것일 수 있고, 그 경우 재적재하면 중복이다
+3. **영수증 확인** — 조회 row에서 읽은 stat_desc(batch_id)를 모아 `.snapshots`와 한 번에 대조 → 커밋이 확인된 batch의 row는 SUCCESS 정정(원천 DB별) 후 대상에서 제외 (섹션 4). **status로 거르지 않는다** — WAIT라도 커밋 후 상태 갱신만 실패한 것일 수 있고, 그 경우 재적재하면 중복이다
 4. **파일 목록 수집** — 조회한 row 전부의 `param.files`를 순서대로 모은다. 별도 크기 상한은 두지 않는다 — 한 회차 물량은 `ROW_LIMIT`으로만 통제한다
 
 > **크기 기준 상한을 두지 않는 이유**: 처리량 통제 수단이 둘이면 둘 사이가 어긋난다. `ROW_LIMIT`이 만드는 최대 물량은 약 22GB로 추정되는데(아래 환산), 여기에 16GB 같은 크기 상한을 겹치면 크기 쪽이 항상 먼저 걸려 `ROW_LIMIT` 값이 무의미해진다. 상한을 하나로 두고 그 값을 실측으로 조정하는 편이 낫다.
@@ -322,7 +322,7 @@ SELECT * FROM (
 > | ⇒ 한 회차 최대 | ≈ **22GB** ≈ Spark 2분 (처리량 8GB/44초 선형 외삽) |
 >
 > 백로그가 크게 쌓인 날에만 이 규모에 도달하며, 그때의 Spark job 크기를 실측해 `ROW_LIMIT`을 조정한다 (섹션 9-8).
-5. **XCom 기록 (2건)** — **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, XCom이 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. 순서가 반대면 마킹되지 않은 row는 상태가 WAIT/FAILED라 update task 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
+5. **XCom 기록 (2건)** — **마킹보다 먼저** 남긴다. 마킹은 DB 수만큼 UPDATE가 나가 중간 실패 가능성이 있는데, XCom이 없으면 이미 마킹된 row를 update_failure가 회수하지 못해 좀비가 된다. 순서가 반대면 마킹되지 않은 row는 상태가 WAIT_SCHEDULING/FAILED라 update task 조건에서 자동으로 빠지고 다음 회차에 정상 회수되므로, 어느 쪽으로 실패해도 안전하다
 
 | key | 내용 | 소비자 |
 |-----|------|--------|
@@ -443,7 +443,7 @@ append DAG의 조회 로직(최근 1일, WAIT만, ts ASC, DB당 ROWNUM 200, conn
 
 | 대상 | 조건 | 대응 |
 |------|------|------|
-| 자동 재처리 범위 초과 | 그저께 이전(3~7일 전) `ts` 범위에 `WAIT` 또는 `FAILED` 존재 | 원인 확인 → 재처리 DAG 수동 실행 (8.3) |
+| 자동 재처리 범위 초과 | 그저께 이전(3~7일 전) `ts` 범위에 `WAIT_SCHEDULING` 또는 `FAILURE` 존재 | 원인 확인 → 재처리 DAG 수동 실행 (8.3) |
 | loop 상한 도달 | `loop_count` 10회 초과 | append DAG 장애 등 대량 밀림 상황 → 원인 확인 후 수동 판단 |
 
 > 잔류 알림 쿼리도 하루 단위 `ts` 범위 조회를 날짜별로 반복한다 (Partition Pruning 유지). 잔류가 매일 꾸준히 증가하면 스케줄링 문제가 아니라 **처리량 부족(capacity)** 신호 — append 조회 상한(DB당 200/5분)이 유입량과 같은 수준이므로 리소스 증설/주기/상한 조정을 검토한다.
@@ -499,7 +499,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 
 | 항목 | 무엇인가 | 호출부가 할 일 |
 |------|---------|---------------|
-| `to_done` | 영수증 확인으로 **이미 커밋이 확인된** 대상 | `_update_jobs(conn_id, pks, "DONE")` — 재적재하지 않는다. `batch_id`는 넘기지 않아 기존 `stat_desc`(영수증)를 유지한다. **`files`가 비어 있어도 먼저 처리해야 한다** |
+| `to_done` | 영수증 확인으로 **이미 커밋이 확인된** 대상 | `_update_jobs(conn_id, pks, "SUCCESS")` — 재적재하지 않는다. `batch_id`는 넘기지 않아 기존 `stat_desc`(영수증)를 유지한다. **`files`가 비어 있어도 먼저 처리해야 한다** |
 | `files` | 이번에 적재할 avro 파일 목록 | 기존 파일 목록 함수에 넘기고, **반환된 executor 개수를 XCom push** (Spark operator가 pull). **비었으면 `False` 반환 → short_circuit으로 하류 skip** |
 | `to_mark` | 이번에 적재할 대상 | XCom에 먼저 남긴 뒤(update_failure 회수용) `_update_jobs(conn_id, pks, "IN_PROGRESS", batch_id)` |
 | `batch_id` | 이번 배치의 영수증 값 | 위 마킹에 쓰고, Spark 쓰기 옵션 `option("snapshot-property.batch_id", batch_id)`에도 같은 값 |
@@ -528,7 +528,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 SELECT table_name, status, COUNT(*) AS cnt
   FROM JOB_HISTORY
  WHERE ts >= :day_start AND ts < :day_end      -- 예: '20260701000000000' ~ '20260702000000000'
-   AND status IN ('WAIT', 'FAILED')
+   AND status IN ('WAIT_SCHEDULING', 'FAILURE')
  GROUP BY table_name, status;
 -- 파일 크기는 param(VARCHAR2 JSON) 안에 있어 단순 SUM이 불가하다.
 -- 총 크기까지 보려면 JSON_VALUE(param, '$.<크기 키>' RETURNING NUMBER)로 꺼내 집계한다
