@@ -52,8 +52,8 @@ SELECT * FROM (
       FROM JOB_HISTORY
      WHERE table_name = :tbl
        AND ts >= :ts_from AND ts < :ts_to
-       AND ( status = 'FAILED'
-             OR (status = 'WAIT' AND ts < :wait_bound) )
+       AND ( status = 'FAILURE'
+             OR (status = 'WAIT_SCHEDULING' AND ts < :wait_bound) )
      ORDER BY ts ASC
 ) WHERE ROWNUM <= :row_limit
 """
@@ -111,7 +111,7 @@ def reprocess_select_jobs(cfg, table, run_id):
     result["has_more"] = any(len(r) >= ROW_LIMIT for r in jobs_by_conn.values())
 
     # ── ② 영수증 확인 (설계 4) ────────────────────────────────────────────
-    # status는 커밋 여부의 증거가 아니다. Airflow가 실패로 판정했든(FAILED),
+    # status는 커밋 여부의 증거가 아니다. Airflow가 실패로 판정했든(FAILURE),
     # 커밋 뒤 상태 갱신만 실패했든(WAIT로 잔류) Spark 커밋은 성공했을 수 있다.
     # batch_id가 snapshot에 있으면 그 데이터는 이미 Iceberg에 있다 → 재적재 금지.
     batch_ids = {r["stat_desc"] for rows in jobs_by_conn.values() for r in rows
@@ -153,7 +153,7 @@ def _select_rows(conn_id, sql, binds):
     with OracleHook(oracle_conn_id=conn_id).get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql, binds)
         columns = [d[0].lower() for d in cur.description]
-        return [dict(zip(columns, row)) for row in cur]
+        return [dict(zip(columns, row, strict=True)) for row in cur]
 
 
 def _pk_of(row):
@@ -183,7 +183,7 @@ class ConvertFileTaskGroup(TaskGroup):
 
         # ── 기존 __init__ 지역값들: 위치 이동 없음 ─────────────────────────
         logger = logging.getLogger(__name__)
-        config = ...              # 기존 설정값 로딩 그대로
+        config = ...              # noqa: F841  기존 설정값 로딩 그대로
 
         def _update_jobs(conn_id, keys, status, batch_id=None):
             """Job History 상태 update — 기존 지역 헬퍼 그대로."""
@@ -223,11 +223,11 @@ class ConvertFileTaskGroup(TaskGroup):
                 logger.info("reprocess get_jobs: %s", table.get_name())
                 r = reprocess_select_jobs(cfg, table, run_id)
 
-                # 이미 Iceberg에 커밋된 건 → 재적재 없이 DONE 정정.
+                # 이미 Iceberg에 커밋된 건 → 재적재 없이 SUCCESS 정정.
                 # batch_id를 넘기지 않아 기존 stat_desc(영수증)가 유지된다.
                 # files가 비어도 이건 처리해야 하므로 아래 return보다 위에 둔다
                 for conn_id, pks in r["to_done"].items():
-                    _update_jobs(conn_id, pks, "DONE")
+                    _update_jobs(conn_id, pks, "SUCCESS")
 
                 if not r["files"]:
                     return False              # 대상 없음 → 그룹 내 하류 skip
@@ -262,11 +262,11 @@ class ConvertFileTaskGroup(TaskGroup):
 
         @task(task_id="update_success", task_group=self, trigger_rule="all_success")
         def update_success(ti=None):
-            ...                   # 기존 구현 (meta의 키 목록으로 DONE 처리)
+            ...                   # 기존 구현 (meta의 키 목록으로 SUCCESS 처리)
 
         @task(task_id="update_failure", task_group=self, trigger_rule="all_failed")
         def update_failure(ti=None):
-            ...                   # 기존 구현 (meta의 키 목록으로 FAILED 처리)
+            ...                   # 기존 구현 (meta의 키 목록으로 FAILURE 처리)
 
         jobs >> spark >> [update_success(), update_failure()]
 
