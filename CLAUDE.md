@@ -20,7 +20,7 @@
 
 - Spark 4.1.1, Iceberg 1.10.1, Airflow 3.2.2
 - Kubernetes 클러스터 (Spark Pod 실행 환경)
-- S3 (MinIO) 스토리지 — Iceberg 테이블
+- S3 (MinIO) 스토리지 — Iceberg 테이블 (카탈로그: **HMS**)
 - Trino — 조회 엔진 (DBeaver JDBC 드라이버로 실행)
 - Oracle DB (처리 대상 상태 관리)
   - Job History `status` 값: `WAIT_SCHEDULING` → `IN_PROGRESS` → `SUCCESS` / `FAILURE`
@@ -92,6 +92,7 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
   - Compaction: 기존 DAG trigger — daily `target_dt`, hourly `start_time`/`end_time` + 양쪽 `tables` multi-select params. daily 스케줄 00:35 → **02:00 이동** (재처리 적재 전날분 자연 커버 + 자정 지연 적재분 구멍 해소), hourly `15 * * * *` 유지
   - 수동 실행: `tables`(multi-select) + `start_time`/`end_time` params (조회 범위 직접 정의, `end_time ≤ 전날 00:00`만 허용)
   - 좀비 IN_PROGRESS(2시간 초과): 탐지 + 알림만, 자동 복구 안 함
+  - append DAG과 동일 테이블에 동시 append 커밋 가능 — HMS의 compare-and-swap + Iceberg 재시도로 안전 (둘 다 반영, 유실·중복 없음). `HadoopCatalog`로 전환 시 이 전제가 깨진다 (설계 2.2)
 - **전제**: Iceberg snapshot 보존 3일 > 재처리 조회 범위 2일 유지 필수. Compaction DAG 변경(02:00, tables params)은 재처리 DAG 배포 전 적용
 
 ## 파일 구조
