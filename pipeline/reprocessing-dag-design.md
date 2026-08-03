@@ -365,10 +365,10 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
 
 ```sql
 -- conn_list의 DB 2개에 각각 실행 (결과는 {conn_id: rows}로 보관)
--- 조회 컬럼 = 복합키 4개 + base_path + param(JSON) + status + stat_desc(영수증용)
--- 컬럼명은 커서(description)에서 받아 그대로 row의 키로 쓴다 → 변환 컬럼에는 별칭 필수
+-- 조회 컬럼 = 복합키 4개 + base_path + param(JSON) + stat_desc(영수증용)
+-- status는 조건으로만 쓰고 결과로 받지 않는다 (아래 주의 참조)
 SELECT * FROM (
-    SELECT k_1, k_2, k_3, ts, base_path, param, status,
+    SELECT k_1, k_2, k_3, ts, base_path, param,
            DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc  -- CLOB → VARCHAR2 (아래 주의)
       FROM JOB_HISTORY
      WHERE table_name = :tbl
@@ -380,6 +380,9 @@ SELECT * FROM (
      ORDER BY ts ASC                -- append와 동일, 오래된 것부터
 ) WHERE ROWNUM <= :row_limit        -- 1,000 (ts는 meta의 적재 범위 기록용으로 함께 조회)
 ```
+   - 조회는 **append와 동일하게 `OracleHook.get_records`** 를 쓴다. 반환은 tuple 목록이므로 `namedtuple`(`Job`)로 감싸 이름으로 접근한다. **필드 순서를 SELECT와 맞춰야 하며**, 어긋나면 `Job(*row)`가 개수 불일치로 **즉시 실패**한다 — 컬럼 목록 상수를 따로 두고 `zip`하면 값이 밀려도 조회는 성공해 런타임까지 드러나지 않는다
+   - 복합키를 SELECT 앞에 몰아두어 **`job[:4]`가 곧 상태 UPDATE에 넘길 키**가 된다 (별도 추출 함수 불필요)
+   - **`status`는 조건으로만 쓰고 결과로 받지 않는다.** 영수증 확인은 status가 아니라 batch_id로 판단하므로(섹션 4.2), 결과에 두면 잘못된 필터가 다시 생길 여지만 남는다
    - 수동 실행 시: prepare_run이 검증한 `start_time`~`end_time` 범위의 WAIT_SCHEDULING+FAILURE 전체
    - 조회 직후 **영수증 필터를 적용하기 전 건수로 잔여분 여부를 기록** (**어느 한 DB라도** 상한 1,000건을 채웠으면 그 DB에 더 남았다는 뜻 — loop 판단은 이 시점 값 기준. 필터로 줄어든 후의 건수로 판단하면 잔여분을 놓친다)
 3. **영수증 확인** — 조회 row에서 읽은 stat_desc(batch_id)를 모아 `.snapshots`와 한 번에 대조 → 커밋이 확인된 batch의 row는 SUCCESS 정정(원천 DB별) 후 대상에서 제외 (섹션 4). **status로 거르지 않는다** — WAIT라도 커밋 후 상태 갱신만 실패한 것일 수 있고, 그 경우 재적재하면 중복이다

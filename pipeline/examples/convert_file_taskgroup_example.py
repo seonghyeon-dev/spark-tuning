@@ -22,6 +22,7 @@
 
 import json
 import logging
+from collections import namedtuple
 
 from airflow.providers.oracle.hooks.oracle import OracleHook
 from airflow.sdk import TaskGroup, task
@@ -38,16 +39,21 @@ from airflow.sdk import TaskGroup, task
 ROW_LIMIT = 1000     # 테이블당·DB당 조회 상한 — 한 회차 물량은 이것만으로 통제한다
                      # (설계 5.4 — 러프 설정, 운영 데이터로 재검증 필요)
 
-# 복합키 4개 (ts도 그중 하나). 상태 UPDATE 인자로 넘길 때는 이 순서의 값 tuple.
-# TODO(연결): 실제 컬럼명으로 교체 — 아래 SQL의 컬럼명도 함께 고칠 것
-PK_COLUMNS = ("k_1", "k_2", "k_3", "ts")
+# 조회 결과 1건. `get_records`는 tuple을 돌려주므로 이 이름표를 씌워서 쓴다.
+# **필드 순서는 아래 SELECT 순서와 반드시 같아야 한다.** 어긋나면 Job(*row)가
+# 개수 불일치로 즉시 실패하므로, 값이 밀린 채 조용히 흘러가지 않는다.
+# 복합키를 앞에 몰아두어 job[:PK_LEN]이 곧 상태 UPDATE에 넘길 키가 된다.
+# TODO(연결): 실제 복합키 컬럼명으로 교체 — 아래 SQL도 함께 고칠 것
+Job = namedtuple("Job", "k_1 k_2 k_3 ts base_path param stat_desc")
+PK_LEN = 4           # Job 앞 4개가 복합키
 
-# stat_desc(CLOB)를 그냥 조회하면 LOB 객체로 와 문자열 비교·set 연산이 안 되므로
+# status는 조회 조건으로만 쓰고 결과로는 받지 않는다 — 영수증 확인은 status가 아니라
+# batch_id로 판단하므로(설계 4.2), 받아두면 잘못된 필터가 다시 생길 여지만 남는다.
+# stat_desc(CLOB)는 그냥 조회하면 LOB 객체로 와 문자열 비교·set 연산이 안 되므로
 # VARCHAR2로 변환해 받는다 (batch_id는 짧아 4000바이트로 충분).
-# 컬럼명이 곧 row의 키가 되므로 변환 컬럼에는 `AS stat_desc` 별칭이 반드시 필요하다.
 SELECT_TARGETS_SQL = """
 SELECT * FROM (
-    SELECT k_1, k_2, k_3, ts, base_path, param, status,
+    SELECT k_1, k_2, k_3, ts, base_path, param,
            DBMS_LOB.SUBSTR(stat_desc, 4000, 1) AS stat_desc
       FROM JOB_HISTORY
      WHERE table_name = :tbl
@@ -75,7 +81,7 @@ def committed_batch_ids(table_name, batch_ids):
 def reprocess_select_jobs(cfg, table, run_id):
     """재처리 대상 조회. append get_jobs와 조회 범위·영수증 확인만 다르다.
 
-      ① DB 2개에서 대상 조회 (전날+그저께, WAIT는 append 범위 밖만)
+      ① DB 2개에서 대상 조회 (전날+그저께, WAIT_SCHEDULING은 append 범위 밖만)
       ② 영수증 확인 — 이미 Iceberg에 커밋된 건은 재적재하면 중복이므로 골라낸다
       ③ 남은 것을 ts 오름차순으로 세워 파일 목록과 복합키 목록을 만든다
 
@@ -103,42 +109,45 @@ def reprocess_select_jobs(cfg, table, run_id):
     # 원천 DB를 찾아가므로 row에 출처를 따로 붙일 필요가 없다. ROW_LIMIT은 DB당.
     binds = {"tbl": table_name, "row_limit": ROW_LIMIT, "ts_from": cfg["ts_from"],
              "ts_to": cfg["ts_to"], "wait_bound": cfg["wait_bound"]}
-    jobs_by_conn = {conn_id: _select_rows(conn_id, SELECT_TARGETS_SQL, binds)
-                    for conn_id in ORACLE_CONN_IDS}  # noqa: F821
+    jobs_by_conn = {}
+    for conn_id in ORACLE_CONN_IDS:  # noqa: F821
+        rows = OracleHook(oracle_conn_id=conn_id).get_records(
+            SELECT_TARGETS_SQL, parameters=binds)
+        jobs_by_conn[conn_id] = [Job(*row) for row in rows]
 
     # 상한을 꽉 채운 DB가 있으면 거기에 더 남았다는 뜻이다. ②에서 건수가 줄면
     # 알 수 없게 되므로 지금 기록해 둔다 (loop를 한 번 더 돌지 판단하는 근거)
-    result["has_more"] = any(len(r) >= ROW_LIMIT for r in jobs_by_conn.values())
+    result["has_more"] = any(len(jobs) >= ROW_LIMIT for jobs in jobs_by_conn.values())
 
     # ── ② 영수증 확인 (설계 4) ────────────────────────────────────────────
     # status는 커밋 여부의 증거가 아니다. Airflow가 실패로 판정했든(FAILURE),
-    # 커밋 뒤 상태 갱신만 실패했든(WAIT로 잔류) Spark 커밋은 성공했을 수 있다.
-    # batch_id가 snapshot에 있으면 그 데이터는 이미 Iceberg에 있다 → 재적재 금지.
-    batch_ids = {r["stat_desc"] for rows in jobs_by_conn.values() for r in rows
-                 if r["stat_desc"]}
+    # 커밋 뒤 상태 갱신만 실패했든(WAIT_SCHEDULING으로 잔류) Spark 커밋은 성공했을
+    # 수 있다. batch_id가 snapshot에 있으면 이미 Iceberg에 있다 → 재적재 금지.
+    batch_ids = {j.stat_desc for jobs in jobs_by_conn.values() for j in jobs
+                 if j.stat_desc}
     committed = committed_batch_ids(table_name, batch_ids) if batch_ids else set()
     if committed:
-        for conn_id, rows in jobs_by_conn.items():
-            done = [r for r in rows if r["stat_desc"] in committed]
+        for conn_id, jobs in jobs_by_conn.items():
+            done = [j for j in jobs if j.stat_desc in committed]
             if done:
-                result["to_done"][conn_id] = [_pk_of(r) for r in done]
-                jobs_by_conn[conn_id] = [r for r in rows
-                                         if r["stat_desc"] not in committed]
+                result["to_done"][conn_id] = [j[:PK_LEN] for j in done]
+                jobs_by_conn[conn_id] = [j for j in jobs
+                                         if j.stat_desc not in committed]
 
     # ── ③ 적재 대상 구성 ──────────────────────────────────────────────────
     # DB별 결과를 합쳐 오래된 것부터 세운다 (append와 같은 순서). 항목에 conn_id를
     # 함께 두는 이유는 합치고 나면 어느 DB에서 왔는지 잃어버리기 때문이다.
-    candidates = [(row["ts"], row, conn_id)
-                  for conn_id, rows in jobs_by_conn.items() for row in rows]
+    candidates = [(j.ts, j, conn_id)
+                  for conn_id, jobs in jobs_by_conn.items() for j in jobs]
     candidates.sort(key=lambda c: c[0])   # DB별로 정렬돼 있어도 합치면 깨진다
 
-    for _, row, conn_id in candidates:
-        result["files"] += json.loads(row["param"])["files"]  # row당 파일 여러 개 가능
-        result["to_mark"].setdefault(conn_id, []).append(_pk_of(row))
+    for _, job, conn_id in candidates:
+        result["files"] += json.loads(job.param)["files"]  # row당 파일 여러 개 가능
+        result["to_mark"].setdefault(conn_id, []).append(job[:PK_LEN])
 
     if not result["files"]:
         # 조회가 비었거나 전부 영수증 정정으로 빠진 경우.
-        # 후자에서 has_more가 살아 있어도 loop를 돌지 않는데, 정정된 건은 DONE으로
+        # 후자에서 has_more가 살아 있어도 loop를 돌지 않는데, 정정된 건은 SUCCESS로
         # 확정돼 다시 조회되지 않으므로 다음날 실행이 나머지를 이어받는다.
         return result
 
@@ -146,19 +155,6 @@ def reprocess_select_jobs(cfg, table, run_id):
     result["ts_min"], result["ts_max"] = candidates[0][0], candidates[-1][0]
     result["batch_id"] = f"{run_id}_{table_name}"  # 배치당 1개 = 커밋 1회 = 영수증 1개
     return result
-
-
-def _select_rows(conn_id, sql, binds):
-    """조회 결과를 컬럼명 dict로 매핑 (Oracle이 대문자로 주므로 소문자로 통일)."""
-    with OracleHook(oracle_conn_id=conn_id).get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, binds)
-        columns = [d[0].lower() for d in cur.description]
-        return [dict(zip(columns, row, strict=True)) for row in cur]
-
-
-def _pk_of(row):
-    """row → 복합키 값 tuple. 상태 UPDATE 인자로 그대로 넘긴다."""
-    return tuple(row[c] for c in PK_COLUMNS)
 
 
 # ══════════════════════════════════════════════════════════════════════════
