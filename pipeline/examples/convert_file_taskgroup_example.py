@@ -162,41 +162,48 @@ def reprocess_select_jobs(cfg, table, run_id):
 # ══════════════════════════════════════════════════════════════════════════
 
 class JobHistoryQuery:
-    """Job History SQL 모음 — 각 함수가 SQL을 돌려주는 기존 구조 그대로."""
+    """Job History SQL 모음."""
 
     @classmethod
     def update_status(cls, batch_id=None):
-        """상태 UPDATE SQL.
+        """상태 UPDATE — **(SQL, 추가 바인드)** 를 함께 돌려준다.
 
         batch_id를 주면 영수증(stat_desc)까지 기록하고, 주지 않으면 status만 바꿔
         **기존 영수증을 보존한다.** `SET stat_desc = :batch_id`를 항상 두면 batch_id
         없이 부르는 update_success / update_failure / 영수증 정정이 NULL로 덮어써
         영수증이 지워진다 (설계 5.3-6).
 
+        SQL만 돌려주고 바인드는 호출부가 만들면 안 된다. 드라이버가 SQL에 없는
+        바인드를 거부하기 때문이다 —
+            no bind placeholder named ":batch_id" was found in the SQL text
+        즉 SQL 모양과 바인드 구성은 **한 가지 결정**이므로 한 곳에서 함께 정한다.
+
         판단은 `is not None` 기준이다 — "값이 참인가"가 아니라 "인자를 주었는가".
         """
-        receipt = ", stat_desc = :batch_id" if batch_id is not None else ""
+        receipt_set, receipt_bind = (
+            (", stat_desc = :batch_id", {"batch_id": batch_id})
+            if batch_id is not None else ("", {})
+        )
         return f"""
 UPDATE JOB_HISTORY
-   SET status = :status{receipt}
+   SET status = :status{receipt_set}
  WHERE k_1 = :k_1 AND k_2 = :k_2 AND k_3 = :k_3 AND ts = :ts
-"""
+""", receipt_bind
 
 
 def update_jobs_sample(conn_id, keys, status, batch_id=None):
-    """호출부 — 분기는 쿼리 함수 한 곳뿐이고, 바인드는 그대로 넘긴다."""
+    """호출부 — 받은 두 값을 그대로 쓴다. 여기엔 분기가 없다."""
     if not keys:
         return
-    binds = [{"status": status, "batch_id": batch_id,
+    sql, receipt = JobHistoryQuery.update_status(batch_id)
+    binds = [{"status": status, **receipt,
               "k_1": k_1, "k_2": k_2, "k_3": k_3, "ts": ts}
              for k_1, k_2, k_3, ts in keys]      # keys = [복합키 값 tuple, ...]
 
     hook = OracleHook(oracle_conn_id=conn_id)
     with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.executemany(JobHistoryQuery.update_status(batch_id), binds)
+        cur.executemany(sql, binds)
         conn.commit()
-    # batch_id가 SQL에 없는 경우 바인드에 남은 그 키를 드라이버가 무시하는지는
-    # 실환경에서 한 번만 확인하면 된다. 걸리면 이 함수에서 키 하나만 빼면 끝이다.
 
 
 # ══════════════════════════════════════════════════════════════════════════
