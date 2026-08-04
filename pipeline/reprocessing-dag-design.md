@@ -270,6 +270,11 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 > 모든 batch_id가 반환되며, 이는 대조에 필요한 양보다 훨씬 크다 (append 약 5분 주기
 > → 테이블당 수백~수천 snapshot). 넘긴 `batch_ids`의 부분집합만 받아야 한다.
 
+> **영수증의 수명**: 마킹 시 한 번 기록하고 그 뒤로는 지우지 않는다. 상태가
+> `IN_PROGRESS` → `SUCCESS`/`FAILURE`로 바뀌어도 `stat_desc`는 그대로 두어야 한다
+> (섹션 5.3-6). 재처리가 다시 집을 때 판단 근거가 되는 값이므로, 상태 갱신 과정에서
+> 지워지면 중복 적재 방지가 작동하지 않는다.
+>
 > **확인 대상은 status와 무관하게 batch_id를 가진 row 전부다.** `status`는 커밋
 > 여부의 증거가 아니다. Airflow가 실패로 판정해 FAILED가 된 경우뿐 아니라,
 > **Spark 커밋은 성공했는데 그 뒤 상태 갱신이 실패해 row가 WAIT로 남는 경우**도
@@ -419,6 +424,36 @@ SELECT * FROM (
    - `keys`는 **복합키 값 tuple**로 올린다. row마다 컬럼명을 풀어 담으면 같은 이름 4개가 건수만큼 반복돼 XCom만 커진다
 6. **IN_PROGRESS 마킹 — 기존 함수에 위임** — 상태 UPDATE는 ConvertFileTaskGroup의 `_update_jobs`가 이미 수행한다. 재처리는 `{conn_id: [복합키 tuple]}`과 `batch_id`를 만들어 넘길 뿐, UPDATE 문을 따로 갖지 않는다 (영수증 정정도 같은 함수 사용)
 
+> **영수증은 마킹 때 한 번 쓰고, 이후 상태 변경에서는 건드리지 않는다.**
+> `_update_jobs`의 UPDATE 문을 하나로 합쳐 `SET stat_desc = :batch_id`를 항상 두면,
+> batch_id 없이 부르는 경로가 stat_desc를 **NULL로 덮어써 영수증이 지워진다.**
+>
+> | 호출 | batch_id | 합쳐 둘 경우 결과 |
+> |------|----------|------------------|
+> | IN_PROGRESS 마킹 | 있음 | 영수증 기록 (정상) |
+> | update_success | 없음 | NULL로 덮어씀 |
+> | **update_failure** | 없음 | **NULL로 덮어씀** |
+> | 영수증 확인 후 SUCCESS 정정 | 없음 | 방금 확인한 영수증을 지움 |
+>
+> `update_failure`가 특히 문제다. `FAILURE`는 다음날 재처리가 집는 대상이고 그때
+> 영수증으로 커밋 여부를 판단해야 하는데, 그 값을 지워버리므로 **거짓 실패 건이
+> 판단 근거 없이 재적재된다.** 중복 적재 방지(섹션 4)가 통째로 무력화된다.
+>
+> 따라서 **batch_id를 준 호출에서만 stat_desc를 갱신**한다.
+>
+> ```sql
+> -- 마킹: 영수증 기록
+> UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id WHERE <복합키>
+> -- 상태만 변경: 영수증 보존
+> UPDATE JOB_HISTORY SET status = :status                        WHERE <복합키>
+> ```
+>
+> `COALESCE(:batch_id, stat_desc)`로 한 문장에 담는 방법은 권하지 않는다 — stat_desc가
+> CLOB이라 VARCHAR2 바인드와 섞으면 암시적 변환에 의존하고(`ORA-00932` 가능),
+> `executemany`에서 batch_id가 전 건 NULL이면 바인드 타입 추론이 되지 않는다.
+>
+> SUCCESS 이후에도 영수증을 남기면 좀비 수동 판정(섹션 8.2)에서 snapshot과 대조할 수 있다.
+
 7. **Spark 입력 준비 — 기존 함수에 위임** — 재처리 조회 로직은 담기로 한 파일 목록을 반환하는 데서 끝난다. avro 경로 텍스트 파일 S3 업로드와 size 총합 XCom push(Spark operator가 pull)는 **ConvertFileTaskGroup에 이미 있는 함수가 그대로 수행**하므로 재구현하지 않는다
 
 > **`param` 구조**: `{"files": [{"file_path": ..., "size": ...}, ...]}` — **row 1건에 파일이 여러 개**일 수 있다. 재처리가 이 목록을 가공 없이 모아 부모 함수에 넘기므로, 경로 조합 규칙·size 단위 해석이 append와 자동으로 일치한다. 재처리는 이 목록의 내용을 들여다보지 않는다 — `size`도 부모 함수가 합산한다.
@@ -505,7 +540,7 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 
 | 대상 | 변경 | 내용 |
 |------|------|------|
-| append DAG (테이블별 공통 py) | batch_id 기록 2건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 |
+| append DAG (테이블별 공통 py) | batch_id 기록 3건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 ③ **`_update_jobs`가 batch_id를 준 호출에서만 stat_desc를 갱신하도록 분기** — 안 그러면 update_success/update_failure가 영수증을 NULL로 지운다 (섹션 5.3-6) |
 | ConvertFileTaskGroup | `reprocess_cfg` 옵션 인자 + 재처리 분기 추가 | ① `__init__(..., reprocess_cfg=None)` 인자 추가 ② get_jobs 생성부를 if/else로 감싸고 else에 재처리 조회 task를 둔다 — 미지정이면 기존 인라인 경로(**코드·closure 전부 그대로, append 동작 완전 동일**). 재처리 task가 같은 `__init__` 스코프에 있으므로 `_update_jobs`·logger·config를 그냥 호출한다 (전달 인자 없음). **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
 | daily Compaction DAG | 스케줄 + params | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체) |
 | hourly Compaction DAG | params | params에 `tables` multi-select 추가 (기본 전체). 스케줄 변경 없음 |
