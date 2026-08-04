@@ -439,18 +439,18 @@ SELECT * FROM (
 > 영수증으로 커밋 여부를 판단해야 하는데, 그 값을 지워버리므로 **거짓 실패 건이
 > 판단 근거 없이 재적재된다.** 중복 적재 방지(섹션 4)가 통째로 무력화된다.
 >
-> 따라서 **batch_id를 준 호출에서만 stat_desc를 갱신**한다.
+> 따라서 **batch_id를 준 호출에서만 stat_desc를 갱신**한다. 분기는 SQL을 돌려주는
+> 함수 한 곳에 둔다.
 >
-> ```sql
-> -- 마킹: 영수증 기록
-> UPDATE JOB_HISTORY SET status = :status, stat_desc = :batch_id WHERE <복합키>
-> -- 상태만 변경: 영수증 보존
-> UPDATE JOB_HISTORY SET status = :status                        WHERE <복합키>
+> ```python
+> receipt = ", stat_desc = :batch_id" if batch_id is not None else ""
+> return f"UPDATE JOB_HISTORY SET status = :status{receipt} WHERE <복합키>"
 > ```
 >
-> `COALESCE(:batch_id, stat_desc)`로 한 문장에 담는 방법은 권하지 않는다 — stat_desc가
-> CLOB이라 VARCHAR2 바인드와 섞으면 암시적 변환에 의존하고(`ORA-00932` 가능),
-> `executemany`에서 batch_id가 전 건 NULL이면 바인드 타입 추론이 되지 않는다.
+> `COALESCE(:batch_id, stat_desc)`로 조건 없이 한 문장에 담는 방법은 권하지 않는다 —
+> stat_desc가 CLOB이라 VARCHAR2 바인드와 섞으면 암시적 변환에 의존하고
+> (`ORA-00932` 가능), `executemany`에서 batch_id가 전 건 NULL이면 바인드 타입
+> 추론이 되지 않는다.
 >
 > SUCCESS 이후에도 영수증을 남기면 좀비 수동 판정(섹션 8.2)에서 snapshot과 대조할 수 있다.
 

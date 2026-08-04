@@ -158,6 +158,48 @@ def reprocess_select_jobs(cfg, table, run_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# ★ 변경 — 쿼리 클래스: 상태 UPDATE를 batch_id 유무로 분기
+# ══════════════════════════════════════════════════════════════════════════
+
+class JobHistoryQuery:
+    """Job History SQL 모음 — 각 함수가 SQL을 돌려주는 기존 구조 그대로."""
+
+    @classmethod
+    def update_status(cls, batch_id=None):
+        """상태 UPDATE SQL.
+
+        batch_id를 주면 영수증(stat_desc)까지 기록하고, 주지 않으면 status만 바꿔
+        **기존 영수증을 보존한다.** `SET stat_desc = :batch_id`를 항상 두면 batch_id
+        없이 부르는 update_success / update_failure / 영수증 정정이 NULL로 덮어써
+        영수증이 지워진다 (설계 5.3-6).
+
+        판단은 `is not None` 기준이다 — "값이 참인가"가 아니라 "인자를 주었는가".
+        """
+        receipt = ", stat_desc = :batch_id" if batch_id is not None else ""
+        return f"""
+UPDATE JOB_HISTORY
+   SET status = :status{receipt}
+ WHERE k_1 = :k_1 AND k_2 = :k_2 AND k_3 = :k_3 AND ts = :ts
+"""
+
+
+def update_jobs_sample(conn_id, keys, status, batch_id=None):
+    """호출부 — 분기는 쿼리 함수 한 곳뿐이고, 바인드는 그대로 넘긴다."""
+    if not keys:
+        return
+    binds = [{"status": status, "batch_id": batch_id,
+              "k_1": k_1, "k_2": k_2, "k_3": k_3, "ts": ts}
+             for k_1, k_2, k_3, ts in keys]      # keys = [복합키 값 tuple, ...]
+
+    hook = OracleHook(oracle_conn_id=conn_id)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.executemany(JobHistoryQuery.update_status(batch_id), binds)
+        conn.commit()
+    # batch_id가 SQL에 없는 경우 바인드에 남은 그 키를 드라이버가 무시하는지는
+    # 실환경에서 한 번만 확인하면 된다. 걸리면 이 함수에서 키 하나만 빼면 끝이다.
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 기존 클래스 — ★ 추가 ②③ 만 반영하면 된다
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -185,21 +227,15 @@ class ConvertFileTaskGroup(TaskGroup):
             """Job History 상태 update — 기존 지역 헬퍼.
 
             ★ 변경 필요: **batch_id를 준 호출에서만 stat_desc를 건드린다.**
-              UPDATE 문 하나로 합쳐 `SET stat_desc = :batch_id`를 항상 두면,
-              batch_id 없이 부르는 update_success / update_failure / 영수증 정정이
-              stat_desc를 NULL로 덮어써 **영수증이 지워진다.** 특히 update_failure는
-              다음날 재처리가 영수증을 확인해야 할 바로 그 row를 지우므로,
-              거짓 실패(커밋 성공 + Airflow 실패) 건이 그대로 재적재된다.
+              SQL을 항상 `SET stat_desc = :batch_id`로 두면, batch_id 없이 부르는
+              update_success / update_failure / 영수증 정정이 NULL로 덮어써
+              **영수증이 지워진다.** 특히 update_failure는 다음날 재처리가 영수증을
+              확인해야 할 바로 그 row를 지우므로, 거짓 실패(커밋 성공 + Airflow 실패)
+              건이 그대로 재적재된다.
 
-                  batch_id 있음:  SET status = :status, stat_desc = :batch_id
-                  batch_id 없음:  SET status = :status          (stat_desc 보존)
-
-              `COALESCE(:batch_id, stat_desc)`로 한 문장에 담는 방법은 권하지 않는다 —
-              stat_desc가 CLOB이라 VARCHAR2 바인드와 섞으면 암시적 변환에 의존하고,
-              executemany에서 batch_id가 전 건 None이면 바인드 타입 추론이 안 된다.
-
-            영수증은 **마킹 때 한 번 쓰고 이후 상태 변경에서는 건드리지 않는다.**
-            SUCCESS 이후에도 남겨야 좀비 수동 판정(설계 8.2)에서 대조할 수 있다.
+              분기는 쿼리 함수 한 곳에서 한다 — 위 JobHistoryQuery.update_status 참조.
+              영수증은 마킹 때 한 번 쓰고 이후 상태 변경에서는 건드리지 않는다.
+              SUCCESS 이후에도 남아야 좀비 수동 판정(설계 8.2)에서 대조할 수 있다.
             """
             ...                   # 기존 구현 + 위 분기
 
