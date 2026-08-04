@@ -439,12 +439,19 @@ SELECT * FROM (
 > 영수증으로 커밋 여부를 판단해야 하는데, 그 값을 지워버리므로 **거짓 실패 건이
 > 판단 근거 없이 재적재된다.** 중복 적재 방지(섹션 4)가 통째로 무력화된다.
 >
-> 따라서 **batch_id를 준 호출에서만 stat_desc를 갱신**한다. 분기는 SQL을 돌려주는
-> 함수 한 곳에 둔다.
+> 따라서 **batch_id를 준 호출에서만 stat_desc를 갱신**한다. 이때 **SQL과 바인드를
+> 한 함수에서 함께 돌려준다** — SQL에 없는 바인드를 넘기면 드라이버가 거부하므로
+> (`no bind placeholder named ":batch_id" was found in the SQL text`), SQL 모양과
+> 바인드 구성은 따로 결정할 수 없는 한 가지 사안이다.
 >
 > ```python
-> receipt = ", stat_desc = :batch_id" if batch_id is not None else ""
-> return f"UPDATE JOB_HISTORY SET status = :status{receipt} WHERE <복합키>"
+> receipt_set, receipt_bind = ((", stat_desc = :batch_id", {"batch_id": batch_id})
+>                             if batch_id is not None else ("", {}))
+> return f"UPDATE JOB_HISTORY SET status = :status{receipt_set} WHERE <복합키>", receipt_bind
+>
+> # 호출부 — 받은 두 값을 그대로 쓴다 (분기 없음)
+> sql, receipt = JobHistoryQuery.update_status(batch_id)
+> bind = {"status": status, **receipt, "k_1": ..., "k_2": ..., "k_3": ..., "ts": ...}
 > ```
 >
 > `COALESCE(:batch_id, stat_desc)`로 조건 없이 한 문장에 담는 방법은 권하지 않는다 —
