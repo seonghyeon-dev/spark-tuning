@@ -182,8 +182,26 @@ class ConvertFileTaskGroup(TaskGroup):
         config = ...              # noqa: F841  기존 설정값 로딩 그대로
 
         def _update_jobs(conn_id, keys, status, batch_id=None):
-            """Job History 상태 update — 기존 지역 헬퍼 그대로."""
-            ...                   # 기존 구현
+            """Job History 상태 update — 기존 지역 헬퍼.
+
+            ★ 변경 필요: **batch_id를 준 호출에서만 stat_desc를 건드린다.**
+              UPDATE 문 하나로 합쳐 `SET stat_desc = :batch_id`를 항상 두면,
+              batch_id 없이 부르는 update_success / update_failure / 영수증 정정이
+              stat_desc를 NULL로 덮어써 **영수증이 지워진다.** 특히 update_failure는
+              다음날 재처리가 영수증을 확인해야 할 바로 그 row를 지우므로,
+              거짓 실패(커밋 성공 + Airflow 실패) 건이 그대로 재적재된다.
+
+                  batch_id 있음:  SET status = :status, stat_desc = :batch_id
+                  batch_id 없음:  SET status = :status          (stat_desc 보존)
+
+              `COALESCE(:batch_id, stat_desc)`로 한 문장에 담는 방법은 권하지 않는다 —
+              stat_desc가 CLOB이라 VARCHAR2 바인드와 섞으면 암시적 변환에 의존하고,
+              executemany에서 batch_id가 전 건 None이면 바인드 타입 추론이 안 된다.
+
+            영수증은 **마킹 때 한 번 쓰고 이후 상태 변경에서는 건드리지 않는다.**
+            SUCCESS 이후에도 남겨야 좀비 수동 판정(설계 8.2)에서 대조할 수 있다.
+            """
+            ...                   # 기존 구현 + 위 분기
 
         def _make_file_list(files):
             """param에서 뽑은 파일 목록을 받아
