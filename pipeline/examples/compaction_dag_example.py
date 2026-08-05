@@ -50,8 +50,11 @@ def dag():
     def compaction_specs(params=None) -> list[dict]:
         """선택된 테이블의 operator 인자를 만든다. dict 1개 = 복사본 1개.
 
-        dict의 키는 operator 인자명 그대로다. 인자를 더 넘겨야 하면 키만 추가하면 된다
-        (`task_id`, `queue`, `pool`은 확장 대상이 아니라 partial에만 둘 수 있다).
+        반환값은 XCom을 거치므로 원시 타입만 담는다. DriverAndExecutor는 여기서
+        만들 수 없고, 아래 map()이 XCom을 건넌 뒤에 만든다.
+
+        인자를 더 넘겨야 하면 이 dict에 키를 추가한다 — 키가 곧 operator 인자명이다.
+        단 `task_id`, `queue`, `pool`은 확장 대상이 아니라 partial에만 둘 수 있다.
 
         기존 get_time이 하던 일(param 날짜 확인 → 없으면 기본값 → YYYY-MM-DD 포맷)을
         여기서 한다. params는 어느 task에서든 받을 수 있어 별도 task일 이유가 없다.
@@ -67,9 +70,7 @@ def dag():
                     target_time,
                     str(table.config.com_max_concurrent_file_group),
                 ],
-                "executor": DriverAndExecutor(  # noqa: F821
-                    instances=str(table.config.com_num_executor)
-                ),
+                "instances": str(table.config.com_num_executor),
             }
             for table in IcebergTable  # noqa: F821
             if table.get_name() in selected
@@ -81,7 +82,16 @@ def dag():
         max_active_tis_per_dagrun=1,                   # chain()이 하던 직렬 실행 역할
         map_index_template="{{ task.arguments[0] }}",   # UI map index를 테이블명으로
         # ...기존 루프에서 table이 등장하지 않던 인자 전부 그대로...
-    ).expand_kwargs(compaction_specs())
+    ).expand_kwargs(
+        # map()은 XCom을 건넌 뒤 실행된다 — 커스텀 객체는 여기서만 만들 수 있다.
+        # @task를 넘기면 Airflow가 거부한다.
+        compaction_specs().map(
+            lambda spec: {
+                "arguments": spec["arguments"],
+                "executor": DriverAndExecutor(instances=spec["instances"]),  # noqa: F821
+            }
+        )
+    )
 
 
 dag()
@@ -89,24 +99,17 @@ dag()
 
 # --- 옮기기 전 확인 -----------------------------------------------------------
 #
-# ① DriverAndExecutor가 XCom 직렬화를 통과하는가
-#    compaction_specs의 반환값은 XCom을 거친다. 이 객체가 통과하지 못하면 직렬화
-#    단계에서 실패하므로, 그때는 원시값(instances 문자열)만 반환하고 XCom을 건넌
-#    뒤에 객체를 만든다.
-#      .expand_kwargs(compaction_specs().map(to_operator_kwargs))
-#    map()에 넘기는 함수는 @task가 아니어야 한다.
-#
-# ② get_time의 XCom을 SKO 말고 다른 task가 참조하는가
+# ① get_time의 XCom을 SKO 말고 다른 task가 참조하는가
 #    알림·로깅 등에서 {{ ti.xcom_pull(task_ids="get_time") }}를 쓰고 있으면 그쪽이 깨진다.
 #
-# ③ arguments의 첫 원소가 테이블명인가
+# ② arguments의 첫 원소가 테이블명인가
 #    map_index_template이 위치로 참조한다. 순서가 다르면 인덱스를 맞춘다.
 #    커스텀 operator에 테이블명 전용 인자가 있다면 {{ task.<그 인자> }}가 더 안전하다.
 #
-# ④ max_active_tis_per_dagrun=1을 빼지 않았는가
+# ③ max_active_tis_per_dagrun=1을 빼지 않았는가
 #    복사본은 기본이 동시 실행이다. 빼면 Spark job이 테이블 수만큼 한꺼번에 뜬다.
 #
-# ⑤ arguments 안에 Jinja를 남기지 않았는가
+# ④ arguments 안에 Jinja를 남기지 않았는가
 #    XCom에서 온 expand 값은 template_fields에 있어도 렌더링을 건너뛴다
 #    (expandinput.py의 resolved_oids → templater.py의 `if id(value) in oids: return value`).
 #    기존 '{{ ti.xcom_pull(task_ids="get_time") }}'는 target_time 실제 값으로 대체했다.
