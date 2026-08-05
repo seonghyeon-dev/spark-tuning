@@ -532,10 +532,12 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 **`tables` param 선언** (양쪽 DAG에 추가, 각자 자기 그룹 Enum만 사용):
 
 ```python
+DAILY_TABLE_NAMES = [t.get_name() for t in DailyIcebergTable]   # hourly는 HourlyIcebergTable
+
 "tables": Param(
-    default=[t.get_name() for t in DailyIcebergTable],      # hourly는 HourlyIcebergTable
-    type="array",                                            # format은 쓰지 않는다
-    examples=[t.get_name() for t in DailyIcebergTable],      # 이게 multi-select UI를 만든다
+    default=DAILY_TABLE_NAMES,      # 실제 값 — 정기 실행은 UI를 안 거치므로 이 값이 곧 전체 처리
+    type="array",                   # format은 쓰지 않는다
+    examples=DAILY_TABLE_NAMES,     # 값에 관여하지 않고 multi-select UI만 만든다
 )
 ```
 
@@ -549,6 +551,40 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 > free text field.")
 
 `default`가 전체여야 conf 없이 도는 **정기 스케줄 실행의 대상 범위가 그대로 유지**된다.
+
+#### params 선언만으로는 필터가 동작하지 않는다
+
+현재 Compaction DAG은 테이블 Enum을 파싱 시점에 loop해서 `SparkKubernetesOperator`를 테이블 수만큼 만들고 `chain()`으로 직렬 연결한다. `params`는 DagRun이 생겨야 값이 정해지므로, 이 구조에서는 어떤 조건문을 넣어도 선택 결과를 반영할 수 없다 — **task 자체를 런타임에 만들어야 한다.**
+
+```python
+@task
+def compaction_specs(params: dict) -> list[dict]:
+    """선택된 테이블만 operator kwargs로 변환."""
+    selected = set(params["tables"])
+    return [
+        {"application_file": build_spec(t)}          # 테이블마다 달라지는 인자만
+        for t in DailyIcebergTable
+        if t.get_name() in selected
+    ]
+
+compact = SparkKubernetesOperator.partial(
+    task_id="compact",
+    kubernetes_conn_id=...,                          # 테이블과 무관한 인자
+    namespace=...,
+    max_active_tis_per_dagrun=1,                     # chain()이 하던 직렬 실행을 대신한다
+).expand_kwargs(compaction_specs())
+
+chain(get_time(), compact)
+```
+
+| 주의 | 내용 |
+|------|------|
+| **직렬 실행 유실** | mapped task instance는 기본이 **병렬**이다. `max_active_tis_per_dagrun=1`을 빼면 Spark job이 테이블 수만큼 동시에 뜬다 — 이 전환에서 가장 위험한 지점 |
+| partial vs expand | `partial`은 파싱 시점, `expand`는 런타임. 테이블마다 달라지는 값(executor 수, 리소스 등)은 전부 `compaction_specs`가 계산해 kwargs dict에 담아야 하고, dict의 키는 **실제 operator 파라미터명**이어야 한다 |
+| task_id 고정 | 테이블별 task 이름이 사라지고 `compact` 노드 1개 + map index로 바뀐다. 재시도·알림은 map index 단위로 동작. 라벨은 `map_index_template`으로 보완 |
+| 선택 0개 | mapped task는 `skipped` 처리된다 |
+
+static task를 유지하고 테이블마다 gate task를 다는 대안은, 선형 chain에서 skip이 하위 전체로 전파되어 모든 task에 `trigger_rule="all_done"`을 달고 gate를 테이블 수만큼 더 만들어야 하므로 채택하지 않는다.
 
 재처리가 왜 필요하게 만드는가: 정기 Compaction은 시간당(직전 1시간)·일일(전일치) 범위만 보므로, 재처리가 적재하는 **과거 시간대/과거 날짜**는 정기 run이 다시 방문하지 않는 구간이다. trigger 없이는 재처리분 small file이 과거 파티션에 영구히 남는다.
 
@@ -582,8 +618,8 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 3건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 ③ **`_update_jobs`가 batch_id를 준 호출에서만 stat_desc를 갱신하도록 분기** — 안 그러면 update_success/update_failure가 영수증을 NULL로 지운다 (섹션 5.3-6) |
 | ConvertFileTaskGroup | `reprocess_cfg` 옵션 인자 + 재처리 분기 추가 | ① `__init__(..., reprocess_cfg=None)` 인자 추가 ② get_jobs 생성부를 if/else로 감싸고 else에 재처리 조회 task를 둔다 — 미지정이면 기존 인라인 경로(**코드·closure 전부 그대로, append 동작 완전 동일**). 재처리 task가 같은 `__init__` 스코프에 있으므로 `_update_jobs`·logger·config를 그냥 호출한다 (전달 인자 없음). **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
-| daily Compaction DAG | 스케줄 + params | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체) |
-| hourly Compaction DAG | params | params에 `tables` multi-select 추가 (기본 전체). 스케줄 변경 없음 |
+| daily Compaction DAG | 스케줄 + params + task 생성 방식 | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체). **Enum loop + `chain()`을 mapped task로 전환** — 안 그러면 params가 선언만 되고 필터가 동작하지 않는다 (6.1) |
+| hourly Compaction DAG | params + task 생성 방식 | 위와 동일. 스케줄 변경 없음 |
 
 append DAG의 조회 로직(최근 1일, WAIT만, ts ASC, DB당 ROWNUM 200, conn_list loop)과 update task 구조는 **변경 없음**.
 
