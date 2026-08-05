@@ -560,17 +560,9 @@ DAILY_TABLE_NAMES = [t.get_name() for t in DailyIcebergTable]   # hourly는 Hour
 TABLE_NAMES = [t.get_name() for t in IcebergTable]
 
 
-def to_operator_kwargs(spec: dict) -> dict:
-    """XCom을 못 건너는 것만 여기서 만든다."""
-    return {
-        "arguments": spec["arguments"],
-        "executor": DriverAndExecutor(instances=spec["instances"]),
-    }
-
-
 @task
 def compaction_specs(params=None) -> list[dict]:
-    """선택된 테이블만 고른다. 반환값은 XCom을 통과하므로 원시 타입만 담는다."""
+    """선택된 테이블의 operator 인자를 만든다. dict 1개 = 복사본 1개."""
     target_time = params.get("target_dt") or ...     # 기존 get_time의 기본값 로직
     selected = set(params["tables"])
     return [
@@ -578,7 +570,7 @@ def compaction_specs(params=None) -> list[dict]:
             # arguments[0]은 테이블명 — map_index_template이 이 위치를 참조한다
             "arguments": [table.get_name(), str(COM_TARGET_FILE_SIZE_BYTES),
                           target_time, str(table.config.com_max_concurrent_file_group)],
-            "instances": str(table.config.com_num_executor),
+            "executor": DriverAndExecutor(instances=str(table.config.com_num_executor)),
         }
         for table in IcebergTable
         if table.get_name() in selected
@@ -590,7 +582,7 @@ SparkKubernetesOperator.partial(
     max_active_tis_per_dagrun=1,                    # chain()이 하던 직렬 실행을 대신한다
     map_index_template="{{ task.arguments[0] }}",    # UI map index를 테이블명으로
     # ...기존 루프에서 table이 등장하지 않던 인자 전부 그대로...
-).expand_kwargs(compaction_specs().map(to_operator_kwargs))
+).expand_kwargs(compaction_specs())
 ```
 
 **변경 예시 전문: `pipeline/examples/compaction_dag_example.py`** (daily 기준. hourly는 `target_dt` 대신 `start_time`/`end_time`을 담고 구조는 동일)
@@ -598,7 +590,8 @@ SparkKubernetesOperator.partial(
 | 주의 | 내용 |
 |------|------|
 | **직렬 실행 유실** | mapped task instance는 기본이 **병렬**이다. `max_active_tis_per_dagrun=1`을 빼면 Spark job이 테이블 수만큼 동시에 뜬다 — 이 전환에서 가장 위험한 지점 |
-| **커스텀 객체는 XCom을 못 건넌다** | `DriverAndExecutor` 인스턴스를 `compaction_specs`가 직접 반환하면 직렬화에서 걸린다. XCom에는 원시 타입만 보내고 객체 생성은 `.map()`이 XCom **이후에** 수행한다. `.map()`에 넘기는 함수는 `@task`가 아니어야 한다. 그 외의 조립은 Enum이 손에 있는 `compaction_specs`에서 끝내는 편이 낫다 — 이름만 보내고 `.map()`에서 Enum을 되찾으면 한 바퀴 돌 뿐 아니라 `get_name()`이 Enum value와 다를 때 깨진다 |
+| dict 키 = operator 인자명 | 인자를 더 넘겨야 하면 `compaction_specs`가 반환하는 dict에 키만 추가한다. 단 `task_id`, `queue`, `pool`은 확장 대상이 아니라 `partial`에만 둘 수 있다 — 테이블별 `task_id`는 포기하고 `map_index_template`으로 대신한다 |
+| 커스텀 객체와 XCom | `compaction_specs`의 반환값은 XCom을 거친다. `DriverAndExecutor`가 직렬화를 통과하지 못하면 원시값만 반환하고 XCom을 건넌 뒤 `.map(f)`에서 객체를 만든다. `f`는 `@task`가 아니어야 한다 |
 | **expand된 값의 Jinja는 렌더링되지 않는다** | `template_fields`에 있어도 마찬가지다. XCom에서 resolve된 값은 `id()`가 `seen_oids`에 등록되고(`expandinput.py`), 렌더러가 `if id(value) in oids: return value`로 건너뛴다(`templater.py`). 기존 `'{{ ti.xcom_pull(task_ids="get_time") }}'`는 실제 값으로 대체해야 한다 |
 | get_time 흡수 | `get_time`은 params만 읽어 날짜를 포맷하는 일만 하므로 `compaction_specs`에 합친다. task 하나와 XCom 왕복 한 번이 줄고, 다른 task가 그 XCom을 참조하지 않는지만 확인하면 된다 |
 | task_id 고정 | 테이블별 task 이름이 사라지고 `compact` 노드 1개 + map index로 바뀐다. `map_index_template`으로 라벨을 테이블명으로 되돌릴 수 있고, 실행 전에도 렌더링되므로 running·failed 상태에서도 보인다 |
