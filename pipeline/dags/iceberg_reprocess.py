@@ -81,6 +81,7 @@ class DailyIcebergTable(str, Enum):
 
 
 ALL_TABLES = [*HourlyIcebergTable, *DailyIcebergTable]
+ALL_TABLE_NAMES = [t.get_name() for t in ALL_TABLES]
 
 
 # --- 시간 유틸 --------------------------------------------------------------
@@ -170,12 +171,9 @@ def collect_metas(ti, table_tasks: list[dict]) -> list[dict]:
     max_active_runs=1,      # loop 회차 순차 실행 보장
     params={
         # 선택지·기본값 모두 iceberg.py Enum에서 생성 (설계 5.1).
-        # multi-value select UI는 `examples`가 만든다 — `items`로는 안 나온다.
-        "tables": Param(
-            default=[t.get_name() for t in ALL_TABLES],
-            type="array",
-            examples=[t.get_name() for t in ALL_TABLES],
-        ),
+        # default는 실제 값 — 정기 실행은 UI를 안 거치므로 이 값이 전체 테이블 처리를 뜻한다.
+        # examples는 값에 관여하지 않고 multi-select UI만 만든다 (`items`로는 안 나온다).
+        "tables": Param(default=ALL_TABLE_NAMES, type="array", examples=ALL_TABLE_NAMES),
         # 수동 실행 조회 범위 (둘 다 함께 지정, prepare_run이 검증).
         # 미지정 시 정기 범위(그저께 00:00 ~ 전날 끝).
         "start_time": Param(None, type=["null", "string"], format="date-time"),
