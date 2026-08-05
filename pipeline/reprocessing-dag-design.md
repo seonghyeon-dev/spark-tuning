@@ -512,10 +512,34 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 
 **Compaction DAG params** (양쪽 공통으로 `tables` multi-select 추가 — 기본 전체, 수동/trigger 시 일부 선택. 선택지는 재처리 DAG과 동일하게 `iceberg.py`의 hourly/daily Enum에서 생성 권장 — 각 DAG은 자기 그룹 Enum만 사용):
 
-| DAG | params |
-|-----|--------|
-| daily | `target_dt` + `tables` |
-| hourly | `start_time`, `end_time` + `tables` |
+| DAG | params | 형식 |
+|-----|--------|------|
+| daily | `target_dt` + `tables` | `target_dt`는 **`format="date"`** → `2026-07-28` |
+| hourly | `start_time`, `end_time` + `tables` | 둘 다 **`format="date-time"`** → `2026-07-28T08:15:00+09:00` |
+
+> **conf 값을 이 형식으로 변환해서 넘겨야 한다.** Job History의 `ts`(`YYYYMMDDHHmmSSsss`)를
+> 그대로 넣으면 DagRun 생성이 params 검증에서 실패한다. 이때 Airflow API 서버는 422가
+> 아니라 **500**을 돌려주고, `TriggerDagRunOperator`는 그 실패를 처리하지 못한 채
+> `UnboundLocalError: cannot access local variable 'state'`로 터진다 — task 로그만 보면
+> 원인을 알 수 없으므로 **API 서버 로그**를 봐야 한다.
+>
+> ```
+> ValueError: Invalid input for param target_dt: '20260728' is not a 'date'
+> ```
+>
+> 변환은 `dates_between`(→ `YYYY-MM-DD`)과 `ts_to_param`(→ ISO 8601)이 담당한다.
+
+**`tables` param 선언** (양쪽 DAG에 추가, 각자 자기 그룹 Enum만 사용):
+
+```python
+"tables": Param(
+    default=[t.get_name() for t in DailyIcebergTable],      # hourly는 HourlyIcebergTable
+    type="array",                                            # format은 쓰지 않는다
+    items={"type": "string", "enum": [t.get_name() for t in DailyIcebergTable]},
+)
+```
+
+`default`가 전체여야 conf 없이 도는 **정기 스케줄 실행의 대상 범위가 그대로 유지**된다.
 
 재처리가 왜 필요하게 만드는가: 정기 Compaction은 시간당(직전 1시간)·일일(전일치) 범위만 보므로, 재처리가 적재하는 **과거 시간대/과거 날짜**는 정기 run이 다시 방문하지 않는 구간이다. trigger 없이는 재처리분 small file이 과거 파티션에 영구히 남는다.
 
@@ -638,7 +662,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | 4 | XCom(meta) 기록 → IN_PROGRESS 마킹 → S3 업로드 순서 (마킹 중간 실패 시 좀비 방지) | 5.3 |
 | 5 | loop 재trigger 조건 = 조회 상한을 채운 테이블 존재. 지속 실패는 MAX_LOOP(10회) 상한으로 유한 종료. 첫 회차가 확정한 조회 범위·tables를 conf로 승계 | 5.5 |
 | 6 | 수동 `start_time`/`end_time`은 함께 지정 + `end_time ≤ 전날 00:00` (전날/당일 거부) — prepare_run에서 검증 | 5.1 |
-| 7 | Compaction trigger는 적재분 전부, `tables` 필터 포함. 날짜/시간 형식은 기존 Compaction DAG params 형식과 일치 확인 | 6.3 |
+| 7 | Compaction trigger는 적재분 전부, `tables` 필터 포함. conf 값은 대상 params 형식으로 변환해 넘긴다 — daily `date`, hourly `date-time` | 6.3 |
 
 
 ### 잔류 데이터 알림 쿼리 (별도 모니터링, 섹션 8.1)

@@ -99,17 +99,29 @@ def param_to_ts(value: str) -> str:
     return ts_str(pendulum.parse(value, tz=KST).in_timezone(KST))
 
 
-def dates_between(ts_min: str, ts_max: str) -> list[str]:
-    """ts_min~ts_max 구간이 걸치는 모든 날짜(YYYYMMDD) 목록.
+def ts_to_param(ts: str) -> str:
+    """ts 문자열 → date-time 형식 (`param_to_ts`의 역변환).
 
-    daily Compaction은 날짜 단위로 trigger하므로 양 끝 날짜만 쓰면 3일 이상
-    범위에서 중간 날짜가 누락된다.
+    hourly Compaction DAG의 `start_time`/`end_time`이 `format="date-time"`이라
+    ts를 그대로 넘기면 params 검증에서 걸린다.
+    """
+    return pendulum.from_format(ts[:14], "YYYYMMDDHHmmss", tz=KST).isoformat()
+
+
+def dates_between(ts_min: str, ts_max: str) -> list[str]:
+    """ts_min~ts_max 구간이 걸치는 모든 날짜 목록 — daily의 `target_dt` 형식.
+
+    `target_dt`가 `format="date"`라 **YYYY-MM-DD**로 넘겨야 한다. ts 형식 그대로
+    주면 API 서버가 거부한다:
+        Invalid input for param target_dt: '20260728' is not a 'date'
+
+    양 끝 날짜만 쓰면 3일 이상 범위에서 중간 날짜가 누락되므로 전부 만든다.
     """
     day = pendulum.from_format(ts_min[:8], "YYYYMMDD", tz=KST)
     last = pendulum.from_format(ts_max[:8], "YYYYMMDD", tz=KST)
     days = []
     while day <= last:
-        days.append(day.format("YYYYMMDD"))
+        days.append(day.format("YYYY-MM-DD"))
         day = day.add(days=1)
     return days
 
@@ -234,7 +246,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     def compaction_targets(table_tasks: list[dict], ti=None) -> list[dict]:
         """적재 결과 집계 → TriggerDagRunOperator kwargs 목록 (설계 6.3).
         적재분 전부 trigger — tables 필터로 비용 최소, 중복은 no-op.
-        TODO(연결): conf 날짜/시간 형식을 기존 Compaction DAG UI params와 일치시킬 것."""
+        conf 값은 대상 DAG params 형식에 맞춰 넘긴다 (daily=date, hourly=date-time)."""
         metas = collect_metas(ti, table_tasks)
         daily = [m for m in metas if m["group"] == "daily"]
         hourly = [m for m in metas if m["group"] == "hourly"]
@@ -257,8 +269,8 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
             targets.append({
                 "trigger_dag_id": HOURLY_COMPACTION_DAG_ID,
                 "conf": {
-                    "start_time": min(m["ts_min"] for m in hourly),
-                    "end_time": max(m["ts_max"] for m in hourly),
+                    "start_time": ts_to_param(min(m["ts_min"] for m in hourly)),
+                    "end_time": ts_to_param(max(m["ts_max"] for m in hourly)),
                     "tables": [m["table"] for m in hourly],
                 },
             })
