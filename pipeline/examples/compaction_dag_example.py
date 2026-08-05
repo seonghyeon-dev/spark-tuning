@@ -34,10 +34,11 @@ TABLE_NAMES = [t.get_name() for t in IcebergTable]  # noqa: F821
 # --- A. operator 인자 조립 -----------------------------------------------------
 
 def to_operator_kwargs(spec: dict) -> dict:
-    """복사본 1개분의 operator 인자를 만든다.
+    """XCom을 못 건너는 것만 여기서 만든다.
 
-    XCom을 건넌 **뒤에** 실행되므로 DriverAndExecutor 같은 커스텀 객체를 만들어도 된다.
-    compaction_specs가 이 객체를 직접 반환하면 XCom 직렬화에서 걸린다.
+    DriverAndExecutor 인스턴스를 compaction_specs가 직접 반환하면 XCom 직렬화에서
+    걸린다. 이 함수는 XCom을 건넌 **뒤에** 실행되므로 객체를 만들어도 된다.
+    나머지 조립은 Enum이 손에 있는 compaction_specs에서 끝낸다.
 
     `@task`를 붙이면 안 된다 — Airflow가 명시적으로 거부한다
     ("map() argument must be a plain function, not a @task operator").
@@ -45,16 +46,9 @@ def to_operator_kwargs(spec: dict) -> dict:
     DAG 밖에 두는 이유는 성능이 아니라 가독성이다. closure로 잡는 것이 없어 DAG
     스코프가 필요 없고, `@task`가 아니라는 점이 눈에 띄는 편이 낫다.
     """
-    table = IcebergTable(spec["name"])  # noqa: F821
     return {
-        # arguments[0]은 테이블명 — map_index_template이 이 위치를 참조한다
-        "arguments": [
-            table.get_name(),
-            str(COM_TARGET_FILE_SIZE_BYTES),  # noqa: F821
-            spec["target_time"],
-            str(table.config.com_max_concurrent_file_group),
-        ],
-        "executor": DriverAndExecutor(instances=str(table.config.com_num_executor)),  # noqa: F821
+        "arguments": spec["arguments"],
+        "executor": DriverAndExecutor(instances=spec["instances"]),  # noqa: F821
     }
 
 
@@ -83,7 +77,16 @@ def dag():
         target_time = params.get("target_dt") or ...  # TODO(연결) 기존 get_time의 기본값 로직
         selected = set(params["tables"])
         return [
-            {"name": table.get_name(), "target_time": target_time}
+            {
+                # arguments[0]은 테이블명 — map_index_template이 이 위치를 참조한다
+                "arguments": [
+                    table.get_name(),
+                    str(COM_TARGET_FILE_SIZE_BYTES),  # noqa: F821
+                    target_time,
+                    str(table.config.com_max_concurrent_file_group),
+                ],
+                "instances": str(table.config.com_num_executor),
+            }
             for table in IcebergTable  # noqa: F821
             if table.get_name() in selected
         ]
@@ -109,15 +112,10 @@ dag()
 #    map_index_template이 위치로 참조한다. 순서가 다르면 인덱스를 맞춘다.
 #    커스텀 operator에 테이블명 전용 인자가 있다면 {{ task.<그 인자> }}가 더 안전하다.
 #
-# ③ get_name()이 Enum value를 그대로 돌려주는가
-#    아니라면 IcebergTable(spec["name"]) 역조회가 실패한다. 그때는 조회표를 둔다.
-#      TABLE_BY_NAME = {t.get_name(): t for t in IcebergTable}
-#      TABLE_NAMES = list(TABLE_BY_NAME)
-#
-# ④ max_active_tis_per_dagrun=1을 빼지 않았는가
+# ③ max_active_tis_per_dagrun=1을 빼지 않았는가
 #    복사본은 기본이 동시 실행이다. 빼면 Spark job이 테이블 수만큼 한꺼번에 뜬다.
 #
-# ⑤ arguments 안에 Jinja를 남기지 않았는가
+# ④ arguments 안에 Jinja를 남기지 않았는가
 #    XCom에서 온 expand 값은 template_fields에 있어도 렌더링을 건너뛴다
 #    (expandinput.py의 resolved_oids → templater.py의 `if id(value) in oids: return value`).
-#    기존 '{{ ti.xcom_pull(task_ids="get_time") }}'는 spec["target_time"]으로 대체했다.
+#    기존 '{{ ti.xcom_pull(task_ids="get_time") }}'는 target_time 실제 값으로 대체했다.
