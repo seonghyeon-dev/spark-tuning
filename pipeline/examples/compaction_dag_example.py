@@ -31,28 +31,7 @@ from airflow.sdk import Param, dag, task
 TABLE_NAMES = [t.get_name() for t in IcebergTable]  # noqa: F821
 
 
-# --- A. operator 인자 조립 -----------------------------------------------------
-
-def to_operator_kwargs(spec: dict) -> dict:
-    """XCom을 못 건너는 것만 여기서 만든다.
-
-    DriverAndExecutor 인스턴스를 compaction_specs가 직접 반환하면 XCom 직렬화에서
-    걸린다. 이 함수는 XCom을 건넌 **뒤에** 실행되므로 객체를 만들어도 된다.
-    나머지 조립은 Enum이 손에 있는 compaction_specs에서 끝낸다.
-
-    `@task`를 붙이면 안 된다 — Airflow가 명시적으로 거부한다
-    ("map() argument must be a plain function, not a @task operator").
-
-    DAG 밖에 두는 이유는 성능이 아니라 가독성이다. closure로 잡는 것이 없어 DAG
-    스코프가 필요 없고, `@task`가 아니라는 점이 눈에 띄는 편이 낫다.
-    """
-    return {
-        "arguments": spec["arguments"],
-        "executor": DriverAndExecutor(instances=spec["instances"]),  # noqa: F821
-    }
-
-
-# --- B. DAG -------------------------------------------------------------------
+# --- DAG ----------------------------------------------------------------------
 
 @dag(
     dag_id=...,                  # TODO(연결) 기존 dag_id 유지
@@ -69,7 +48,13 @@ def dag():
 
     @task
     def compaction_specs(params=None) -> list[dict]:
-        """선택된 테이블만 고른다. 반환값은 XCom을 통과하므로 원시 타입만 담는다.
+        """선택된 테이블의 operator 인자를 만든다. dict 1개 = 복사본 1개.
+
+        반환값은 XCom을 거치므로 원시 타입만 담는다. DriverAndExecutor는 여기서
+        만들 수 없고, 아래 map()이 XCom을 건넌 뒤에 만든다.
+
+        인자를 더 넘겨야 하면 이 dict에 키를 추가한다 — 키가 곧 operator 인자명이다.
+        단 `task_id`, `queue`, `pool`은 확장 대상이 아니라 partial에만 둘 수 있다.
 
         기존 get_time이 하던 일(param 날짜 확인 → 없으면 기본값 → YYYY-MM-DD 포맷)을
         여기서 한다. params는 어느 task에서든 받을 수 있어 별도 task일 이유가 없다.
@@ -97,13 +82,22 @@ def dag():
         max_active_tis_per_dagrun=1,                   # chain()이 하던 직렬 실행 역할
         map_index_template="{{ task.arguments[0] }}",   # UI map index를 테이블명으로
         # ...기존 루프에서 table이 등장하지 않던 인자 전부 그대로...
-    ).expand_kwargs(compaction_specs().map(to_operator_kwargs))
+    ).expand_kwargs(
+        # map()은 XCom을 건넌 뒤 실행된다 — 커스텀 객체는 여기서만 만들 수 있다.
+        # @task를 넘기면 Airflow가 거부한다.
+        compaction_specs().map(
+            lambda spec: {
+                "arguments": spec["arguments"],
+                "executor": DriverAndExecutor(instances=spec["instances"]),  # noqa: F821
+            }
+        )
+    )
 
 
 dag()
 
 
-# --- C. 옮기기 전 확인 --------------------------------------------------------
+# --- 옮기기 전 확인 -----------------------------------------------------------
 #
 # ① get_time의 XCom을 SKO 말고 다른 task가 참조하는가
 #    알림·로깅 등에서 {{ ti.xcom_pull(task_ids="get_time") }}를 쓰고 있으면 그쪽이 깨진다.
