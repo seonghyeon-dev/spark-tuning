@@ -89,7 +89,7 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
   - 조회 범위 경계로 경합 원천 차단: FAILED는 전날+그저께 전체, WAIT는 전날 01:00 이전만 (append 하한 = 실행시각-24h ≥ 전날 01:00이므로 절대 안 겹침). 잠금/선점/pool 불필요
   - 상한: 테이블당 row 1,000 / 16GB (러프 설정, 재검증 필요). 초과 시 자기 자신 재trigger loop (상한 10회, `max_active_runs=1`로 순차)
   - 중복 적재 방지: snapshot summary에 batch_id 기록(영수증), FAILURE 재적재 전 `.snapshots` 확인 → 커밋된 건 SUCCESS 정정. batch_id는 `stat_desc` CLOB 재사용 — **WHERE 조건 사용 금지** (값 기록/읽기만). **상태 UPDATE는 batch_id를 준 호출에서만 stat_desc를 갱신** — 합쳐 두면 update_success/update_failure가 NULL로 지워 중복 방지가 무력화된다
-  - Compaction: 기존 DAG trigger — daily `target_dt`, hourly `start_time`/`end_time` + 양쪽 `tables` multi-select params. daily 스케줄 00:35 → **02:00 이동** (재처리 적재 전날분 자연 커버 + 자정 지연 적재분 구멍 해소), hourly `15 * * * *` 유지
+  - Compaction: 기존 DAG trigger — daily `target_dt`, hourly `start_time`/`end_time` + 양쪽 `tables` multi-select params. daily 스케줄 00:35 → **02:00 이동** (재처리 적재 전날분 자연 커버 + 자정 지연 적재분 구멍 해소), hourly `15 * * * *` 유지. **`tables` params 선언만으로는 필터가 동작하지 않는다** — Enum loop + `chain()`을 mapped task(`partial`/`expand_kwargs`/`.map()`)로 전환해야 한다 (설계 6.1, `pipeline/examples/compaction_dag_example.py`)
   - 수동 실행: `tables`(multi-select) + `start_time`/`end_time` params (조회 범위 직접 정의, `end_time ≤ 전날 00:00`만 허용)
   - 좀비 IN_PROGRESS(2시간 초과): 탐지 + 알림만, 자동 복구 안 함
   - append DAG과 동일 테이블에 동시 append 커밋 가능 — HMS의 compare-and-swap + Iceberg 재시도로 안전 (둘 다 반영, 유실·중복 없음). `HadoopCatalog`로 전환 시 이 전제가 깨진다 (설계 2.2)
@@ -111,5 +111,6 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
     ├── dags/
     │   └── iceberg_reprocess.py        # 재처리 DAG 정의 (신규 파일은 이것 하나)
     └── examples/
-        └── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
+        ├── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
+        └── compaction_dag_example.py          # Compaction DAG 변경(tables 필터 = mapped task) 예시
 ```

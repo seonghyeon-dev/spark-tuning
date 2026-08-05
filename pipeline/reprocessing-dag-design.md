@@ -557,31 +557,49 @@ DAILY_TABLE_NAMES = [t.get_name() for t in DailyIcebergTable]   # hourly는 Hour
 현재 Compaction DAG은 테이블 Enum을 파싱 시점에 loop해서 `SparkKubernetesOperator`를 테이블 수만큼 만들고 `chain()`으로 직렬 연결한다. `params`는 DagRun이 생겨야 값이 정해지므로, 이 구조에서는 어떤 조건문을 넣어도 선택 결과를 반영할 수 없다 — **task 자체를 런타임에 만들어야 한다.**
 
 ```python
+TABLE_NAMES = [t.get_name() for t in IcebergTable]
+
+
+def to_operator_kwargs(spec: dict) -> dict:
+    """복사본 1개분의 operator 인자. XCom을 건넌 뒤 실행되므로 커스텀 객체를 만들어도 된다."""
+    table = IcebergTable(spec["name"])
+    return {
+        # arguments[0]은 테이블명 — map_index_template이 이 위치를 참조한다
+        "arguments": [table.get_name(), str(COM_TARGET_FILE_SIZE_BYTES),
+                      spec["target_time"], str(table.config.com_max_concurrent_file_group)],
+        "executor": DriverAndExecutor(instances=str(table.config.com_num_executor)),
+    }
+
+
 @task
-def compaction_specs(params: dict) -> list[dict]:
-    """선택된 테이블만 operator kwargs로 변환."""
+def compaction_specs(params=None) -> list[dict]:
+    """선택된 테이블만 고른다. 반환값은 XCom을 통과하므로 원시 타입만 담는다."""
+    target_time = params.get("target_dt") or ...     # 기존 get_time의 기본값 로직
     selected = set(params["tables"])
     return [
-        {"application_file": build_spec(t)}          # 테이블마다 달라지는 인자만
-        for t in DailyIcebergTable
-        if t.get_name() in selected
+        {"name": table.get_name(), "target_time": target_time}
+        for table in IcebergTable
+        if table.get_name() in selected
     ]
 
-compact = SparkKubernetesOperator.partial(
-    task_id="compact",
-    kubernetes_conn_id=...,                          # 테이블과 무관한 인자
-    namespace=...,
-    max_active_tis_per_dagrun=1,                     # chain()이 하던 직렬 실행을 대신한다
-).expand_kwargs(compaction_specs())
 
-chain(get_time(), compact)
+SparkKubernetesOperator.partial(
+    task_id="compact",
+    max_active_tis_per_dagrun=1,                    # chain()이 하던 직렬 실행을 대신한다
+    map_index_template="{{ task.arguments[0] }}",    # UI map index를 테이블명으로
+    # ...기존 루프에서 table이 등장하지 않던 인자 전부 그대로...
+).expand_kwargs(compaction_specs().map(to_operator_kwargs))
 ```
+
+**변경 예시 전문: `pipeline/examples/compaction_dag_example.py`** (daily 기준. hourly는 `target_dt` 대신 `start_time`/`end_time`을 담고 구조는 동일)
 
 | 주의 | 내용 |
 |------|------|
 | **직렬 실행 유실** | mapped task instance는 기본이 **병렬**이다. `max_active_tis_per_dagrun=1`을 빼면 Spark job이 테이블 수만큼 동시에 뜬다 — 이 전환에서 가장 위험한 지점 |
-| partial vs expand | `partial`은 파싱 시점, `expand`는 런타임. 테이블마다 달라지는 값(executor 수, 리소스 등)은 전부 `compaction_specs`가 계산해 kwargs dict에 담아야 하고, dict의 키는 **실제 operator 파라미터명**이어야 한다 |
-| task_id 고정 | 테이블별 task 이름이 사라지고 `compact` 노드 1개 + map index로 바뀐다. 재시도·알림은 map index 단위로 동작. 라벨은 `map_index_template`으로 보완 |
+| **커스텀 객체는 XCom을 못 건넌다** | `DriverAndExecutor` 인스턴스를 `compaction_specs`가 직접 반환하면 직렬화에서 걸린다. XCom에는 이름·시각만 보내고 객체 생성은 `.map()`이 XCom **이후에** 수행한다. `.map()`에 넘기는 함수는 `@task`가 아니어야 한다 |
+| **expand된 값의 Jinja는 렌더링되지 않는다** | `template_fields`에 있어도 마찬가지다. XCom에서 resolve된 값은 `id()`가 `seen_oids`에 등록되고(`expandinput.py`), 렌더러가 `if id(value) in oids: return value`로 건너뛴다(`templater.py`). 기존 `'{{ ti.xcom_pull(task_ids="get_time") }}'`는 실제 값으로 대체해야 한다 |
+| get_time 흡수 | `get_time`은 params만 읽어 날짜를 포맷하는 일만 하므로 `compaction_specs`에 합친다. task 하나와 XCom 왕복 한 번이 줄고, 다른 task가 그 XCom을 참조하지 않는지만 확인하면 된다 |
+| task_id 고정 | 테이블별 task 이름이 사라지고 `compact` 노드 1개 + map index로 바뀐다. `map_index_template`으로 라벨을 테이블명으로 되돌릴 수 있고, 실행 전에도 렌더링되므로 running·failed 상태에서도 보인다 |
 | 선택 0개 | mapped task는 `skipped` 처리된다 |
 
 static task를 유지하고 테이블마다 gate task를 다는 대안은, 선형 chain에서 skip이 하위 전체로 전파되어 모든 task에 `trigger_rule="all_done"`을 달고 gate를 테이블 수만큼 더 만들어야 하므로 채택하지 않는다.
@@ -618,8 +636,8 @@ static task를 유지하고 테이블마다 gate task를 다는 대안은, 선�
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 3건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 ③ **`_update_jobs`가 batch_id를 준 호출에서만 stat_desc를 갱신하도록 분기** — 안 그러면 update_success/update_failure가 영수증을 NULL로 지운다 (섹션 5.3-6) |
 | ConvertFileTaskGroup | `reprocess_cfg` 옵션 인자 + 재처리 분기 추가 | ① `__init__(..., reprocess_cfg=None)` 인자 추가 ② get_jobs 생성부를 if/else로 감싸고 else에 재처리 조회 task를 둔다 — 미지정이면 기존 인라인 경로(**코드·closure 전부 그대로, append 동작 완전 동일**). 재처리 task가 같은 `__init__` 스코프에 있으므로 `_update_jobs`·logger·config를 그냥 호출한다 (전달 인자 없음). **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
-| daily Compaction DAG | 스케줄 + params + task 생성 방식 | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체). **Enum loop + `chain()`을 mapped task로 전환** — 안 그러면 params가 선언만 되고 필터가 동작하지 않는다 (6.1) |
-| hourly Compaction DAG | params + task 생성 방식 | 위와 동일. 스케줄 변경 없음 |
+| daily Compaction DAG | 스케줄 + params + task 생성 방식 | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체). **Enum loop + `chain()`을 mapped task로 전환** — 안 그러면 params가 선언만 되고 필터가 동작하지 않는다 (6.1). **변경 예시: `pipeline/examples/compaction_dag_example.py`** |
+| hourly Compaction DAG | params + task 생성 방식 | 위와 동일. 스케줄 변경 없음. `target_dt` 대신 `start_time`/`end_time`을 담는다 |
 
 append DAG의 조회 로직(최근 1일, WAIT만, ts ASC, DB당 ROWNUM 200, conn_list loop)과 update task 구조는 **변경 없음**.
 
