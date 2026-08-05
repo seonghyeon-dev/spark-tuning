@@ -320,7 +320,7 @@ Iceberg는 append 커밋마다 snapshot을 생성하고, snapshot summary(key-va
 
 | param | 기본값 | 설명 |
 |-------|--------|------|
-| `tables` | 전체 테이블 | 처리 대상 테이블 multi-select — 1개/여러 개/전체 선택 가능. 정기 실행은 기본값(전체). 선택지·기본값은 append DAG과 동일한 **`iceberg.py`의 hourly/daily Enum 클래스**에서 생성 (`Param(type="array", items={"enum": [...]})`) — hourly/daily 분류는 소속 Enum 클래스로 결정되고, 테이블 추가/제거 시 Enum 한 곳만 수정하면 append/재처리가 함께 반영되는 단일 소스 |
+| `tables` | 전체 테이블 | 처리 대상 테이블 multi-select — 1개/여러 개/전체 선택 가능. 정기 실행은 기본값(전체). 선택지·기본값은 append DAG과 동일한 **`iceberg.py`의 hourly/daily Enum 클래스**에서 생성 (`Param(type="array", examples=[...])` — multi-select UI는 `examples`가 만든다, 6.3 참조) — hourly/daily 분류는 소속 Enum 클래스로 결정되고, 테이블 추가/제거 시 Enum 한 곳만 수정하면 append/재처리가 함께 반영되는 단일 소스 |
 | `start_time` / `end_time` | 없음 | **수동 실행 시 조회 범위를 직접 정의** (WAIT_SCHEDULING+FAILURE 전체). 둘 다 함께 지정해야 하며, `end_time ≤ 전날 00:00`만 허용 — 전날/당일은 append 조회 범위와 겹치므로 prepare_run이 검증 후 거부. 기존 DAG과 동일한 date-time 형식 → 내부에서 ts 문자열(`YYYYMMDDHHmmSSsss`)로 변환. 미지정 시 정기 범위(그저께 00:00 ~ 전날 끝) |
 
 ### 5.2 Task 구성
@@ -535,9 +535,18 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 "tables": Param(
     default=[t.get_name() for t in DailyIcebergTable],      # hourly는 HourlyIcebergTable
     type="array",                                            # format은 쓰지 않는다
-    items={"type": "string", "enum": [t.get_name() for t in DailyIcebergTable]},
+    examples=[t.get_name() for t in DailyIcebergTable],      # 이게 multi-select UI를 만든다
 )
 ```
+
+> **multi-select UI를 만드는 속성은 `examples`다.** `type="array"`만 선언하면 여러 줄
+> 텍스트 필드가 나오고 **한 줄에 한 값**으로 입력해야 한다(콤마 구분 아님). `items`는
+> 렌더링에 관여하지 않는다 — `items.type`이 `"string"`이 아닐 때 JSON 입력창으로 바뀔 뿐이고,
+> `items.enum`은 jsonschema 검증에만 쓰인다. 표시 라벨을 값과 다르게 하려면
+> `values_display={"table_a": "테이블 A"}`를 함께 준다.
+> (근거: Airflow `core-concepts/params.rst` — array 항목 "If you add the attribute
+> `examples` with a list, a multi-value select option will be generated instead of a
+> free text field.")
 
 `default`가 전체여야 conf 없이 도는 **정기 스케줄 실행의 대상 범위가 그대로 유지**된다.
 

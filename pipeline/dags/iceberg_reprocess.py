@@ -169,11 +169,12 @@ def collect_metas(ti, table_tasks: list[dict]) -> list[dict]:
     catchup=False,
     max_active_runs=1,      # loop 회차 순차 실행 보장
     params={
-        # 선택지·기본값 모두 iceberg.py Enum에서 생성 (설계 5.1)
+        # 선택지·기본값 모두 iceberg.py Enum에서 생성 (설계 5.1).
+        # multi-value select UI는 `examples`가 만든다 — `items`로는 안 나온다.
         "tables": Param(
             default=[t.get_name() for t in ALL_TABLES],
             type="array",
-            items={"type": "string", "enum": [t.get_name() for t in ALL_TABLES]},
+            examples=[t.get_name() for t in ALL_TABLES],
         ),
         # 수동 실행 조회 범위 (둘 다 함께 지정, prepare_run이 검증).
         # 미지정 시 정기 범위(그저께 00:00 ~ 전날 끝).
