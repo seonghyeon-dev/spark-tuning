@@ -527,7 +527,12 @@ run N+1: 동일 파이프라인 반복. 남은 게 없는 테이블은 조회 �
 > ValueError: Invalid input for param target_dt: '20260728' is not a 'date'
 > ```
 >
-> 변환은 `dates_between`(→ `YYYY-MM-DD`)과 `ts_to_param`(→ ISO 8601)이 담당한다.
+> 변환은 `dates_between`(→ `YYYY-MM-DD`)과 `ts_to_hour_param`(→ ISO 8601)이 담당한다.
+>
+> hourly 범위는 **시 단위로 내림**해서 넘긴다. 대상 테이블이 `hour(ts)` 히든 파티셔닝이라
+> Compaction 단위가 1시간 통이고, 통 중간을 가리키는 값을 주면 그 통을 반쪽만 지정하게
+> 된다. `end_time`은 여기에 **+1시간** 한다 — 내림한 값 그대로면 `ts_max`가 속한 통이
+> 범위 밖으로 떨어져 정작 적재한 시간대가 Compaction되지 않는다.
 
 **`tables` param 선언** (양쪽 DAG에 추가, 각자 자기 그룹 Enum만 사용):
 

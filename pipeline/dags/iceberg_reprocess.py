@@ -100,13 +100,20 @@ def param_to_ts(value: str) -> str:
     return ts_str(pendulum.parse(value, tz=KST).in_timezone(KST))
 
 
-def ts_to_param(ts: str) -> str:
-    """ts 문자열 → date-time 형식 (`param_to_ts`의 역변환).
+def ts_to_hour_param(ts: str, add_hours: int = 0) -> str:
+    """ts 문자열 → hourly Compaction DAG의 date-time 형식, **시 단위 내림**.
 
     hourly Compaction DAG의 `start_time`/`end_time`이 `format="date-time"`이라
     ts를 그대로 넘기면 params 검증에서 걸린다.
+
+    분·초를 살려 보내지 않는 이유: 대상 테이블이 `hour(ts)` 히든 파티셔닝이라
+    Compaction 단위가 1시간 통이다. 통 중간을 가리키는 값을 주면 그 통을
+    반쪽만 지정하게 된다. `ts[:10]`(YYYYMMDDHH)만 파싱해 자연스럽게 내림한다.
+
+    `end_time`은 `add_hours=1`로 부른다 — ts_max가 속한 통까지 포함해야 하는데
+    내림한 값 그대로면 그 통이 범위 밖으로 떨어진다.
     """
-    return pendulum.from_format(ts[:14], "YYYYMMDDHHmmss", tz=KST).isoformat()
+    return pendulum.from_format(ts[:10], "YYYYMMDDHH", tz=KST).add(hours=add_hours).isoformat()
 
 
 def dates_between(ts_min: str, ts_max: str) -> list[str]:
@@ -269,13 +276,15 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         ]
 
         # hourly: 전체 min~max 합집합으로 1회만 trigger.
-        # 사이에 빈 시간대가 껴도 Compaction은 no-op이라 무해
+        # 사이에 빈 시간대가 껴도 Compaction은 no-op이라 무해.
+        # 범위는 시 단위로 정렬한다 — 대상이 hour 히든 파티셔닝이라 1시간 통 단위로
+        # 처리해야 하고, end_time은 ts_max가 속한 통을 포함하도록 +1시간 한다
         if hourly:
             targets.append({
                 "trigger_dag_id": HOURLY_COMPACTION_DAG_ID,
                 "conf": {
-                    "start_time": ts_to_param(min(m["ts_min"] for m in hourly)),
-                    "end_time": ts_to_param(max(m["ts_max"] for m in hourly)),
+                    "start_time": ts_to_hour_param(min(m["ts_min"] for m in hourly)),
+                    "end_time": ts_to_hour_param(max(m["ts_max"] for m in hourly), add_hours=1),
                     "tables": [m["table"] for m in hourly],
                 },
             })
