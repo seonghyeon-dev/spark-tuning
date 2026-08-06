@@ -354,6 +354,7 @@ next_loop          [all_done] → retrigger_self       # 잔여분 판단 → �
   - 기각한 대안들 — 조회 task를 부모 밖으로 빼는 방식 전부: ① 메서드 추출 후 상속 override ② builder 주입 ③ 필요한 헬퍼를 파라미터로 전달. 공통 사유: 조회 로직은 `__init__` 지역 함수·설정값(`_update_jobs`, logger, config …)을 사용해야 하는데, 밖으로 빼면 그것들을 일일이 전달해야 하고 헬퍼가 늘 때마다 시그니처가 깨진다
   - **채택**: `__init__(..., reprocess_cfg=None)` 인자와 분기만 추가한다. 미지정이면 기존 인라인 경로(append: 코드·closure 전부 그대로, 동작 동일), 지정이면 같은 `__init__` 스코프에서 재처리 조회 task를 만든다 — **지역 함수를 그냥 호출**하면 되므로 전달 인자가 늘지 않는다 (섹션 7)
   - 재처리 조회 task 옵션: `trigger_rule="all_done"`(앞 테이블 실패에도 실행) + `ignore_downstream_trigger_rules=False`(skip을 그룹 내로 한정)
+  - **`cfg` 없으면 즉시 skip (구현 주의)**: `all_done`은 앞 테이블뿐 아니라 `prepare_run` 실패도 통과시킨다. `prepare_run`은 특정 테이블이 아니라 **모든 테이블의 공통 전제(조회 범위)** 이므로, 실패하면 `cfg`가 `None`으로 내려와 테이블 수만큼 실패가 쌓인다. 조회 task 첫 줄에서 `if not cfg: return False`로 막아 원인 1건에 알림 1건이 되게 한다
 - **테이블별 순차 실행**: Spark job(최대 24 executor)이 테이블 수만큼 동시에 뜨면 K8S가 감당하지 못한다. Compaction DAG과 동일하게 순차 — 잔여분 없는 테이블은 조회 후 즉시 skip이라 빠르다
 - **상태 update는 그룹 내부에서만**: `all_success`/`all_failed`가 각 테이블 자신의 Spark task에만 걸리므로, 테이블 간 부분 실패로 상태 update가 누락되는 구멍이 없다
 - **skip 전파 차단 (구현 주의)**: ShortCircuit의 기본 동작은 trigger_rule을 무시하고 **모든 하류 task를 재귀적으로 skip**시킨다. 기본값 그대로면 잔여분 없는 첫 테이블이 skip되는 순간 뒤 테이블 그룹 전체가 skip된다. 반드시 `ignore_downstream_trigger_rules=False`로 설정해 skip을 그룹 내 직계 하류로 한정한다 (`trigger_rule=all_done`인 다음 그룹/집계 task는 정상 실행)
