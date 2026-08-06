@@ -127,12 +127,18 @@ def dates_between(ts_min: str, ts_max: str) -> list[str]:
     return days
 
 
-# TODO(연결): ① 갱신 시각 컬럼명 확인(updated_at 가정) ② ts 범위 조건이 없어
-#             파티션 전체 스캔 — status 인덱스 유무 확인 필요
+# dt는 파티션 키(VARCHAR2 'YYYYMMDDHHmmSSsss')다. 고정 폭 zero-padded라 사전순
+# 비교가 시간순과 일치하고, dt를 함수로 감싸지 않으므로 pruning이 살아 있다.
+# 임계값도 SYSTIMESTAMP를 쓰므로 dt까지 DB 시계로 통일한다.
+# ⚠ 하루로 좁히면 하루 넘게 IN_PROGRESS로 굳은 row는 dt가 범위 밖이라 영영 안 잡힌다.
+#   잔류 알림(설계 8.1)도 WAIT_SCHEDULING/FAILURE만 보므로 사각지대가 된다.
+#   재처리 조회 범위(그저께~전날)에 맞춰 -2로 넓히는 것도 방법.
+# TODO(연결): 갱신 시각 컬럼명 확인(updated_at 가정)
 ZOMBIE_SQL = """
 SELECT table_name, k_1, k_2, k_3, ts, updated_at
   FROM JOB_HISTORY
  WHERE status = 'IN_PROGRESS'
+   AND dt >= TO_CHAR(SYSDATE - 1, 'YYYYMMDDHH24MISS') || '000'
    AND updated_at < SYSTIMESTAMP - NUMTODSINTERVAL(:h, 'HOUR')
 """
 
