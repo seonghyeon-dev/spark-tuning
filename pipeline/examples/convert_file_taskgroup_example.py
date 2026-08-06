@@ -278,6 +278,14 @@ class ConvertFileTaskGroup(TaskGroup):
             )
             def get_jobs(cfg, run_id=None, ti=None):
                 logger.info("reprocess get_jobs: %s", table.get_name())
+
+                # prepare_run이 실패하면 cfg가 None으로 내려온다. trigger_rule이
+                # all_done이라 여기까지 오는데, 조회 범위가 없으면 할 일이 없다.
+                # 막지 않으면 원인 하나에 테이블 수만큼 실패가 쌓인다
+                if not cfg:
+                    logger.warning("조회 범위 없음(prepare_run 실패 추정) — skip")
+                    return False
+
                 r = reprocess_select_jobs(cfg, table, run_id)
 
                 # 이미 Iceberg에 커밋된 건 → 재적재 없이 SUCCESS 정정.
