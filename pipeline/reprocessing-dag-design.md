@@ -627,10 +627,10 @@ static task를 유지하고 테이블마다 gate task를 다는 대안은, 선�
 |------|------|------|
 | 매시 `35 * * * *` | hourly Compaction | 유지 |
 | `0 1 * * *` | daily Compaction | `35 0 * * *` → **01:00** |
-| `5 2 * * *` | expire snapshots | 01:05 → **02:05** |
+| `0 2 * * *` | expire snapshots | 01:05 → **02:00** |
 | `0 3 * * *` | **재처리 DAG** | 01:00 → **03:00** |
-| `5 4 * * *` | remove orphan files | 01:35 → **04:05** |
-| 3일마다 `5 5 * * *` | rewrite manifests | 02:05 → **05:05** |
+| `0 4 * * *` | remove orphan files | 01:35 → **04:00** |
+| `0 5 */3 * *` | rewrite manifests | 02:05 → **05:00** (3일마다) |
 
 순서(Compaction → expire → 재처리 → orphan → manifests)는 유지하고 간격만 duration에 맞췄다. remove orphan files를 재처리 뒤로 뺀 것은 재처리와 그것이 trigger한 Compaction이 만든 파일까지 지나간 뒤 정리하기 위함이다.
 
@@ -640,7 +640,7 @@ static task를 유지하고 테이블마다 gate task를 다는 대안은, 선�
 |------|------|
 | 재처리 적재분 Compaction | daily 정기 run(01:00)이 재처리(03:00)보다 **먼저** 끝나므로 재처리 적재분은 정기 run이 덮지 못한다. 6.3의 "조건 없이 적재분 전부 trigger"가 이를 담당한다 — 조건부 생략을 두지 않은 결정이 여기서 값을 한다 |
 | 자정 지연 적재 구멍 | 00:35 → 01:00은 25분 개선일 뿐이다. append가 01:00 이후에 전날 데이터를 적재하면 그 데이터는 이미 `SUCCESS`라 재처리 대상도 아니어서 정기 Compaction을 영영 놓친다. **append가 전날 데이터를 얼마나 늦게까지 적재하는지 실측**해 01:00으로 충분한지 판단해야 한다 |
-| hourly와의 겹침 | hourly Compaction이 매시간 도는 이상 60분짜리 daily 작업과의 겹침은 피할 수 없다. daily Compaction과는 대상 테이블 그룹이 달라 Iceberg 충돌이 없고 리소스 경합만 있다. **expire/orphan/manifests는 전체 테이블 대상이라 hourly와 같은 테이블을 건드리므로**, 시작 시각을 :05로 두어 :35 창을 피한다 |
+| hourly와의 겹침 | hourly Compaction이 매시간 도는 이상 60분짜리 daily 작업과의 겹침은 피할 수 없다. daily Compaction과는 대상 테이블 그룹이 달라 Iceberg 충돌이 없고 리소스 경합만 있다. **expire/orphan/manifests는 전체 테이블 대상이라 hourly와 같은 테이블을 건드리므로**, 정각에 시작해 `:35`까지 35분을 확보한다 (`:30` 시작은 5분밖에 없어 최악) |
 | append와의 충돌 | append DAG이 5분 주기로 상시 도므로 **스케줄로는 막을 수 없다.** `remove_orphan_files`의 `older_than`이 진행 중인 쓰기보다 짧으면 커밋 전 파일을 지운다 — Iceberg 기본 3일을 줄이지 않았는지 확인 필수 |
 | 재처리 실행 시각 | `wait_bound`가 "append 조회 하한 = 실행시각 − 24h"에서 나오므로 **실행 시각과 함께 움직여야 한다.** DAG에 `RUN_HOUR` 상수를 두어 `schedule`과 `wait_bound`가 한 값을 쓰게 했다. 어긋나면 그 사이 구간을 append도 재처리도 보지 않아 회수가 하루 밀린다 |
 
