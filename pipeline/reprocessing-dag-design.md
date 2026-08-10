@@ -34,7 +34,7 @@
 | Iceberg 테이블 | **20개 이상**. 첫 파티션 기준 hourly 그룹(`hour` hidden partition)과 daily 그룹(`day` hidden partition)으로 분류 |
 | Job History (Oracle) | 처리 대상 상태 관리 테이블. **Oracle DB 2개(a/b)에 동일 스키마로 존재** — append DAG은 conn_list(conn_id 2개) loop로 같은 쿼리를 DB별로 실행. **키는 복합키 4개**(예: `k_1`, `k_2`, `k_3`, `ts`) — `ts`(string, `YYYYMMDDHHmmSSsss` 밀리세컨즈)도 그중 하나이며 날짜 파티셔닝 키이자 조회 기준이다. 그 외 컬럼: `table_name`(대상 테이블), `base_path`, `param`(JSON — `{"files": [{"file_path", "size"}, ...]}`, row당 파일 여러 개 가능), `status`, `stat_desc`(CLOB, 현재 미사용). 복합키 값은 DB 간 유일 보장 없음 |
 | append DAG | py 파일 1개에서 loop로 **테이블별 DAG 동적 생성** (테이블당 1개 실행). 약 5분 주기. `get_jobs`가 conn_list의 **DB별로** `table_name` 조건 + `ts` 최근 1일 범위 + `status='WAIT_SCHEDULING'`을 `ORDER BY ts ASC`, `ROWNUM <= 200`으로 조회 |
-| Compaction DAG | **hourly DAG 1개**(`15 * * * *`, 직전 1시간치) + **daily DAG 1개**(현재 `35 0 * * *`, 전일치). 각 DAG 내부에서 소속 테이블 task가 순차 실행. `max_active_runs=1`. UI 수동 실행용 params: daily는 `target_dt`, hourly는 `start_time`/`end_time` |
+| Compaction DAG | **hourly DAG 1개**(`35 * * * *`, 직전 1시간치) + **daily DAG 1개**(현재 `35 0 * * *` → `0 1 * * *`, 전일치). 각 DAG 내부에서 소속 테이블 task가 순차 실행. `max_active_runs=1`. UI 수동 실행용 params: daily는 `target_dt`, hourly는 `start_time`/`end_time` |
 | DB 상태 처리 | callback이 아닌 `update_success`(`trigger_rule=all_success`) / `update_failure`(`all_failed`) task 방식 — callback은 DB update 지연 시 작업이 kill되는 문제가 있었음 |
 
 ### 1.2 문제: 영구 잔류 데이터
@@ -49,7 +49,7 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 ### 1.3 설계 방향
 
 - append DAG의 조회 기간(최근 1일)과 `ORDER BY ts ASC` 순차 처리를 건드리지 않는다 — Partition Pruning과 최신 데이터 freshness 유지
-- 잔류 데이터 회수는 **재처리 DAG 1개**(1일 주기, 01:00 KST)가 전담한다. 테이블별 task로 구성 (Compaction DAG과 동일 패턴)
+- 잔류 데이터 회수는 **재처리 DAG 1개**(1일 주기, 03:00 KST)가 전담한다. 테이블별 task로 구성 (Compaction DAG과 동일 패턴)
 - append DAG과 재처리 DAG의 조회 범위를 **애초에 겹치지 않게 설계**해서 같은 row를 두 DAG이 집는 경합을 원천 차단한다 (잠금·선점 로직 불필요)
 - 자동 재처리 범위는 **전날 + 그저께**로 제한하고, 그 이상 밀린 데이터는 알림 후 **수동 처리**한다 (매일 모니터링 운영 전제)
 
@@ -64,7 +64,7 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 │   재시도 없음. 실패 건은 FAILURE 확정 후 재처리 DAG에 위임        │
 └──────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────┐
-│ 재처리 DAG 1개 (1일 주기, 01:00 KST) — 잔류 데이터 회수 전담    │
+│ 재처리 DAG 1개 (1일 주기, 03:00 KST) — 잔류 데이터 회수 전담    │
 │   테이블별 task 순차 실행 (Compaction DAG과 동일 패턴)          │
 │   조회: FAILURE(전날+그저께) + WAIT_SCHEDULING(append 범위 밖만), DB 2개    │
 │   테이블당·DB당 ROWNUM ≤ 1,000. 초과 시 자기 재trigger(loop)   │
@@ -79,17 +79,17 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 
 ### 2.1 조회 범위 경계 — 겹침이 원천적으로 불가능한 이유
 
-**핵심 규칙**: append는 항상 "실행 시각-24시간 이후"만 조회한다. 재처리의 WAIT_SCHEDULING 조회 상한을 **전날 01:00**(= 재처리 스케줄 시각 - 24시간)으로 잡으면, 재처리가 01:00 이후에 도는 한 append의 조회 하한은 항상 전날 01:00 이상이므로 **두 범위는 절대 겹치지 않는다.** FAILED는 append가 아예 조회하지 않으므로 겹침 걱정 없이 전날·그저께 전체를 잡는다.
+**핵심 규칙**: append는 항상 "실행 시각-24시간 이후"만 조회한다. 재처리의 WAIT_SCHEDULING 조회 상한을 **전날 03:00**(= 재처리 스케줄 시각 `RUN_HOUR` - 24시간)으로 잡으면, 재처리가 03:00 이후에 도는 한 append의 조회 하한은 항상 전날 03:00 이상이므로 **두 범위는 절대 겹치지 않는다.** FAILED는 append가 아예 조회하지 않으므로 겹침 걱정 없이 전날·그저께 전체를 잡는다.
 
-**오늘 = 4일** (전날 = 3일, 그저께 = 2일)로 두고, 오늘 4일 01:00 실행 기준 (`ts`는 `YYYYMMDDHHmmSSsss` 문자열 비교):
+**오늘 = 4일** (전날 = 3일, 그저께 = 2일)로 두고, 오늘 4일 03:00 실행 기준(`RUN_HOUR=3`) (`ts`는 `YYYYMMDDHHmmSSsss` 문자열 비교):
 
 | 대상 | ts 범위 | 이유 |
 |------|---------|------|
 | FAILURE | `20260702000000000` ≤ ts < `20260704000000000` (그저께 00:00 ~ 전날 끝) | append는 FAILED를 조회하지 않으므로 전 구간 안전 |
-| WAIT_SCHEDULING | `20260702000000000` ≤ ts < `20260703010000000` (그저께 00:00 ~ 전날 01:00) | 전날 01:00 이후는 append가 아직 조회 가능한 영역 |
+| WAIT_SCHEDULING | `20260702000000000` ≤ ts < `20260703030000000` (그저께 00:00 ~ 전날 03:00) | 전날 03:00 이후는 append가 아직 조회 가능한 영역 |
 | 그저께 이전 | 조회 안 함 | **알림 → 수동 처리** (섹션 8) |
 
-> **경계값은 실행 시각이 아니라 그 날의 01:00 고정값으로 계산한다.** 재실행이나 loop 회차가 늦게 돌아도 경계가 append 조회 하한보다 항상 과거이므로 안전이 유지된다.
+> **경계값은 실행 시각이 아니라 그 날의 `RUN_HOUR`(03:00) 고정값으로 계산한다.** 재실행이나 loop 회차가 늦게 돌아도 경계가 append 조회 하한보다 항상 과거이므로 안전이 유지된다.
 >
 > **그저께까지 조회하는 이유(안전망)**: 재처리가 하룻밤 통째로 실패하거나 조회 상한으로 이월이 생겨도, 다음날 실행이 그저께 범위로 자동 회수한다. 이틀 연속 실패부터 수동 영역이다.
 >
@@ -98,12 +98,12 @@ append DAG의 조회 기간은 **실행 시각 기준 최근 1일**(rolling)이�
 **잔류 데이터 회수 타임라인**:
 
 ```
-[FAILURE] 전날(3일) 15:00 배치 실패 → 오늘(4일) 01:00 재처리가 회수 (최대 하루 지연)
+[FAILURE] 전날(3일) 15:00 배치 실패 → 오늘(4일) 03:00 재처리가 회수 (최대 하루 지연)
 
 [WAIT_SCHEDULING]   전날(3일) 08:00 생성 후 계속 미처리
-         4일 01:00  재처리: WAIT_SCHEDULING 상한이 3일 01:00 → 대상 아님 (아직 append 담당)
+         4일 03:00  재처리: WAIT_SCHEDULING 상한이 3일 03:00 → 대상 아님 (아직 append 담당)
          4일 08:00  생성 24시간 경과 → append 조회 범위 이탈
-         다음날(5일) 01:00  재처리: WAIT_SCHEDULING 범위 [3일 00:00 ~ 4일 01:00) → 회수 ✅ (최대 약 이틀 지연)
+         다음날(5일) 03:00  재처리: WAIT_SCHEDULING 범위 [3일 00:00 ~ 4일 03:00) → 회수 ✅ (최대 약 이틀 지연)
 ```
 
 append가 `ORDER BY ts ASC`(오래된 것부터)로 소화하므로, 조회 범위 안의 WAIT가 하루 종일 안 집히는 상황 자체가 append 처리량 이상 신호다 — 이 경우는 잔류 알림(섹션 8.1)으로 드러난다.
@@ -111,7 +111,7 @@ append가 `ORDER BY ts ASC`(오래된 것부터)로 소화하므로, 조회 범�
 ### 2.2 Iceberg 동시 append — 커밋 레벨에서 안전한 이유
 
 2.1이 막는 것은 **같은 row를 두 DAG이 집는 것**이다. 그와 별개로, 두 DAG의 Spark job이
-**같은 테이블에 동시에 append 커밋**을 시도하는 상황은 실제로 발생한다 (재처리는 01:00에
+**같은 테이블에 동시에 append 커밋**을 시도하는 상황은 실제로 발생한다 (재처리는 03:00에
 수 분간 돌고, append는 그 동안에도 약 5분 주기로 뜬다). Airflow `max_active_runs`는
 DAG 단위 설정이라 서로 다른 DAG 사이에는 아무 제약이 되지 않는다.
 
@@ -189,7 +189,7 @@ HMS는 자기 RDB 트랜잭션 안에서 테이블 파라미터를 읽고·비�
 | append DAG 조회를 상태 기준(시간 조건 제거)으로 변경 | `ts` 날짜 키 파티셔닝에서 전체 파티션 스캔 발생 → 조회 성능 저하 |
 | append DAG 조회 기간 확장 (1일 → 7일) | 조회 성능 저하 + 밀린 과거 데이터가 최신 데이터 처리를 지연시킴 |
 | 재처리 DAG을 테이블별로 동적 생성 (append 패턴) | 재처리는 하루 1회 청소 배치로 대부분 테이블이 no-op — DAG 20개+가 매일 빈 run을 쌓는 관리 소음. 단일 DAG + 테이블별 task(Compaction 패턴)가 관리에 유리하고, Compaction trigger도 한곳에서 날짜별로 묶어 1회씩 실행 가능 |
-| 전날 WAIT_SCHEDULING 전체를 재처리가 가져가기 (UPDATE 선점 또는 Airflow pool로 경합 제어) | UPDATE 선점 후 재조회는 stat_desc(CLOB) 조건이 필요해 성능 문제. pool은 테이블 20개+ 구조에서 테이블별 pool 난립 또는 전역 병목. 조회 범위를 겹치지 않게 하는 것이 가장 단순 (전날 01:00 이후 WAIT는 다음날 회수 — 하루 지연 허용) |
+| 전날 WAIT_SCHEDULING 전체를 재처리가 가져가기 (UPDATE 선점 또는 Airflow pool로 경합 제어) | UPDATE 선점 후 재조회는 stat_desc(CLOB) 조건이 필요해 성능 문제. pool은 테이블 20개+ 구조에서 테이블별 pool 난립 또는 전역 병목. 조회 범위를 겹치지 않게 하는 것이 가장 단순 (전날 03:00 이후 WAIT는 다음날 회수 — 하루 지연 허용) |
 | 한 DAG run 안에서 Spark task 여러 개로 분할 처리 | 일부 성공/일부 실패 시 `all_success`/`all_failed`가 모두 불충족되어 상태 update 누락. loop는 DAG 재trigger 방식으로 해결 (섹션 5.5) |
 | 재처리 DAG에서 직접 `rewrite_data_files` 실행 | 기존 Compaction DAG과 동시 실행 시 Iceberg commit 충돌. 기존 DAG trigger로 `max_active_runs=1` 직렬화 활용 (섹션 6) |
 
@@ -223,7 +223,7 @@ FAILURE ───────────────────┘        │
 ### 3.3 재시도 정책
 
 - **task 레벨 재시도**: Spark task의 Airflow `retries`(권장 2회, `retry_delay` 5분)가 일시적 오류(S3 순단 등)를 1차 방어
-- **배치 레벨 재시도**: task 재시도 소진 후 FAILURE 확정 → 다음날 01:00 재처리 DAG이 재시도. 별도 retry 카운트는 DB에 저장하지 않음 (재시도는 task가, 배치 재시도는 상태 재조회가 담당)
+- **배치 레벨 재시도**: task 재시도 소진 후 FAILURE 확정 → 다음날 03:00 재처리 DAG이 재시도. 별도 retry 카운트는 DB에 저장하지 않음 (재시도는 task가, 배치 재시도는 상태 재조회가 담당)
 - **무한 재시도 방지**: 재처리에서도 반복 실패하는 건은 그저께 이전 잔류 알림(섹션 8.1)으로 사람에게 노출됨
 
 > **FAILURE 격리 효과**: append DAG이 FAILED를 재조회하지 않으므로, 깨진 파일이 섞인 배치가 5분마다 반복 실패하며 정상 신규 데이터까지 물고 늘어지는 상황이 구조적으로 발생하지 않는다.
@@ -239,7 +239,7 @@ Airflow의 "task 실패" 판정이 항상 "데이터 미적재"를 의미하지 
 ```
 전날(3일) 09:00  Spark job이 Iceberg commit 성공 (데이터 적재됨)
             → 직후 Pod 통신 오류 → Airflow는 실패 판정 → FAILURE 기록
-오늘(4일) 01:00  재처리 DAG이 FAILED를 재적재 → 중복!
+오늘(4일) 03:00  재처리 DAG이 FAILED를 재적재 → 중복!
 ```
 
 ### 4.2 동작 방식
@@ -381,7 +381,7 @@ SELECT * FROM (
        AND ts >= :ts_from           -- 그저께 00:00  '20260702000000000'
        AND ts <  :ts_to             -- 전날 끝       '20260704000000000'
        AND ( status = 'FAILURE'                                   -- FAILURE: 전 구간
-             OR (status = 'WAIT_SCHEDULING' AND ts < :wait_bound)           -- WAIT_SCHEDULING: 전날 01:00 이전만
+             OR (status = 'WAIT_SCHEDULING' AND ts < :wait_bound)           -- WAIT_SCHEDULING: 전날 03:00 이전만
            )
      ORDER BY ts ASC                -- append와 동일, 오래된 것부터
 ) WHERE ROWNUM <= :row_limit        -- 1,000 (ts는 meta의 적재 범위 기록용으로 함께 조회)
@@ -619,14 +619,32 @@ static task를 유지하고 테이블마다 gate task를 다는 대안은, 선�
 
 재처리가 왜 필요하게 만드는가: 정기 Compaction은 시간당(직전 1시간)·일일(전일치) 범위만 보므로, 재처리가 적재하는 **과거 시간대/과거 날짜**는 정기 run이 다시 방문하지 않는 구간이다. trigger 없이는 재처리분 small file이 과거 파티션에 영구히 남는다.
 
-### 6.2 daily Compaction 스케줄 변경: 00:35 → 02:00
+### 6.2 maintenance 스케줄 재배치
+
+기존 배치는 간격이 duration을 반영하지 않아 실제로는 겹쳤다. daily Compaction이 30~60분 걸리는데 5분 뒤 expire snapshots, 35분 뒤 remove orphan files가 시작됐고, remove orphan files는 매시 :35의 hourly Compaction과 정면 충돌했다.
+
+| 시각 | 작업 | 변경 |
+|------|------|------|
+| 매시 `35 * * * *` | hourly Compaction | 유지 |
+| `0 1 * * *` | daily Compaction | `35 0 * * *` → **01:00** |
+| `0 2 * * *` | expire snapshots | 01:05 → **02:00** |
+| `0 3 * * *` | **재처리 DAG** | 01:00 → **03:00** |
+| `0 4 * * *` | remove orphan files | 01:35 → **04:00** |
+| `0 5 */3 * *` | rewrite manifests | 02:05 → **05:00** (3일마다) |
+
+순서(Compaction → expire → 재처리 → orphan → manifests)는 유지하고 간격만 duration에 맞췄다. remove orphan files를 재처리 뒤로 뺀 것은 재처리와 그것이 trigger한 Compaction이 만든 파일까지 지나간 뒤 정리하기 위함이다.
+
+**전제와 한계**
 
 | 항목 | 내용 |
 |------|------|
-| 변경 | daily Compaction `35 0 * * *` → **`0 2 * * *`** |
-| 효과 ① | 재처리(01:00)가 적재한 **전날 데이터**가 전일치 정기 run에 자연 포함 → 전날분은 trigger 불필요 |
-| 효과 ② | 기존 00:35의 숨은 구멍 해소 — 자정 넘어 늦게 도착한 전날 데이터를 append가 00:35 이후에 적재하면 정기 Compaction을 영영 놓쳤음 |
-| hourly | **`15 * * * *` 유지** — 정기 run은 직전 1시간만 보므로 스케줄을 옮겨도 과거 시간대는 커버 불가. 과거분은 어차피 trigger로 처리 |
+| 재처리 적재분 Compaction | daily 정기 run(01:00)이 재처리(03:00)보다 **먼저** 끝나므로 재처리 적재분은 정기 run이 덮지 못한다. 6.3의 "조건 없이 적재분 전부 trigger"가 이를 담당한다 — 조건부 생략을 두지 않은 결정이 여기서 값을 한다 |
+| 자정 지연 적재 구멍 | 00:35 → 01:00은 25분 개선일 뿐이다. append가 01:00 이후에 전날 데이터를 적재하면 그 데이터는 이미 `SUCCESS`라 재처리 대상도 아니어서 정기 Compaction을 영영 놓친다. **append가 전날 데이터를 얼마나 늦게까지 적재하는지 실측**해 01:00으로 충분한지 판단해야 한다 |
+| hourly와의 겹침 | hourly Compaction이 매시간 도는 이상 60분짜리 daily 작업과의 겹침은 피할 수 없다. daily Compaction과는 대상 테이블 그룹이 달라 Iceberg 충돌이 없고 리소스 경합만 있다. **expire/orphan/manifests는 전체 테이블 대상이라 hourly와 같은 테이블을 건드리므로**, 정각에 시작해 `:35`까지 35분을 확보한다 (`:30` 시작은 5분밖에 없어 최악) |
+| append와의 충돌 | append DAG이 5분 주기로 상시 도므로 **스케줄로는 막을 수 없다.** `remove_orphan_files`의 `older_than`이 진행 중인 쓰기보다 짧으면 커밋 전 파일을 지운다 — Iceberg 기본 3일을 줄이지 않았는지 확인 필수 |
+| 재처리 실행 시각 | `wait_bound`가 "append 조회 하한 = 실행시각 − 24h"에서 나오므로 **실행 시각과 함께 움직여야 한다.** DAG에 `RUN_HOUR` 상수를 두어 `schedule`과 `wait_bound`가 한 값을 쓰게 했다. 어긋나면 그 사이 구간을 append도 재처리도 보지 않아 회수가 하루 밀린다 |
+
+> **근본 해결은 별건**: 시계로 벌리는 방식은 duration이 늘면 조용히 깨진다. daily 계열 maintenance를 DAG 하나의 순차 task로 묶으면(Compaction → expire → manifests → orphan) 구조적으로 사라지는 문제다. 공수 문제로 후속 과제로 미룬다.
 
 ### 6.3 trigger 규칙
 
@@ -637,7 +655,7 @@ static task를 유지하고 테이블마다 gate task를 다는 대안은, 선�
 | daily 그룹 테이블 | 적재한 날짜별로 daily DAG trigger: `conf={"target_dt": 날짜, "tables": [해당 테이블들]}` |
 | hourly 그룹 테이블 | hourly DAG trigger: `conf={"start_time": ..., "end_time": ..., "tables": [해당 테이블들]}` (적재 데이터 ts 최소~최대 범위) |
 
-- **조건 없이 적재분 전부 trigger한다.** "전날 daily분은 02:00 정기 run이 커버하니 생략" 같은 조건부 생략을 두지 않는 이유: loop 회차가 02:00을 넘겨 전날 데이터를 적재하면 정기 run은 이미 지나갔는데 trigger도 생략되어 Compaction이 영영 누락된다. `tables` 필터 덕분에 trigger run은 해당 테이블만 처리하므로 중복 비용이 작고, 이미 Compaction된 범위의 중복 실행은 합칠 파일이 없어 사실상 no-op이다
+- **조건 없이 적재분 전부 trigger한다.** 정기 daily run(01:00)이 재처리(03:00)보다 먼저 끝나므로 재처리 적재분은 어차피 정기 run이 덮지 못한다. 설령 순서를 되돌리더라도 "전날 daily분은 정기 run이 커버하니 생략" 같은 조건부 생략은 두지 않는다 — loop 회차가 정기 run 시각을 넘겨 적재하면 trigger도 생략되어 Compaction이 영영 누락된다. `tables` 필터 덕분에 trigger run은 해당 테이블만 처리하므로 중복 비용이 작고, 이미 Compaction된 범위의 중복 실행은 합칠 파일이 없어 사실상 no-op이다
 - `wait_for_completion=False` — Compaction 실패 알림은 Compaction DAG이 담당. 대기하면 재처리 DAG 실행 시간만 늘어남
 - **`trigger_run_id` + `skip_when_already_exists=True` 필수**: `TriggerDagRunOperator`는 DagRun을 만든 **뒤에** 자기 상태를 보고한다. 상태 보고가 실패하면(API 서버 오류, 라벨 길이 초과 등) 일은 이미 됐는데 task는 실패로 기록되고, 재시도가 처음부터 다시 돌아 **DagRun이 하나 더 생긴다.** `trigger_run_id`를 비워 두면 시도마다 새 run_id가 생성되어 Airflow가 중복을 알아채지 못한다. 이름을 직접 지어 두면 재시도가 같은 run_id로 들어와 `DagRunAlreadyExists`가 되고, `skip_when_already_exists=True`가 그걸 SKIPPED로 마무리한다. 이름 재료는 daily/hourly는 **자기 DagRun의 `run_id`**(재시도 사이에 고정), `retrigger_self`는 **`cfg["chain_id"]` + 회차**(자기 run_id를 쓰면 회차마다 이름이 중첩되어 길어진다)
 - loop 회차마다 자기 회차 적재분을 trigger하면 되므로 loop와의 상호작용 없음
@@ -650,7 +668,7 @@ static task를 유지하고 테이블마다 gate task를 다는 대안은, 선�
 |------|------|------|
 | append DAG (테이블별 공통 py) | batch_id 기록 3건 | ① `get_jobs`의 IN_PROGRESS 마킹 UPDATE에 `stat_desc = :batch_id` 추가 ② Spark 쓰기에 `option("snapshot-property.batch_id", batch_id)` 추가 ③ **`_update_jobs`가 batch_id를 준 호출에서만 stat_desc를 갱신하도록 분기** — 안 그러면 update_success/update_failure가 영수증을 NULL로 지운다 (섹션 5.3-6) |
 | ConvertFileTaskGroup | `reprocess_cfg` 옵션 인자 + 재처리 분기 추가 | ① `__init__(..., reprocess_cfg=None)` 인자 추가 ② get_jobs 생성부를 if/else로 감싸고 else에 재처리 조회 task를 둔다 — 미지정이면 기존 인라인 경로(**코드·closure 전부 그대로, append 동작 완전 동일**). 재처리 task가 같은 `__init__` 스코프에 있으므로 `_update_jobs`·logger·config를 그냥 호출한다 (전달 인자 없음). **변경 예시: `pipeline/examples/convert_file_taskgroup_example.py`** |
-| daily Compaction DAG | 스케줄 + params + task 생성 방식 | `35 0 * * *` → `0 2 * * *`. params에 `tables` multi-select 추가 (기본 전체). **Enum loop + `chain()`을 mapped task로 전환** — 안 그러면 params가 선언만 되고 필터가 동작하지 않는다 (6.1). **변경 예시: `pipeline/examples/compaction_dag_example.py`** |
+| daily Compaction DAG | 스케줄 + params + task 생성 방식 | `35 0 * * *` → `0 1 * * *` (6.2). params에 `tables` multi-select 추가 (기본 전체). **Enum loop + `chain()`을 mapped task로 전환** — 안 그러면 params가 선언만 되고 필터가 동작하지 않는다 (6.1). **변경 예시: `pipeline/examples/compaction_dag_example.py`** |
 | hourly Compaction DAG | params + task 생성 방식 | 위와 동일. 스케줄 변경 없음. `target_dt` 대신 `start_time`/`end_time`을 담는다 |
 
 append DAG의 조회 로직(최근 1일, WAIT만, ts ASC, DB당 ROWNUM 200, conn_list loop)과 update task 구조는 **변경 없음**.
@@ -695,7 +713,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | 1 | Oracle Job History 파티션 보존 기간 | ≥ 7일 (잔류 알림 조회 범위) |
 | 2 | Iceberg snapshot 보존 기간 | 3일. **항상 재처리 조회 범위(2일)보다 길게 유지** |
 | 3 | K8S 클러스터 여유 용량 | append + 재처리 동시 실행 시 최대 ~192 core / ~427GB. 부족 시 재처리 executor 상한 하향 |
-| 4 | Compaction DAG 사전 변경 | daily 스케줄 02:00 이동, 양쪽 `tables` params 추가 — 재처리 DAG 배포 **전에** 적용 |
+| 4 | maintenance 스케줄 재배치 + Compaction DAG 변경 | 6.2 표대로 5개 DAG 스케줄 조정, 양쪽 Compaction DAG에 `tables` params + mapped task 전환 — 재처리 DAG 배포 **전에** 적용 |
 | 5 | Spark task retries | `retries=2`, `retry_delay=5분` 권장 (일시적 오류 1차 방어) |
 | 6 | 시간대 | 모든 DAG `Asia/Seoul` timezone 명시. `ts` 경계 계산 KST 기준 |
 | 7 | stat_desc 컬럼 | batch_id 용도 전환 공유. **WHERE 조건 사용 금지** (CLOB — 값 기록/읽기만) |
