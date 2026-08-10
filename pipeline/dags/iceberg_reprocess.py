@@ -252,13 +252,21 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
             "ts_to": ts_to,
             "wait_bound": wait_bound,
             "loop_count": 0,
+            # loop 전체를 관통하는 고정 식별자 — retrigger_self의 trigger_run_id 재료.
+            # 매 회차 자기 run_id를 쓰면 이름이 회차마다 중첩되어 길어진다
+            "chain_id": dag_run.run_id,
         }
 
     @task(trigger_rule="all_done")
-    def compaction_targets(table_tasks: list[dict], ti=None) -> list[dict]:
+    def compaction_targets(table_tasks: list[dict], ti=None, run_id=None) -> list[dict]:
         """적재 결과 집계 → TriggerDagRunOperator kwargs 목록 (설계 6.3).
         적재분 전부 trigger — tables 필터로 비용 최소, 중복은 no-op.
-        conf 값은 대상 DAG params 형식에 맞춰 넘긴다 (daily=date, hourly=date-time)."""
+        conf 값은 대상 DAG params 형식에 맞춰 넘긴다 (daily=date, hourly=date-time).
+
+        `trigger_run_id`를 직접 짓는 이유: 비워 두면 Airflow가 시도마다 새 run_id를
+        만들어, trigger task가 재시도될 때 DagRun이 하나 더 생긴다 (DagRun 생성이
+        상태 보고보다 먼저라 '일은 됐는데 실패로 기록'되면 재시도가 일을 또 한다).
+        run_id는 이 DagRun 안에서 고정이므로 재시도해도 같은 이름이 나온다."""
         metas = collect_metas(ti, table_tasks)
         daily = [m for m in metas if m["group"] == "daily"]
         hourly = [m for m in metas if m["group"] == "hourly"]
@@ -271,6 +279,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
                 by_date.setdefault(date, []).append(m["table"])
         targets = [
             {"trigger_dag_id": DAILY_COMPACTION_DAG_ID,
+             "trigger_run_id": f"reprocess_{run_id}_d{date}",
              "conf": {"target_dt": date, "tables": tables}}
             for date, tables in by_date.items()
         ]
@@ -282,6 +291,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         if hourly:
             targets.append({
                 "trigger_dag_id": HOURLY_COMPACTION_DAG_ID,
+                "trigger_run_id": f"reprocess_{run_id}_h",
                 "conf": {
                     "start_time": ts_to_hour_param(min(m["ts_min"] for m in hourly)),
                     "end_time": ts_to_hour_param(max(m["ts_max"] for m in hourly), add_hours=1),
@@ -302,9 +312,13 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         if cfg["loop_count"] >= MAX_LOOP:
             send_alert(f"재처리 loop 상한({MAX_LOOP}회) 도달 — 수동 처리 필요")
             return []
-        # 첫 회차가 확정한 조회 범위·tables를 conf로 승계 (자정을 넘겨도 경계 고정)
+        # 첫 회차가 확정한 조회 범위·tables를 conf로 승계 (자정을 넘겨도 경계 고정).
+        # trigger_run_id는 chain_id + 회차로 짓는다 — 자기 run_id를 쓰면 회차마다
+        # 이름이 중첩되어 길어진다 (재시도 중복 방지 이유는 compaction_targets 참조)
+        nxt = cfg["loop_count"] + 1
         return [{"trigger_dag_id": DAG_ID,
-                 "conf": {**cfg, "loop_count": cfg["loop_count"] + 1}}]
+                 "trigger_run_id": f"reprocess_loop{nxt}_{cfg['chain_id']}",
+                 "conf": {**cfg, "loop_count": nxt}}]
 
     # 좀비 점검은 독립 실행 — 알림 실패가 재처리 본류를 막지 않음 (설계 8.2)
     check_zombie_jobs()
@@ -346,12 +360,16 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     #   테이블이 늘면 성공 상태 보고가 DB 에러로 실패하고, task는 이미 DagRun을
     #   만든 뒤라 재시도마다 중복 trigger된다. 실행 전 렌더링 실패는 debug로
     #   삼켜지므로 징후 없이 마지막에만 터진다
+    # skip_when_already_exists: 재시도가 같은 trigger_run_id로 들어오면 이미 만든
+    # DagRun을 발견하고 task를 SKIPPED로 끝낸다 (기본값은 예외 → task 실패)
     TriggerDagRunOperator.partial(
         task_id="trigger_compaction",
+        skip_when_already_exists=True,
         map_index_template="{{ task.conf.get('target_dt') or task.conf['start_time'] }}",
     ).expand_kwargs(comp)
     TriggerDagRunOperator.partial(
         task_id="retrigger_self",
+        skip_when_already_exists=True,
         map_index_template="loop {{ task.conf['loop_count'] }}",
     ).expand_kwargs(nxt)
 

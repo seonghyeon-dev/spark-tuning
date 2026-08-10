@@ -639,6 +639,7 @@ static task를 유지하고 테이블마다 gate task를 다는 대안은, 선�
 
 - **조건 없이 적재분 전부 trigger한다.** "전날 daily분은 02:00 정기 run이 커버하니 생략" 같은 조건부 생략을 두지 않는 이유: loop 회차가 02:00을 넘겨 전날 데이터를 적재하면 정기 run은 이미 지나갔는데 trigger도 생략되어 Compaction이 영영 누락된다. `tables` 필터 덕분에 trigger run은 해당 테이블만 처리하므로 중복 비용이 작고, 이미 Compaction된 범위의 중복 실행은 합칠 파일이 없어 사실상 no-op이다
 - `wait_for_completion=False` — Compaction 실패 알림은 Compaction DAG이 담당. 대기하면 재처리 DAG 실행 시간만 늘어남
+- **`trigger_run_id` + `skip_when_already_exists=True` 필수**: `TriggerDagRunOperator`는 DagRun을 만든 **뒤에** 자기 상태를 보고한다. 상태 보고가 실패하면(API 서버 오류, 라벨 길이 초과 등) 일은 이미 됐는데 task는 실패로 기록되고, 재시도가 처음부터 다시 돌아 **DagRun이 하나 더 생긴다.** `trigger_run_id`를 비워 두면 시도마다 새 run_id가 생성되어 Airflow가 중복을 알아채지 못한다. 이름을 직접 지어 두면 재시도가 같은 run_id로 들어와 `DagRunAlreadyExists`가 되고, `skip_when_already_exists=True`가 그걸 SKIPPED로 마무리한다. 이름 재료는 daily/hourly는 **자기 DagRun의 `run_id`**(재시도 사이에 고정), `retrigger_self`는 **`cfg["chain_id"]` + 회차**(자기 run_id를 쓰면 회차마다 이름이 중첩되어 길어진다)
 - loop 회차마다 자기 회차 적재분을 trigger하면 되므로 loop와의 상호작용 없음
 
 ---
