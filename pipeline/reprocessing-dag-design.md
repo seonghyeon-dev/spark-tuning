@@ -612,6 +612,7 @@ SparkKubernetesOperator.partial(
 | **expand된 값의 Jinja는 렌더링되지 않는다** | `template_fields`에 있어도 마찬가지다. XCom에서 resolve된 값은 `id()`가 `seen_oids`에 등록되고(`expandinput.py`), 렌더러가 `if id(value) in oids: return value`로 건너뛴다(`templater.py`). 기존 `'{{ ti.xcom_pull(task_ids="get_time") }}'`는 실제 값으로 대체해야 한다 |
 | get_time 흡수 | `get_time`은 params만 읽어 날짜를 포맷하는 일만 하므로 `compaction_specs`에 합친다. task 하나와 XCom 왕복 한 번이 줄고, 다른 task가 그 XCom을 참조하지 않는지만 확인하면 된다 |
 | task_id 고정 | 테이블별 task 이름이 사라지고 `compact` 노드 1개 + map index로 바뀐다. `map_index_template`으로 라벨을 테이블명으로 되돌릴 수 있고, 실행 전에도 렌더링되므로 running·failed 상태에서도 보인다 |
+| **map_index 라벨은 250자 제한** | `rendered_map_index` 컬럼이 `String(250)`인데 잘라 주는 곳이 없다. 넘기면 **성공 상태 보고가 DB 에러(500)로 실패**하고, task는 이미 일을 마친 뒤라 재시도마다 같은 일을 다시 한다(`TriggerDagRunOperator`면 중복 DagRun). 실행 전 렌더링 실패는 `debug`로 삼켜지므로 징후 없이 마지막에만 터진다 — **목록류(테이블 배열 등)를 라벨에 넣지 말 것** |
 | 선택 0개 | mapped task는 `skipped` 처리된다 |
 
 static task를 유지하고 테이블마다 gate task를 다는 대안은, 선형 chain에서 skip이 하위 전체로 전파되어 모든 task에 `trigger_rule="all_done"`을 달고 gate를 테이블 수만큼 더 만들어야 하므로 채택하지 않는다.
@@ -638,6 +639,7 @@ static task를 유지하고 테이블마다 gate task를 다는 대안은, 선�
 
 - **조건 없이 적재분 전부 trigger한다.** "전날 daily분은 02:00 정기 run이 커버하니 생략" 같은 조건부 생략을 두지 않는 이유: loop 회차가 02:00을 넘겨 전날 데이터를 적재하면 정기 run은 이미 지나갔는데 trigger도 생략되어 Compaction이 영영 누락된다. `tables` 필터 덕분에 trigger run은 해당 테이블만 처리하므로 중복 비용이 작고, 이미 Compaction된 범위의 중복 실행은 합칠 파일이 없어 사실상 no-op이다
 - `wait_for_completion=False` — Compaction 실패 알림은 Compaction DAG이 담당. 대기하면 재처리 DAG 실행 시간만 늘어남
+- **`trigger_run_id` + `skip_when_already_exists=True` 필수**: `TriggerDagRunOperator`는 DagRun을 만든 **뒤에** 자기 상태를 보고한다. 상태 보고가 실패하면(API 서버 오류, 라벨 길이 초과 등) 일은 이미 됐는데 task는 실패로 기록되고, 재시도가 처음부터 다시 돌아 **DagRun이 하나 더 생긴다.** `trigger_run_id`를 비워 두면 시도마다 새 run_id가 생성되어 Airflow가 중복을 알아채지 못한다. 이름을 직접 지어 두면 재시도가 같은 run_id로 들어와 `DagRunAlreadyExists`가 되고, `skip_when_already_exists=True`가 그걸 SKIPPED로 마무리한다. 이름 재료는 daily/hourly는 **자기 DagRun의 `run_id`**(재시도 사이에 고정), `retrigger_self`는 **`cfg["chain_id"]` + 회차**(자기 run_id를 쓰면 회차마다 이름이 중첩되어 길어진다)
 - loop 회차마다 자기 회차 적재분을 trigger하면 되므로 loop와의 상호작용 없음
 
 ---
