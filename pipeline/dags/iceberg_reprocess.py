@@ -341,13 +341,14 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
     # trigger 건수가 가변이라 dynamic task mapping.
     # TriggerDagRunOperator는 wait_for_completion 기본 False (설계 6.3)
     # map_index_template: UI map index를 숫자 대신 읽을 수 있는 값으로.
-    # daily는 날짜별로 1건씩 나뉘어 테이블 목록이 겹칠 수 있으므로 날짜를 앞에 둔다
+    # daily는 날짜, hourly는 시작 시각이 인스턴스를 유일하게 구분한다.
+    # ⚠ 테이블 목록을 라벨에 넣지 말 것 — rendered_map_index 컬럼이 250자라
+    #   테이블이 늘면 성공 상태 보고가 DB 에러로 실패하고, task는 이미 DagRun을
+    #   만든 뒤라 재시도마다 중복 trigger된다. 실행 전 렌더링 실패는 debug로
+    #   삼켜지므로 징후 없이 마지막에만 터진다
     TriggerDagRunOperator.partial(
         task_id="trigger_compaction",
-        map_index_template=(
-            "{{ task.conf.get('target_dt') or task.conf['start_time'] }} "
-            "{{ task.conf['tables'] | join(',') }}"
-        ),
+        map_index_template="{{ task.conf.get('target_dt') or task.conf['start_time'] }}",
     ).expand_kwargs(comp)
     TriggerDagRunOperator.partial(
         task_id="retrigger_self",

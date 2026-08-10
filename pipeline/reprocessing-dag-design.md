@@ -612,6 +612,7 @@ SparkKubernetesOperator.partial(
 | **expand된 값의 Jinja는 렌더링되지 않는다** | `template_fields`에 있어도 마찬가지다. XCom에서 resolve된 값은 `id()`가 `seen_oids`에 등록되고(`expandinput.py`), 렌더러가 `if id(value) in oids: return value`로 건너뛴다(`templater.py`). 기존 `'{{ ti.xcom_pull(task_ids="get_time") }}'`는 실제 값으로 대체해야 한다 |
 | get_time 흡수 | `get_time`은 params만 읽어 날짜를 포맷하는 일만 하므로 `compaction_specs`에 합친다. task 하나와 XCom 왕복 한 번이 줄고, 다른 task가 그 XCom을 참조하지 않는지만 확인하면 된다 |
 | task_id 고정 | 테이블별 task 이름이 사라지고 `compact` 노드 1개 + map index로 바뀐다. `map_index_template`으로 라벨을 테이블명으로 되돌릴 수 있고, 실행 전에도 렌더링되므로 running·failed 상태에서도 보인다 |
+| **map_index 라벨은 250자 제한** | `rendered_map_index` 컬럼이 `String(250)`인데 잘라 주는 곳이 없다. 넘기면 **성공 상태 보고가 DB 에러(500)로 실패**하고, task는 이미 일을 마친 뒤라 재시도마다 같은 일을 다시 한다(`TriggerDagRunOperator`면 중복 DagRun). 실행 전 렌더링 실패는 `debug`로 삼켜지므로 징후 없이 마지막에만 터진다 — **목록류(테이블 배열 등)를 라벨에 넣지 말 것** |
 | 선택 0개 | mapped task는 `skipped` 처리된다 |
 
 static task를 유지하고 테이블마다 gate task를 다는 대안은, 선형 chain에서 skip이 하위 전체로 전파되어 모든 task에 `trigger_rule="all_done"`을 달고 gate를 테이블 수만큼 더 만들어야 하므로 채택하지 않는다.

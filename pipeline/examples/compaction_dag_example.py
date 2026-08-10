@@ -104,6 +104,8 @@ dag()
 #
 # ② arguments의 첫 원소가 테이블명인가
 #    map_index_template이 위치로 참조한다. 순서가 다르면 인덱스를 맞춘다.
+#    라벨은 250자를 넘기면 안 된다(rendered_map_index 컬럼 크기). 넘기면 성공
+#    상태 보고가 DB 에러로 실패해 task가 재시도된다 — 목록류를 넣지 말 것.
 #    커스텀 operator에 테이블명 전용 인자가 있다면 {{ task.<그 인자> }}가 더 안전하다.
 #
 # ③ max_active_tis_per_dagrun=1을 빼지 않았는가
