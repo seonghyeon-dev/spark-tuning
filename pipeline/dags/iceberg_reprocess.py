@@ -5,7 +5,7 @@
 무엇을 하는가
   append DAG은 최근 1일치 WAIT만 조회하므로, 그 범위에서 밀려난 WAIT와
   아무도 다시 집지 않는 FAILED가 Job History에 영구히 남는다.
-  이 DAG이 하루 1회(01:00 KST) 전날+그저께 범위를 훑어 회수하고,
+  이 DAG이 하루 1회(03:00 KST) 전날+그저께 범위를 훑어 회수하고,
   적재한 시간 범위에 대해 기존 Compaction DAG을 trigger한다.
 
 DAG 구조
@@ -52,6 +52,11 @@ ORACLE_CONN_IDS = ["oracle_a", "oracle_b"]
 
 KST = pendulum.timezone("Asia/Seoul")
 DAG_ID = Path(__file__).stem  # 조직 컨벤션: dag_id는 파일명에서 파생 (단일 소스)
+
+# 실행 시각 — schedule과 wait_bound가 함께 써야 하는 값이라 상수로 묶는다.
+# wait_bound는 "append 조회 하한 = 실행시각 - 24h"에서 나오므로 둘이 어긋나면
+# 아무도 안 보는 시간대가 생긴다 (설계 2.1 / 6.2)
+RUN_HOUR = 3         # 03:00 KST — daily Compaction(01:00, ~60분) 종료 후
 
 MAX_LOOP = 10        # 자기 재trigger 상한 (설계 5.5)
 ZOMBIE_HOURS = 2     # 좀비 IN_PROGRESS 판정 임계 (설계 8.2)
@@ -178,7 +183,7 @@ def collect_metas(ti, table_tasks: list[dict]) -> list[dict]:
 
 @dag(
     dag_id=DAG_ID,
-    schedule="0 1 * * *",   # 01:00 KST — 전날 데이터 안정화 버퍼 (설계 5.1)
+    schedule=f"0 {RUN_HOUR} * * *",   # 설계 5.1 / 6.2
     start_date=pendulum.datetime(2026, 7, 1, tz=KST),
     catchup=False,
     max_active_runs=1,      # loop 회차 순차 실행 보장
@@ -224,7 +229,7 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         if conf.get("ts_from"):
             return {**conf, "loop_count": int(conf.get("loop_count", 0))}
 
-        base = pendulum.now(KST).start_of("day")  # 오늘 00:00 (오늘=4일 01:00 실행이면 4일 00:00)
+        base = pendulum.now(KST).start_of("day")  # 오늘 00:00 (오늘=4일 03:00 실행이면 4일 00:00)
         st, et = params.get("start_time"), params.get("end_time")
 
         if st and et:
@@ -237,14 +242,16 @@ def dag():  # 함수명 dag() 고정 — DAG 정체성은 파일명(dag_id)이 �
         elif st or et:
             raise ValueError("start_time과 end_time은 함께 지정해야 한다")
         else:
-            # 정기 실행 경계 (설계 2.1). 오늘=4일 기준:
+            # 정기 실행 경계 (설계 2.1). 오늘=4일, RUN_HOUR=3 기준:
             #   ts_from    그저께(2일) 00:00 — 하룻밤 실패분 자동 회수
             #   ts_to      오늘(4일) 00:00
-            #   wait_bound 전날(3일) 01:00 — 이후 WAIT는 append 조회 범위 안이라 제외
+            #   wait_bound 전날(3일) 03:00 — 이후 WAIT는 append 조회 범위 안이라 제외
             #                                (FAILED는 append가 안 보므로 상한 없음)
+            # wait_bound가 RUN_HOUR를 따라가야 한다. 실행만 늦추고 이 값을 두면
+            # 그 사이 구간을 append도 재처리도 안 봐서 회수가 하루 밀린다
             ts_from = ts_str(base.subtract(days=2))
             ts_to = ts_str(base)
-            wait_bound = ts_str(base.subtract(days=1).add(hours=1))
+            wait_bound = ts_str(base.subtract(days=1).add(hours=RUN_HOUR))
 
         return {
             "tables": list(params["tables"]),

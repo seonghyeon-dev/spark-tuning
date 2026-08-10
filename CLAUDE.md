@@ -46,7 +46,7 @@
 ### 워크플로우
 
 Airflow DAG → avro read → Iceberg append (현재 약 5분 주기, 5분치 ≈ Job History 200 rows. 벤치마크는 10분 주기 ~8GB 기준)
-Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일치) — 모든 전략에서 필수
+Compaction: 1시간(`35 * * * *`, 직전 1시간치) + 1일(`35 0 * * *` → `0 1 * * *`, 전일치) — 모든 전략에서 필수
 
 ### 참고 공식 문서
 
@@ -85,15 +85,16 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 - **배경**: append DAG의 Oracle 조회 기간(최근 1일 rolling — Job History `ts` 날짜 키 파티셔닝 제약)에서 밀려난 WAIT_SCHEDULING 데이터와, `get_jobs`가 조회하지 않는 FAILURE 데이터가 영구 잔류하는 문제
 - **시스템 구조**: Iceberg 테이블 20개+ (hourly/daily 그룹), append DAG은 py 1개에서 테이블별 동적 생성(약 5분 주기, `ts` string `YYYYMMDDHHmmSSsss` 기준 ORDER BY ASC, ROWNUM 200), Compaction DAG은 hourly/daily 각 1개(내부 테이블별 task 순차). **Job History는 Oracle DB 2개에 동일 스키마로 존재 — conn_list loop로 DB별 동일 쿼리 실행, `job_id`는 DB 간 유일 보장 없음(상태 UPDATE는 원천 DB로)**
 - **핵심 설계**:
-  - 재처리 DAG **1개** (1일 주기, 01:00 KST), 테이블별 TaskGroup 순차 실행 (Compaction DAG 패턴)
-  - 조회 범위 경계로 경합 원천 차단: FAILED는 전날+그저께 전체, WAIT는 전날 01:00 이전만 (append 하한 = 실행시각-24h ≥ 전날 01:00이므로 절대 안 겹침). 잠금/선점/pool 불필요
+  - 재처리 DAG **1개** (1일 주기, 03:00 KST — `RUN_HOUR` 상수), 테이블별 TaskGroup 순차 실행 (Compaction DAG 패턴)
+  - 조회 범위 경계로 경합 원천 차단: FAILED는 전날+그저께 전체, WAIT는 전날 03:00 이전만 (append 하한 = 실행시각-24h ≥ 전날 03:00이므로 절대 안 겹침). **`wait_bound`는 `RUN_HOUR`를 따라가야 한다** — 실행 시각만 옮기면 그 사이 구간을 아무도 안 본다. 잠금/선점/pool 불필요
   - 상한: 테이블당 row 1,000 / 16GB (러프 설정, 재검증 필요). 초과 시 자기 자신 재trigger loop (상한 10회, `max_active_runs=1`로 순차)
   - 중복 적재 방지: snapshot summary에 batch_id 기록(영수증), FAILURE 재적재 전 `.snapshots` 확인 → 커밋된 건 SUCCESS 정정. batch_id는 `stat_desc` CLOB 재사용 — **WHERE 조건 사용 금지** (값 기록/읽기만). **상태 UPDATE는 batch_id를 준 호출에서만 stat_desc를 갱신** — 합쳐 두면 update_success/update_failure가 NULL로 지워 중복 방지가 무력화된다
-  - Compaction: 기존 DAG trigger — daily `target_dt`, hourly `start_time`/`end_time` + 양쪽 `tables` multi-select params. daily 스케줄 00:35 → **02:00 이동** (재처리 적재 전날분 자연 커버 + 자정 지연 적재분 구멍 해소), hourly `15 * * * *` 유지. **`tables` params 선언만으로는 필터가 동작하지 않는다** — Enum loop + `chain()`을 mapped task(`partial`/`expand_kwargs`/`.map()`)로 전환해야 한다 (설계 6.1, `pipeline/examples/compaction_dag_example.py`)
+  - Compaction: 기존 DAG trigger — daily `target_dt`, hourly `start_time`/`end_time` + 양쪽 `tables` multi-select params. **maintenance 스케줄 재배치** (설계 6.2): hourly Compaction `35 * * * *` 유지, daily Compaction 01:00, expire snapshots 02:05, 재처리 03:00, remove orphan files 04:05, rewrite manifests 05:05(3일마다). 기존 간격이 duration보다 짧아 실제로 겹쳤고 orphan이 hourly와 :35에서 충돌했다. **`remove_orphan_files`의 `older_than`은 스케줄로 못 막는다 — 기본 3일 확인 필수**. **`tables` params 선언만으로는 필터가 동작하지 않는다** — Enum loop + `chain()`을 mapped task(`partial`/`expand_kwargs`/`.map()`)로 전환해야 한다 (설계 6.1, `pipeline/examples/compaction_dag_example.py`)
   - 수동 실행: `tables`(multi-select) + `start_time`/`end_time` params (조회 범위 직접 정의, `end_time ≤ 전날 00:00`만 허용)
   - 좀비 IN_PROGRESS(2시간 초과): 탐지 + 알림만, 자동 복구 안 함
   - append DAG과 동일 테이블에 동시 append 커밋 가능 — HMS의 compare-and-swap + Iceberg 재시도로 안전 (둘 다 반영, 유실·중복 없음). `HadoopCatalog`로 전환 시 이 전제가 깨진다 (설계 2.2)
-- **전제**: Iceberg snapshot 보존 3일 > 재처리 조회 범위 2일 유지 필수. Compaction DAG 변경(02:00, tables params)은 재처리 DAG 배포 전 적용
+- **전제**: Iceberg snapshot 보존 3일 > 재처리 조회 범위 2일 유지 필수. maintenance 스케줄 재배치와 Compaction DAG 변경(tables params + mapped task)은 재처리 DAG 배포 전 적용
+- **후속 과제**: daily 계열 maintenance를 DAG 1개의 순차 task로 통합 (시계 기반 간격은 duration이 늘면 조용히 깨짐)
 
 ## 파일 구조
 
