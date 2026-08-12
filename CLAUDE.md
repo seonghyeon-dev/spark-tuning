@@ -96,15 +96,33 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **전제**: Iceberg snapshot 보존 3일 > 재처리 조회 범위 2일 유지 필수. maintenance 스케줄 재배치와 Compaction DAG 변경(tables params + mapped task)은 재처리 DAG 배포 전 적용
 - **후속 과제**: daily 계열 maintenance를 DAG 1개의 순차 task로 통합 (시계 기반 간격은 duration이 늘면 조용히 깨짐)
 
+## 작업 5: Compaction 튜닝 (hourly) — 4개 설정 확정, num-executors 동적 산정 대기
+
+- **산출물**: `tuning/compaction-tuning-guide.md`
+- **상태**: hourly Compaction 설정 확정 (초/GB **3.24 → 1.88, −42%**), `num-executors` 동적 산정 계수 미확정
+- **대상**: hourly 테이블 4개 (파티션 `hour(ts)`/`col_a`, sort `col_b`/`col_c`, `range` 모드 동일). rewrite 전략은 `sort` — 미적용 시 조회 40% 저하(`read-performance-test.md` §5.4)라 필수
+- **확정 설정**: `max-concurrent-file-group-rewrites` 2→**10**(−30%), `max-file-group-size-bytes` 10GB→**기본값 100GB**(−16% + small file 제거), `driver cpu` 1→**2**, `advisory-partition-size` **삭제**(무효 확인). `rewrite-all=true`·`parallelismFirst=false`·`partial-progress=false`·executor 4core/16GB는 유지
+- **핵심 발견**:
+  - **file group이 처리 단위다.** `file group 수 = Σ ceil(파티션 크기 ÷ max-file-group-size-bytes)`. 초기엔 7개를 2개씩 처리해 **4회차**로 나뉘고, 그중 2회차가 데이터 8%에 시간 37%를 썼다 (`idle cores 58%`)
+  - **작은 file group은 small file을 만든다.** 출력 파일 수 = `ceil(group 크기 ÷ 512MB)`이므로 **512~768MB 자투리 group은 반드시 384MB 미만 파일 2개**를 만든다 (실측 288.9/312.5/362.4MB = 각 577.8/625.0/724.8MB ÷ 2). 분할을 없애는 것이 해결책이므로 **상한은 높을수록 안전** — 그래서 30GB가 아니라 기본값 100GB
+  - **출력 파일 크기의 손잡이는 `target-file-size-bytes` 하나다.** `advisory-partition-size`는 Iceberg가 덮어써서 무효 (5회 실측 전부 `ceil(총 크기÷512MB)`와 일치)
+  - **`sort` 전략은 데이터를 2번 읽는다** (정렬 범위 샘플링 + 실제 쓰기). DataFlint `input = output × 2.0`이 정상값
+  - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번은 후자였다. alert는 전자만 제안한다
+  - **`memory usage` 84~94%는 `spill to disk 0b`와 짝으로 읽는다** — 낭비 없이 맞게 쓰는 중이라는 뜻이며 줄이면 spill이 시작된다
+- **동적 산정**: 당초 6개 값을 동적화하려 했으나 **`num-executors` 하나로 좁혀졌다** (나머지는 데이터 양과 무관하거나 크게 고정하는 것이 우월). `num_executors = ceil(총 크기GB × C)`, 현재 검증된 C=0.43(16 executor/37GB, idle 24.9%). **12·8 두 지점 측정으로 C 확정 예정 — 조건은 `spill 0` 유지**. 입력 측정은 `.files`의 `sum(file_size_in_bytes)`만으로 충분(입력이 전부 small file). 구현 위치는 `compaction_dag_example.py`의 `compaction_specs` → `instances`
+- **후속 과제**: **daily Compaction의 `rewrite-all` 낭비 의심** — hourly가 정리한 뒤라 no-op이어야 하는데 888GB에 30~60분(데이터 양에 선형). daily 단계 최우선 확인 항목
+
 ## 파일 구조
 
 ```
 ├── CLAUDE.md
 ├── tuning/
-│   └── spark-tuning-guide.md          # Spark 튜닝 가이드
+│   ├── spark-tuning-guide.md          # Spark 튜닝 가이드 (append Job)
+│   └── compaction-tuning-guide.md     # Compaction 튜닝 가이드 (hourly)
 ├── schema/
 │   ├── iceberg-schema-design-guide.md  # Iceberg 스키마 설계 가이드
 │   ├── read-performance-test.md        # 파티션 전략별 읽기 성능 비교 테스트
+│   ├── spark-query-metrics-guide.md    # Spark 쿼리 메트릭 가이드
 │   └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
 └── pipeline/
     ├── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
