@@ -8,7 +8,7 @@
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.2.2 |
 | 대상 범위 | **hourly Compaction만.** daily Compaction은 별도 (섹션 8.1) |
-| 최종 수정일 | 2026-08-12 |
+| 최종 수정일 | 2026-08-13 |
 
 ### 근거 수준 라벨
 
@@ -23,7 +23,7 @@
 - [1. 개요](#1-개요) — 범위, 대상 테이블, 초기 상태
 - [2. Compaction 동작 원리](#2-compaction-동작-원리) — file group, 출력 파일 수 결정 방식
 - [3. 옵션 및 설정 설명](#3-옵션-및-설정-설명) — Iceberg 옵션, Spark 설정, 리소스, filter
-- [4. 최적화 과정](#4-최적화-과정) — 병목 분석, 테스트 결과, small file 발생 메커니즘
+- [4. 최적화 과정](#4-최적화-과정) — 병목 분석, 테스트 결과 9회, min_size 원인, num-executors 캘리브레이션
 - [5. 확정 설정](#5-확정-설정) — 최종 설정과 근거 요약
 - [6. 동적 리소스 산정](#6-동적-리소스-산정) — num-executors 산정식
 - [7. 모니터링 지표](#7-모니터링-지표) — DataFlint / Iceberg 메타데이터 / Spark UI
@@ -252,24 +252,26 @@ Iceberg 기본값은 5, 초기 설정은 2였다. 2에서 7개 group을 처리�
 
 Iceberg의 shuffling rewriter가 이 값을 자체 계산으로 덮어쓴다. 남겨두면 혼란을 유발하므로 삭제한다.
 
-#### `coalescePartitions.parallelismFirst` = false ✅ 유지 (⚠️ 근거 미확정)
+#### `coalescePartitions.parallelismFirst` = **무효 확정, 삭제 가능** ✅
 
-`false`면 AQE가 위 advisory 목표 크기를 존중하고, `true`(기본값)면 병렬성을 우선해 더 작은 크기로 계산한다.
+`false`면 AQE가 advisory 목표 크기를 존중하고, `true`(기본값)면 병렬성을 우선해 더 작은 크기로 계산한다. AQE coalesce는 **병합만 하고 분할은 못 한다.**
 
-**`advisory-partition-size`와 상황이 다르다.** 무효라는 실측 근거가 없다. AQE coalesce는 **병합만 하고 분할은 못 하므로** 두 가능성이 존재한다.
+`true`로 전환한 T8이 이 항목을 확정했다.
 
-| 가능성 | `false`의 역할 |
-|--------|--------------|
-| Iceberg가 shuffle partition 수를 512MB 기준으로 직접 지정 | 무의미 (병합할 것이 없음) |
-| Iceberg가 partition을 많이 두고 AQE 병합에 의존 | **필수** (없으면 작고 많은 파일 생성) |
+| 회차 | `parallelismFirst` | 데이터 | file_count | **파일당 크기** | avg_size |
+|------|-------------------|--------|-----------|--------------|---------|
+| T6 | **false** | 37.3GB | 75 | **509MB** | 509.1MB |
+| T8 | **true** | 38.4GB | 77 | **510MB** | 510.4MB |
 
-`advisory-partition-size` 삭제로는 이 둘을 구별할 수 없다. 어느 쪽이든 Iceberg가 자기 값으로 덮으므로 사용자 지정값 제거는 변화를 만들지 않는다.
+`true`면 AQE가 파티션을 잘게 유지해 파일이 더 많고 작게 나와야 하는데 변화가 없다. **Iceberg가 shuffle partition 수를 직접 정하고 있어 AQE가 병합할 대상이 없다.**
 
-**위험이 비대칭이므로 유지한다**: `false` 유지는 최악의 경우 무의미하지만(손해 없음), 제거는 필수였을 경우 섹션 4.3의 small file 문제를 재발시킨다.
+소요시간 차이(초/GB 2.41 → 2.50, dcu/GB 0.00219 → 0.00242)는 노이즈 기준선(15%) 안이다.
 
-**판정 방법** (후속): 1시간치를 제거 상태로 실행해 `file_count`를 확인한다. `ceil(총 크기 ÷ 512MB)` 수준을 유지하면 무의미 확정, 늘어나면 필수 확정.
+**설정에서 제거해도 된다.** 남겨두어도 무해하다.
 
-> **append Job은 `true`(기본값)를 쓴다.** 반대로 설정된 것이 맞다 — append는 쓰기 레이턴시가 목적이고 Compaction은 파일 크기가 목적이므로 갈라지는 것이 정상이다.
+> ⚠️ Iceberg 버전 업그레이드로 shuffle partition 결정 방식이 바뀌면 이 판정이 뒤집힐 수 있다. 섹션 8.3의 재검증 트리거에 포함되어 있다.
+
+> **append Job은 `true`(기본값)를 쓴다** (`spark-tuning-guide.md` §3.2, 벤치마크로 결정). append에서는 이 설정이 실제로 동작하며 쓰기 성능에 23% 영향을 준다. Compaction에서만 무효다.
 
 ### 3.3 리소스 설정
 
@@ -325,79 +327,144 @@ Iceberg의 shuffling rewriter가 이 값을 자체 계산으로 덮어쓴다. �
 | 1회 (D + A) | 11% | **21%** (25s) | 작은 파티션끼리 짝지어짐 |
 | 4회 (C 3/3) | 4% | **17%** (20s) | group이 7개(홀수)라 짝이 없어 단독 실행 |
 
-**1회 + 4회 = 45초(전체의 37%)를 데이터 8%에 소비한다.** DataFlint의 `idle cores 58.22%`가 이를 다르게 표현한 값이다 — 64 core를 확보했으나 동시에 2 group만 처리하므로 절반 이상이 유휴 상태다.
+**1회 + 4회 = 45초(전체의 37%)를 데이터 15%에 소비한다.** DataFlint의 `idle cores 58.22%`가 이를 다르게 표현한 값이다 — 64 core를 확보했으나 동시에 2 group만 처리하므로 절반 이상이 유휴 상태다.
 
 > **DataFlint alert의 처방은 오진이었다.** "executor를 줄여라"라고 제안했으나 원인은 `max-concurrent-file-group-rewrites=2`였다. 제안을 따랐다면 소요시간은 120초 그대로인 채 리소스만 줄었을 것이다. DataFlint는 Iceberg 옵션을 모른다 (섹션 7.2).
 
 ### 4.2 테스트 결과 ✅
 
-측정 대상: 2026-08-12, 매시간 다른 데이터. **이미 Compaction한 데이터는 이전 상태로 되돌릴 수 없어 각 회차가 서로 다른 시간대를 대상으로 한다.** 데이터 크기가 다르므로 `초/GB`로 정규화해 비교한다.
+측정 대상: 2026-08-11 ~ 08-12, 매 회차 다른 시간대. **이미 Compaction한 데이터는 이전 상태로 되돌릴 수 없어 같은 데이터로 A/B 비교가 불가능하다.** 데이터 크기가 다르므로 정규화해 비교한다.
 
-| 회차 | 대상 | 누적 변경 | 데이터 | 시간 | **초/GB** | 개선 | idle cores | memory | spill |
-|------|------|----------|--------|------|----------|------|-----------|--------|-------|
-| baseline | 08-11 13~14 | — | 37.0GB | 120s | **3.24** | — | 58.22% | 89.31% | 0b |
-| T1 | 08-12 07~08 | `max-concurrent` 2→10 | 42.3GB | 96s | **2.27** | **−30%** | 31.61% | 89.36% | 0b |
-| T2 | 08-12 08~09 | + `driver cpu` 1→2 | 40.7GB | 84s | **2.06** | −36% | 29.44% | 94.38% | 0b |
-| T3 | 08-12 09~10 | + `advisory-partition-size` 삭제 | 39.6GB | 96s | **2.42** | −25% | 25.62% | 91.51% | 0b |
-| T4 | 08-12 10~11 | + `max-file-group-size` 10→30GB | 38.3GB | 72s | **1.88** | **−42%** | 24.90% | 84.73% | 0b |
+**정규화 지표**
 
-T1~T4 전부에서 DataFlint alert가 사라졌다.
+| 지표 | 계산 | 용도 |
+|------|------|------|
+| 초/GB | `duration ÷ sum_size` | 소요시간 |
+| **dcu/GB** | `dcu ÷ sum_size` | **리소스 비용. 판정의 주 지표** |
+| core·초/GB | `(executors × 4 × duration) ÷ sum_size` | dcu 검산용 |
+
+`dcu`는 `cores × duration`에 정확히 비례한다 (9회 전부 비율 49,000~53,500, ±5%). `duration`은 0.1분(6초) 단위로 반올림되어 해상도가 낮으므로 **`dcu/GB`를 주 지표로 쓴다.**
+
+| 회차 | 대상 | 누적 변경 | 데이터 | exec | 시간 | 초/GB | **dcu/GB** | idle | memory | spill | group |
+|------|------|----------|--------|------|------|-------|-----------|------|--------|-------|-------|
+| baseline | 08-11 13~14 | — | 37.0GB | 16 | 120s | 3.24 | **0.00416** | 58.22% | 89.31% | 0b | 7 |
+| T1 | 08-12 07~08 | `max-concurrent` 2→10 | 42.3GB | 16 | 96s | 2.27 | 0.00271 | 31.61% | 89.36% | 0b | 7 |
+| T2 | 08-12 08~09 | + `driver cpu` 1→2 | 40.7GB | 16 | 84s | 2.06 | 0.00261 | 29.44% | 94.38% | 0b | 7 |
+| T3 | 08-12 09~10 | + `advisory-partition-size` 삭제 | 39.6GB | 16 | 96s | 2.42 | 0.00303 | 25.62% | 91.51% | 0b | 7 |
+| T4 | 08-12 10~11 | + `max-file-group-size` 10→30GB | 38.3GB | 16 | 72s | 1.88 | 0.00235 | 24.90% | 84.73% | 0b | 4 |
+| T5 | 08-12 11~12 | `max-file-group-size` 100GB | 38.5GB | 16 | 84s | 2.18 | 0.00268 | 28.61% | 91.66% | 0b | 4 |
+| **T6** | 08-12 12~13 | + `num-executors` 16→**12** | 37.3GB | 12 | 90s | 2.41 | **0.00219** | 16.73% | 90.33% | 0b | 4 |
+| T7 | 08-12 13~14 | + `num-executors` 16→**8** | 36.6GB | 8 | 138s | 3.77 | 0.00247 | 15.35% | 91.12% | 0b | 4 |
+| T8 | 08-12 14~15 | exec 12, `parallelismFirst` **true** | 38.4GB | 12 | 96s | 2.50 | 0.00242 | 23.20% | 93.28% | 0b | 4 |
+
+baseline을 제외한 8회 전부에서 DataFlint alert가 사라졌고, `spill to disk`는 9회 전부 0b를 유지했다.
+
+**노이즈 기준선 (해석의 전제)**
+
+T4와 T5는 `max-file-group-size-bytes`만 다르지만 **둘 다 group 4개로 기능적으로 동일한 설정**이다. 그런데 1.88 vs 2.18(16% 차이)이 나왔다. 데이터 크기도 38.3 vs 38.5GB로 거의 같다.
+
+> **따라서 15% 미만의 차이는 회차 간 변동과 구별할 수 없다.** 아래 판정은 모두 이 기준을 적용한다.
 
 **출력 품질**
 
-| 회차 | file_count | min_size | avg_size | max_size |
-|------|-----------|---------|---------|---------|
-| baseline | 75 | 408.4MB | 505.5MB | 585.3MB |
-| T1 | 86 | **288.9MB** ❌ | 503.2MB | 604.9MB |
-| T2 | 82 | **312.5MB** ❌ | 507.9MB | 620.5MB |
-| T3 | 80 | **362.4MB** ❌ | 507.0MB | 670.4MB |
-| T4 | 76 | **414.8MB** ✅ | 516.3MB | 596.7MB |
+| 회차 | file_count | min_size | avg_size | max_size | group |
+|------|-----------|---------|---------|---------|-------|
+| baseline | 75 | 408.4MB | 505.5MB | 585.3MB | 7 |
+| T1 | 86 | 288.9MB | 503.2MB | 604.9MB | 7 |
+| T2 | 82 | 312.5MB | 507.9MB | 620.5MB | 7 |
+| T3 | 80 | 362.4MB | 507.0MB | 670.4MB | 7 |
+| T4 | 76 | 414.8MB | 516.3MB | 596.7MB | 4 |
+| T5 | 78 | 335.5MB | 504.9MB | 651.9MB | 4 |
+| T6 | 75 | 311.5MB | 509.1MB | 607.5MB | 4 |
+| T7 | 73 | 374.4MB | 514.0MB | 626.8MB | 4 |
+| T8 | 77 | 377.4MB | 510.4MB | 618.9MB | 4 |
 
-**변경별 판정** (duration 해상도가 0.1분=6초이므로 노이즈 폭 ±7%)
+`min_size`가 회차마다 288~415MB로 흔들리며 group 수와 무관하다. 원인은 섹션 4.3에서 다룬다.
+
+**변경별 판정**
 
 | 변경 | 효과 | 판정 |
 |------|------|------|
-| `max-concurrent-file-group-rewrites` 2→10 | **−30%** | ✅ **확실.** `idle cores` 58%→32%가 뒷받침 |
-| `driver cpu` 1→2 | 측정 불가 | ⚪ T1·T2·T3이 2.06~2.42로 노이즈 범위에서 섞임. 값이 저렴하고 동시 job 조율에 필요해 유지 |
-| `advisory-partition-size` 삭제 | 없음 (예상대로) | ✅ **무효 확인.** 삭제 전후 avg 507.9 → 507.0MB |
-| `max-file-group-size-bytes` 10→30GB | **추가 −16%** | ✅ **확실.** T1~T3 평균 2.25 → 1.88. **min_size 문제 해결이 더 큰 소득** |
+| `max-concurrent-file-group-rewrites` 2→10 | 초/GB **−30%**, dcu/GB **−35%** | ✅ **확실.** 노이즈 기준선을 크게 넘고 `idle cores` 58%→32%가 뒷받침 |
+| `driver cpu` 1→2 | 측정 불가 | ⚪ 노이즈 범위. 저렴하고 동시 job 조율에 필요해 유지 |
+| `advisory-partition-size` 삭제 | 없음 | ✅ **무효 확정.** 삭제 전후 avg 507.9 → 507.0MB |
+| `max-file-group-size-bytes` 10GB→30/100GB | 초/GB −10% (group 7→4) | ⚪ **노이즈와 구별 불가.** 유지 근거는 속도가 아니라 정렬 구간 (아래) |
+| **`num-executors` 16→12** | 초/GB +19%, **dcu/GB −13%** | ✅ **채택.** 리소스 절감 (섹션 4.4) |
+| `num-executors` 16→8 | 초/GB +86%, dcu/GB −2% | ❌ **기각.** 12 대비 dcu가 +13% 반등 |
+| `parallelismFirst` false→true | 없음 | ✅ **무효 확정.** 파일당 크기 509 → 510MB (섹션 3.2) |
 
-**최종: 3.24 → 1.88 초/GB (−42%).** hourly Compaction DAG 전체(테이블 4개 순차)는 10~12분 → 6~7분이 예상된다.
+**`max-file-group-size-bytes`를 100GB로 유지하는 근거**
 
-### 4.3 small file 발생 메커니즘 ⚠️
+속도 이득(−10%)은 노이즈와 구별되지 않는다. 유지 근거는 **정렬 구간**이다. group 4개면 파티션당 정렬 구간이 1개인데, 10GB 상한에서 col_a=C가 3분할되면 정렬 구간이 3개가 되어 파일 min/max 범위가 겹친다. `read-performance-test.md` §5.4의 "Sort Order 있으면 조회 40% 빠름"이라는 이득이 그만큼 깎인다. **속도 손해가 없으므로 유지가 이득이다.**
 
-**소요시간보다 중요한 발견이다.** T1~T3의 `min_size`가 288.9 / 312.5 / 362.4MB로 **전부 small file 기준(384MB) 미달**이다. Compaction의 목적이 small file 제거인데 결과물에 small file을 남겼다.
+**최종 (baseline → T6)**: 초/GB 3.24 → 2.41(**−26%**), dcu/GB 0.00416 → 0.00219(**−47%**). hourly Compaction DAG 전체(테이블 4개 순차)는 4 × 2.41 × 38GB ≈ **6.1분**으로, `:45`~`:57` 창(12분)에 절반의 여유로 들어간다.
 
-**원인: 작은 file group은 적정 크기의 파일을 만들 수 없다.**
+### 4.3 min_size가 384MB 미달인 원인: col_a=D 파티션 ✅
 
-출력 파일 수는 `ceil(group 크기 ÷ 512MB)`로 정해지고(섹션 2.3), 이 나눗셈이 거칠다.
+Compaction 출력의 `min_size`가 회차마다 288~415MB로 흔들리며, 절반 이상이 small file 기준(384MB)에 미달한다.
 
-| group 크기 | 나누는 개수 | 파일 하나 크기 | 판정 |
-|-----------|-----------|--------------|------|
-| 578MB | 2 | **289MB** | ❌ |
-| 625MB | 2 | **313MB** | ❌ |
-| 725MB | 2 | **362MB** | ❌ |
-| 850MB | 2 | 425MB | ✅ |
-| 10GB | 20 | 512MB | ✅ |
-| 21GB | 42 | 512MB | ✅ |
+**원인은 `col_a=D` 파티션이다.** group 수와 무관하다는 것이 증거다 — T5~T8은 group이 4개(분할 없음)인데도 335.5 / 311.5 / 374.4 / 377.4MB가 나왔다.
 
-**512MB~768MB 크기의 group은 반드시 small file 2개를 만든다.** 512MB 하나로 만들 수도, 512MB짜리 2개로 만들 수도 없다.
+`min_size × 2`를 보면 9회 전부 한 구간으로 모인다.
 
-관측값이 이 패턴과 정확히 일치한다:
+| 회차 | min_size | ×2 | group 수 |
+|------|---------|-----|---------|
+| baseline | 408.4MB | 817MB | 7 |
+| T1 | 288.9MB | 578MB | 7 |
+| T2 | 312.5MB | 625MB | 7 |
+| T3 | 362.4MB | 725MB | 7 |
+| T4 | 414.8MB | 830MB | 4 |
+| T5 | 335.5MB | 671MB | 4 |
+| T6 | 311.5MB | 623MB | 4 |
+| T7 | 374.4MB | 749MB | 4 |
+| T8 | 377.4MB | 755MB | 4 |
+
+**578~830MB 크기의 group 하나가 파일 2개로 갈린 결과다.** 그 group은 `col_a=D` 파티션이며, 측정값 0.9GB를 중심으로 시간대별로 578~830MB 사이에서 변동한다.
+
+출력 파일 수는 `ceil(group 크기 ÷ 512MB)`이므로(섹션 2.3):
 
 ```
-T1: 288.9 × 2 = 577.8MB
-T2: 312.5 × 2 = 625.0MB
-T3: 362.4 × 2 = 724.8MB
+D = 623MB → ceil(623 ÷ 512) = 2개 → 311.5MB씩   (small file)
+D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
+→ D가 768MB 미만인 시간대는 반드시 small file이 나온다
 ```
 
-`max-file-group-size-bytes=10GB`가 파티션을 분할할 때 **자투리 group**이 생기고, 그 크기가 512~768MB에 걸리면 small file이 발생한다. 자투리 크기는 그 시간의 데이터 양으로 정해지므로 **매 시간 운에 맡기는 구조**였다.
+`col_a=A`(2.8GB)는 6개로 갈려 478MB씩이므로 원인이 될 수 없다. 10GB 상한이 만들던 자투리 group들도 정상 크기였다 — C의 자투리 1.4GB는 3개로 갈려 467MB, B의 자투리 2.0GB는 4개로 갈려 500MB다.
 
-T4는 분할하지 않아 자투리가 없다. T4의 414.8MB는 col_a=D 파티션(약 0.83GB) 자체가 작아서 나온 값이며(`830 ÷ 2 = 415`), 384MB를 넘으므로 문제없다. 이는 파티션 설계에서 오는 값이라 Compaction 옵션으로 해소할 수 없다.
+> **T4의 min 414.8MB는 설정 덕이 아니라 그 시간 D가 830MB였던 결과다.** 초기 분석에서 이를 `max-file-group-size-bytes` 변경의 성과로 해석했으나, T5~T8이 group 4개에서도 small file이 나오는 것을 보여 정정되었다.
 
-> **판정 상태**: 메커니즘 추론과 관측값이 일치하나, `max-file-group-size-bytes=100GB`로 여러 시간치를 검증해 `min_size`가 계속 384MB를 넘는 것을 확인해야 확정된다.
+#### 대응: 조치하지 않는다
 
-**부수 효과**: T4의 `memory usage`가 84.73%로 가장 낮다(T2는 94.38%). group이 7개 → 4개로 줄어 동시 실행되는 shuffle이 줄어든 결과다.
+| 항목 | 값 |
+|------|-----|
+| 영향 범위 | 파일 73~86개 중 **2개** |
+| 데이터 비중 | 37GB 중 **0.9GB (2.4%)** |
+| 조회 영향 | 무시 가능 |
+| daily Compaction 영향 | `rewrite-all=true`라 어차피 재작성 |
+
+해소하려면 `target-file-size-bytes`를 830MB 이상으로 올려 D를 파일 1개로 만들어야 하는데, 그러면 **모든 파티션의 파일이 830MB가 되어** `iceberg-schema-design-guide.md` §6.5의 512MB 결정을 뒤집는다. 2.4% 데이터를 위해 치를 비용이 아니다.
+
+**이는 파티션 설계에서 오는 구조적 특성이며 Compaction 옵션으로 해소할 수 없다.** `min_size`가 300MB대인 것은 정상 범위로 판단한다.
+
+> **모니터링 판정 기준 조정**: `min_size < 384MB` 자체를 이상으로 보지 않는다. 대신 **`384MB 미만 파일이 3개 이상`**이면 D 이외의 파티션에서 발생한 것이므로 조사한다.
+
+### 4.4 num-executors: 12가 하한이다 ✅
+
+`max-file-group-size-bytes=100GB`, `max-concurrent-file-group-rewrites=10` 상태에서 executor 수만 변경한 결과.
+
+| exec | core | 초/GB | **dcu/GB** | idle cores | spill |
+|------|------|-------|-----------|-----------|-------|
+| 16 (T4·T5 평균) | 64 | 2.03 | 0.00251 | 24.9~28.6% | 0b |
+| **12 (T6)** | 48 | 2.41 | **0.00219 (−13%)** | **16.73%** | 0b |
+| 8 (T7) | 32 | 3.77 | 0.00247 (−2%) | 15.35% | 0b |
+
+**8에서 dcu가 반등한다.** 12 대비 +13%로, 느려지면서 비싸지기까지 한다.
+
+이유는 8에서 이미 core가 병목이라는 것이다. `idle cores`가 16.73% → 15.35%로 거의 줄지 않은 반면 소요시간은 +56% 늘었다. core를 33% 줄였는데 시간이 56% 늘었으므로 순손실이다.
+
+**12가 리소스 절감의 하한이다.** `spill to disk`는 세 지점 모두 0b를 유지했다.
+
+> **소요시간 증가는 실패가 아니다.** DAG 전체가 4 × 2.41 × 38GB ≈ 6.1분으로 `:45`~`:57` 창(12분)에 여유 있게 들어가므로, 시간을 리소스와 맞바꾸는 것이 이득이다. 16 executor는 시간이 −42%로 더 좋지만 리소스 절감이 −44%에 그친다.
 
 ---
 
@@ -407,26 +474,29 @@ T4는 분할하지 않아 자투리가 없다. T4의 414.8MB는 col_a=D 파티�
 |------|------|-----|----------|------|
 | Iceberg | `target-file-size-bytes` | 536870912 (512MB) | ✅ | 스키마 설계에서 확정 |
 | Iceberg | `rewrite-all` | true | ✅ | 입력이 전부 small file |
-| Iceberg | `max-concurrent-file-group-rewrites` | **10** | ✅ | −30%. 여유 포함 |
-| Iceberg | `max-file-group-size-bytes` | **기본값 100GB** (설정 제거) | ✅ | −16% + small file 제거 |
+| Iceberg | `max-concurrent-file-group-rewrites` | **10** | ✅ | −30%. 유일하게 명확한 개선 |
+| Iceberg | `max-file-group-size-bytes` | **기본값 100GB** (설정 제거) | 📘 | 속도는 중립. 정렬 구간 1개 유지 |
 | Iceberg | `partial-progress.enabled` | 기본값 false | 📘 | 변경 이득 없음 |
-| Spark | `advisory-partition-size` | **삭제** | ✅ | 무효 확인 |
-| Spark | `coalescePartitions.parallelismFirst` | false | ⚠️ | 근거 미확정, 위험 비대칭으로 유지 |
-| 리소스 | `driver cpu` / `memory` | **2** / 4GB | 📘 | |
+| Spark | `advisory-partition-size` | **삭제** | ✅ | 무효 확정 |
+| Spark | `coalescePartitions.parallelismFirst` | **삭제 가능** | ✅ | 무효 확정 (T8) |
+| 리소스 | `driver cpu` / `memory` | **2** / 4GB | 📘 | 효과는 노이즈 범위, 저렴해서 유지 |
 | 리소스 | `executor cpu` / `memory` | 4 / 16GB | ✅ | spill 0 유지 |
-| 리소스 | `num-executors` | 16 → **동적 산정** | ⚠️ | 섹션 6 |
+| 리소스 | `num-executors` | **12** (→ 동적 산정) | ✅ | dcu 최저점. 섹션 4.4, 6 |
 | 전략 | rewrite 전략 | `sort` | ✅ | 미적용 시 조회 40% 저하 |
 
-**변경 전후 요약**
+**변경 전후 요약** (baseline → T6)
 
 | 항목 | 변경 전 | 변경 후 |
 |------|--------|--------|
-| 초/GB | 3.24 | **1.88 (−42%)** |
-| idle cores | 58.22% | **24.90%** |
-| file group 수 | 7 | **4** |
+| 초/GB | 3.24 | **2.41 (−26%)** |
+| **dcu/GB (리소스 비용)** | 0.00416 | **0.00219 (−47%)** |
+| idle cores | 58.22% | **16.73%** |
+| file group 수 | 7 | 4 |
 | 처리 회차 | 4 | **1** |
-| min_size | 408.4MB (운에 의존) | **414.8MB (구조적으로 보장)** |
-| DAG 전체 (테이블 4개) | 10~12분 | **6~7분 예상** |
+| num-executors | 16 | **12** |
+| DAG 전체 (테이블 4개) | 10~12분 | **약 6분** |
+
+시간 −26%, 리소스 −47%다. 스케줄 창에 여유가 있으므로 리소스 절감을 우선한 결과다.
 
 ---
 
@@ -551,30 +621,35 @@ except Exception as e:
 
 pruning 측정 결과 조회 비용이 과하게 나올 때만 재검토한다.
 
-### 6.4 산정식 (⚠️ 계수 미확정)
+### 6.4 산정식 — C = 0.32 ✅
 
 ```python
-num_executors = ceil(total_size_gb * C)
+num_executors = ceil(total_size_gb * 0.32)
 num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 ```
 
-**계수 C 캘리브레이션 상태**
+**계수 C 캘리브레이션 결과** (섹션 4.4)
 
-| | num-executors | 총 크기 | C | idle cores | spill | 판정 |
+| num-executors | 총 크기 | C | dcu/GB | idle cores | spill | 판정 |
 |---|---|---|---|---|---|---|
-| 검증됨 | 16 | 37GB | **0.43** | 24.90% | 0b | ✅ 동작 확인 |
-| 미측정 | 12 | — | 0.32 | ? | ? | 측정 예정 |
-| 미측정 | 8 | — | 0.22 | ? | ? | 측정 예정 |
+| 16 | 38.3~38.5GB | 0.42 | 0.00251 | 24.9~28.6% | 0b | 리소스 과다 |
+| **12** | 37.3GB | **0.32** | **0.00219** | 16.73% | 0b | ✅ **채택** |
+| 8 | 36.6GB | 0.22 | 0.00247 | 15.35% | 0b | dcu 반등, 기각 |
+
+검산: 37.3GB × 0.32 = 11.9 → **12** / 38.5GB → 13 / 42.3GB → 14
 
 **판정 기준** — `spill to disk = 0b` 유지가 절대 조건이고, 그 안에서 아래 파생 지표로 비교한다.
 
 | 지표 | 계산 | 의미 |
 |------|------|------|
 | 초/GB | `duration ÷ sum_size` | 소요시간. **executor를 줄이면 커지는 것이 정상** |
-| **core·초/GB** | `(num_executors × 4 × duration) ÷ sum_size` | **리소스 비용.** 줄어야 축소가 성공 |
+| **dcu/GB** | `dcu ÷ sum_size` | **리소스 비용. 주 지표** — 줄어야 축소가 성공 |
+| core·초/GB | `(num_executors × 4 × duration) ÷ sum_size` | dcu 검산용 |
 | DAG 전체 | `초/GB × 평균 크기 × 4 테이블` | `:45`~`:57` 창(12분) 안에 여유롭게 들어가야 함 |
 
-`duration`만 보면 "느려졌다"로 오판한다. **소요시간 증가와 리소스 절감을 맞바꾸는 것이 목적**이며, DAG 전체가 창 안에 들어가는 한 절감이 이득이다. `dcu`가 `core·초/GB`와 같은 방향으로 움직이는지 함께 확인한다.
+`duration`만 보면 "느려졌다"로 오판한다. **소요시간 증가와 리소스 절감을 맞바꾸는 것이 목적**이며, DAG 전체가 창 안에 들어가는 한 절감이 이득이다.
+
+`dcu`는 `cores × duration`에 비례하는 것이 9회 측정으로 확인되었다(비율 49,000~53,500, ±5%). `duration`보다 해상도가 좋아 주 지표로 적합하다.
 
 **상한·하한**
 
@@ -582,6 +657,8 @@ num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 |------|-----|------|
 | `MAX_EXECUTORS` | ⚠️ 미확정 | append 벤치마크에서 32개 이상은 오히려 느려졌다(shuffle 통신, K8S pod 스케줄링 경합, S3 부하 — `tuning/spark-tuning-guide.md` §2.2.3). K8S namespace quota도 확인 필요. **상한에 걸리면 알림을 발생시켜 파티션 재설계 검토 신호로 사용** |
 | `MIN_EXECUTORS` | 4 (안) 📘 | 데이터가 적은 시간대에 과도하게 축소되는 것 방지 |
+
+> **동적화의 즉각 이득은 작다.** 현재 데이터 범위(36~42GB)에서 산정값은 12~14로 폭이 좁아, 정적 12로도 당장은 충분하다. 동적화의 값어치는 **데이터 증가 시 duration을 일정하게 유지해 섹션 6.2의 스케줄 전제를 지키는 것**이다. 데이터가 늘 때까지 정적 12로 운영하고 동적화를 미루는 선택도 가능하다.
 
 ### 6.5 구현 위치
 
@@ -632,7 +709,7 @@ Airflow   : task duration (pod 기동 시간 역산용)
 
 | 항목 | 확인 위치 | 필요 이유 |
 |------|----------|----------|
-| **min_size / max_size / file_count** | Iceberg `.files` 메타데이터 | **Compaction 품질의 핵심 지표인데 DataFlint에 없다.** T1~T3의 small file 문제는 이것만 드러낸다. duration이 개선되어도 min_size가 384MB 미달이면 실패다 |
+| **min_size / max_size / file_count** | Iceberg `.files` 메타데이터 | **Compaction 품질의 핵심 지표인데 DataFlint에 없다.** duration이 개선되어도 출력이 나빠지면 실패다. 단 `min_size < 384MB`는 col_a=D에서 상시 발생하므로 이상이 아니다 — **384MB 미만 파일이 3개 이상**일 때 조사한다 (섹션 4.3) |
 | file group 수와 구성 | Spark UI Jobs 탭 | 파티션이 몇 개로 분할됐는지 |
 | pod 기동 시간 | Airflow task duration − Spark 앱 duration | 1~2분짜리 job에서 기동이 20~30초면 비중이 크다 |
 
@@ -649,7 +726,7 @@ hourly:  37GB  → 2.0분 (튜닝 전)
 daily:  888GB  → 30~60분        ← 약 24배 선형
 ```
 
-hourly가 매시간 출력을 75개 × 505MB(전부 384MB 이상)로 정리한다면, daily는 **합칠 small file이 없어 사실상 no-op이어야 한다.** 그런데 데이터 양에 선형으로 소요된다.
+hourly가 매시간 출력을 75개 × 505MB(대부분 384MB 이상)로 정리한다면, daily는 **합칠 small file이 거의 없어 사실상 no-op에 가까워야 한다.** 그런데 데이터 양에 선형으로 소요된다.
 
 **가설**: daily도 `rewrite-all: true`로 888GB 전체를 다시 쓰고 있다. hourly와 달리 daily에서는 `rewrite-all: false`가 큰 이득일 수 있다.
 
@@ -659,13 +736,14 @@ daily 단계에서 최우선으로 확인할 항목이다.
 
 | 항목 | 내용 | 우선순위 |
 |------|------|---------|
-| `max-file-group-size-bytes` 100GB 검증 | 30GB와 동일하게 동작하는지. **min_size > 384MB, duration 1.2~1.4분** 확인 | 높음 |
-| `num-executors` 축소 (C 캘리브레이션) | 12, 8 두 지점 측정. `spill 0` 유지가 조건 (섹션 6.4) | 높음 |
-| `MAX_EXECUTORS` 확정 | K8S namespace quota 확인. append(batch당 약 10 executor)와 동시 실행됨 | 중간 |
+| `MAX_EXECUTORS` 확정 | K8S namespace quota 확인. append(batch당 약 10 executor)와 동시 실행됨. **산정식 완성의 마지막 조각** | 높음 |
+| 확정 설정 운영 검증 | 여러 시간대에서 `spill 0`, `384MB 미만 파일 ≤ 2개`, DAG 전체 6분대 유지 확인 | 높음 |
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
-| `parallelismFirst` 판정 | 제거 후 `file_count` 확인 (섹션 3.2) | 낮음 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
+| 다른 hourly 테이블 3개 검증 | col_a 카디널리티가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)를 재확인해야 한다 | 중간 |
+
+**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정).
 
 ### 8.3 재검증 트리거
 
@@ -686,6 +764,15 @@ daily 단계에서 최우선으로 확인할 항목이다.
 
 5. hourly duration이 15분 초과 (DAG 전체)
    → reprocessing-dag-design.md §6.2의 M ≤ 60 − duration − 여유 재계산 필요
+
+6. Iceberg 버전 업그레이드
+   → shuffle partition 결정 방식이 바뀌면 advisory-partition-size와
+     parallelismFirst의 "무효" 판정(섹션 3.2)이 뒤집힐 수 있다.
+     file_count가 ceil(총 크기 ÷ 512MB) 수준을 유지하는지 확인한다
+
+7. col_a=D 파티션 비중 변화
+   → min_size가 D 크기 ÷ 2로 정해진다(섹션 4.3). D가 커지면 문제가
+     사라지고, 512MB 미만으로 줄면 파일 1개가 되어 역시 사라진다
 ```
 
 ---
