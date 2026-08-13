@@ -112,7 +112,13 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **`sort` 전략은 데이터를 2번 읽는다** (정렬 범위 샘플링 + 실제 쓰기). DataFlint `input = output × 2.0`이 정상값
   - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번 사례의 원인은 후자다. alert는 전자만 제안한다
   - **`memory usage` 84~94%는 `spill to disk 0b`와 짝으로 읽는다** — 낭비 없이 맞게 쓰는 중이라는 뜻이며 줄이면 spill이 시작된다
-- **동적 산정**: 당초 6개 값을 동적화하려 했으나 **`num-executors` 하나로 좁혀졌다**. `num_executors = ceil(총 크기GB × 0.32)`, **C=0.32 확정**. `MAX_EXECUTORS`만 미확정(K8S quota 필요). 입력 측정은 **`.files`가 아니라 `.partitions`** (파티션당 1행 집계, `.files`는 컬럼 19개 통계를 전부 끌고 옴). 기존 `com_num_executor` 상수는 **fallback으로 유지**. 구현 위치는 `compaction_dag_example.py`의 `compaction_specs` → `instances`. 현재 데이터(36~42GB)에서 산정값이 12~14로 좁아 **정적 12로 운영하며 동적화를 미루는 선택도 가능**
+- **동적 산정 (`num-executors`)**: 당초 6개 값을 동적화하려 했으나 **`num-executors` 하나로 좁혀졌다** (나머지는 데이터 양과 무관하거나 크게 고정이 우월). 구현 스켈레톤: **`pipeline/examples/compaction_executor_sizing_example.py`**
+  - `num_executors = clamp(ceil(총 크기GB × 0.32), 4, MAX)`, **C=0.32 확정**. `MAX_EXECUTORS`만 미확정(K8S quota 필요, 잠정 32)
+  - 입력 측정은 **`.files`가 아니라 `.partitions`** (파티션당 1행 집계, `.files`는 컬럼 19개 통계를 전부 끌고 옴). **범위 조회**여야 한다 — 재처리 DAG trigger 시 여러 시간에 걸친다
+  - **파티션 값 변환은 naive datetime으로** — `ts`가 `timestamp_ntz`라 timezone을 붙이면 엉뚱한 시간대를 조회한다. `int((dt − 1970-01-01).total_seconds() // 3600)`, 2026-08-11 13:00 → 496237 (Spark UI 실측 일치)
+  - 기존 `com_num_executor` 상수는 **fallback으로 유지** (조회 실패·0 반환·비정상 크기 전부). 지우면 Trino 장애가 곧 Compaction 실패가 된다
+  - 미확인: Trino `$partitions`의 `partition.ts_hour` 타입, manifest pruning 동작 여부
+  - 현재 데이터(36~42GB)에서 산정값이 12~14로 좁아 **정적 12로 운영하며 동적화를 미루는 선택도 가능**. `C=0.32`은 hourly 전용 — daily는 별도 측정 필요
 - **후속 과제**: **daily Compaction의 `rewrite-all` 낭비 의심** — hourly가 정리한 뒤라 no-op이어야 하는데 888GB에 30~60분(데이터 양에 선형). daily 단계 최우선 확인 항목
 
 ## 파일 구조
@@ -135,5 +141,6 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
     │   └── iceberg_reprocess.py        # 재처리 DAG 정의 (신규 파일은 이것 하나)
     └── examples/
         ├── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
-        └── compaction_dag_example.py          # Compaction DAG 변경(tables 필터 = mapped task) 예시
+        ├── compaction_dag_example.py          # Compaction DAG 변경(tables 필터 = mapped task) 예시
+        └── compaction_executor_sizing_example.py  # Compaction num-executors 동적 산정 예시
 ```

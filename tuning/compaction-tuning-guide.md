@@ -660,15 +660,38 @@ num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 
 > **동적화의 즉각 이득은 작다.** 현재 데이터 범위(36~42GB)에서 산정값은 12~14로 폭이 좁아, 정적 12로도 당장은 충분하다. 동적화의 값어치는 **데이터 증가 시 duration을 일정하게 유지해 섹션 6.2의 스케줄 전제를 지키는 것**이다. 데이터가 늘 때까지 정적 12로 운영하고 동적화를 미루는 선택도 가능하다.
 
-### 6.5 구현 위치
+### 6.5 구현
 
-`pipeline/examples/compaction_dag_example.py`의 `compaction_specs` task에 자리가 있다.
+**변경 예시: `pipeline/examples/compaction_executor_sizing_example.py`**
+
+`compaction_dag_example.py`가 만드는 `compaction_specs` task에서 `instances` 한 줄만 바꾼다.
 
 ```python
-"instances": str(table.config.com_num_executor),   # ← 계산값으로 교체
+# before
+"instances": str(table.config.com_num_executor),
+# after
+"instances": str(num_executors_for(table, from_hour, until_hour)),
 ```
 
-`.files` 조회를 위한 Trino 연결부만 신규 구현이 필요하다.
+예시 파일이 담고 있는 것:
+
+| 항목 | 내용 |
+|------|------|
+| `to_partition_hour()` | datetime → `hour(ts)` 파티션 값 변환. **naive datetime으로 계산** (`ts`가 `timestamp_ntz`이므로 timezone을 붙이면 값이 어긋난다). 2026-08-11 13:00 → 496237로 Spark UI 실측값과 일치 검증 |
+| `query_size_bytes()` | `.partitions` 범위 조회. 정기 실행은 1시간이지만 재처리 DAG trigger 시 여러 시간에 걸치므로(`reprocessing-dag-design.md` §6.3) 범위 조회다 |
+| `num_executors_for()` | 산정 + clamp + fallback. 조회 실패, 0 반환, 비정상 크기를 모두 `com_num_executor`로 fallback |
+| 상한 경고 | `MAX_EXECUTORS`에 걸리면 warning 로그. 데이터가 설계 범위를 넘었다는 신호 |
+
+**신규 구현이 필요한 부분**: Trino connection(`TrinoHook`)과 Iceberg schema 이름. 예시 파일에 `TODO(연결)`로 표시되어 있다.
+
+**도입 전 확인이 필요한 부분** (예시 파일에 `TODO(확인)`으로 표시):
+
+1. Trino `$partitions`에서 `partition.ts_hour`가 INTEGER로 노출되는지 (Spark SQL은 컬럼명이 `total_data_file_size_in_bytes`로 다르다)
+2. manifest pruning이 걸리는지 (섹션 6.3의 두 쿼리 비교)
+
+**조회 횟수**: `compaction_specs`는 DAG run당 1회 실행되고 그 안에서 테이블 수만큼 조회한다. hourly 테이블 4개 × 24시간 = 96회/일.
+
+**daily에 그대로 쓸 수 없다.** `C=0.32`은 hourly 측정값이며, daily는 `rewrite-all` 낭비 의심(섹션 8.1) 확인 후 별도로 계수를 잡아야 한다.
 
 ---
 
