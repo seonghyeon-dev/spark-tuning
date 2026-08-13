@@ -110,7 +110,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **min_size 300MB대는 정상이다** — 원인은 `col_a=D` 파티션(시간당 600~830MB)이 `ceil(÷512MB)`로 2개로 갈리는 것. **group 분할과 무관**(group 4개에서도 발생). 파일 75개 중 2개, 데이터 2.4%라 조치 안 함. 모니터링 기준은 `min_size<384MB`가 아니라 **`384MB 미만 파일 3개 이상`**
   - **출력 파일 크기의 손잡이는 `target-file-size-bytes` 하나다.** `advisory-partition-size`와 `parallelismFirst` 모두 무효 확정 (Iceberg가 shuffle partition 수를 직접 정함)
   - **`sort` 전략은 데이터를 2번 읽는다** (정렬 범위 샘플링 + 실제 쓰기). DataFlint `input = output × 2.0`이 정상값
-  - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번은 후자였다. alert는 전자만 제안한다
+  - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번 사례의 원인은 후자다. alert는 전자만 제안한다
   - **`memory usage` 84~94%는 `spill to disk 0b`와 짝으로 읽는다** — 낭비 없이 맞게 쓰는 중이라는 뜻이며 줄이면 spill이 시작된다
 - **동적 산정**: 당초 6개 값을 동적화하려 했으나 **`num-executors` 하나로 좁혀졌다**. `num_executors = ceil(총 크기GB × 0.32)`, **C=0.32 확정**. `MAX_EXECUTORS`만 미확정(K8S quota 필요). 입력 측정은 **`.files`가 아니라 `.partitions`** (파티션당 1행 집계, `.files`는 컬럼 19개 통계를 전부 끌고 옴). 기존 `com_num_executor` 상수는 **fallback으로 유지**. 구현 위치는 `compaction_dag_example.py`의 `compaction_specs` → `instances`. 현재 데이터(36~42GB)에서 산정값이 12~14로 좁아 **정적 12로 운영하며 동적화를 미루는 선택도 가능**
 - **후속 과제**: **daily Compaction의 `rewrite-all` 낭비 의심** — hourly가 정리한 뒤라 no-op이어야 하는데 888GB에 30~60분(데이터 양에 선형). daily 단계 최우선 확인 항목
