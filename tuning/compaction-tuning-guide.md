@@ -458,15 +458,98 @@ T4는 분할하지 않아 자투리가 없다. T4의 414.8MB는 col_a=D 파티�
 
 ### 6.3 입력 측정
 
-```sql
-SELECT sum(file_size_in_bytes)
-FROM <db>.<table>.files
-WHERE <대상 시간 파티션>
-```
-
 hourly는 입력 파일이 **전부** small file이므로(최대 72.3MB) 크기 필터가 불필요하다. 총 크기만 측정하면 된다.
 
-`.files`는 manifest만 읽으므로 S3 ListObjects가 필요 없다. Airflow task에서 Trino JDBC로 조회하는 것이 현실적이다.
+#### `.files`가 아니라 `.partitions`를 사용한다
+
+`.files`는 **데이터 파일 1개당 1행**을 만들고, 그 행에 `column_sizes`·`value_counts`·`null_value_counts`·`lower_bounds`·`upper_bounds`가 **컬럼 19개 전부**에 대해 들어간다. `sum(file_size_in_bytes)` 하나만 필요한데 전부 끌고 온다.
+
+`.partitions`는 필요한 값이 **파티션당 1행으로 이미 집계**되어 있다.
+
+| 조회 | 반환 행 수 (30일 보관 가정) | 행 하나 크기 |
+|------|------------------------|------------|
+| `.files` (필터 없음) | 약 54,000 | 무거움 (컬럼 19개 통계) |
+| `.files` (파티션 필터) | 약 75 | 무거움 |
+| **`.partitions` (파티션 필터)** | **4** | 가벼움 |
+
+**Trino** (Airflow에서 JDBC 조회):
+
+```sql
+SELECT sum(total_size) AS total_bytes,
+       sum(file_count) AS file_count
+FROM "db.table_a$partitions"
+WHERE partition.ts_hour = <대상 시간>
+```
+
+**Spark SQL** (컬럼명이 다름):
+
+```sql
+SELECT sum(total_data_file_size_in_bytes), sum(file_count)
+FROM db.table_a.partitions
+WHERE partition.ts_hour = <대상 시간>
+```
+
+> ⚠️ 컬럼명은 엔진·버전에 따라 다르다 (`total_size` vs `total_data_file_size_in_bytes`). 실제 조회로 확인한다.
+
+#### 부하 특성과 manifest pruning ⚠️
+
+메타데이터 조회 비용은 두 갈래이며, **행 수가 아니라 manifest 수가 지배한다.**
+
+| 비용 | 무엇에 비례 | 규모 |
+|------|-----------|------|
+| manifest 읽기 (S3 GET + avro 파싱) | **manifest 파일 수** | append 5분 주기 = 288 commit/일. `rewrite_manifests` 3일 주기 사이 수백~1,000개 누적 가능 |
+| 행 materialize | 데이터 파일 수 | `.partitions`를 쓰면 사실상 사라짐 |
+
+파티션 필터를 걸면 Iceberg가 **해당 시간과 겹치지 않는 manifest를 건너뛸 수 있다** (manifest list에 manifest별 파티션 범위 요약이 있다). 이 pruning이 걸리면 manifest 수가 늘어도 비용이 거의 늘지 않는다.
+
+**이 테이블은 pruning에 유리한 조건이다:**
+
+| 조건 | 효과 |
+|------|------|
+| 파티션이 `hour(ts)` — 시간순 | 특정 시간의 파일이 최근 manifest 소수에 모여 있음 |
+| `rewrite_manifests` 3일마다 실행 (`reprocessing-dag-design.md` §6.2) | manifest를 파티션 기준으로 정리 → pruning 정밀도 향상 |
+
+즉 이미 운영 중인 `rewrite_manifests`가 이 조회의 비용을 관리해 주는 구조다.
+
+**pruning 동작 확인 방법** (⚠️ metadata table에서 실제로 걸리는지 미검증):
+
+```sql
+-- A: 전체
+SELECT count(*) FROM "db.table_a$partitions";
+-- B: 파티션 필터
+SELECT count(*) FROM "db.table_a$partitions" WHERE partition.ts_hour = <대상 시간>;
+```
+
+B가 A보다 확연히 빠르고 Trino 쿼리 통계의 **Physical input**이 작으면 pruning이 걸린 것이다. 비슷하면 manifest 전체를 읽고 있다.
+
+**최악의 경우 추정**: manifest 1,000개 × 30~100KB ≈ 30~90MB 읽기 → 수 초. hourly Compaction 자체가 1~2분 걸리는 job이므로 수 초는 무시할 수준이다. 호출 빈도는 테이블 4개 × 24시간 = 96회/일.
+
+#### fallback 필수
+
+조회를 도입하면 **외부 의존성과 실패 모드가 하나 늘어난다.** 지금은 상수라 이 실패 모드가 없다.
+
+```python
+try:
+    total_gb = query_partitions_size(table, target_hour)   # Trino
+    if total_gb <= 0:
+        raise ValueError(f"비정상 크기: {total_gb}")
+    num_executors = clamp(ceil(total_gb * C), MIN_EXECUTORS, MAX_EXECUTORS)
+except Exception as e:
+    logger.warning("메타데이터 조회 실패, 기본값 사용: %s", e)
+    num_executors = table.config.com_num_executor   # 기존 상수를 fallback으로 유지
+```
+
+**기존 `com_num_executor` 상수를 지우지 않고 fallback으로 남긴다.** 조회가 실패해도 Compaction은 실행되어야 한다.
+
+**결과 검증도 필요하다.** 조회는 성공했으나 파티션 조건이 틀려 0이 반환되면 executor가 `MIN_EXECUTORS`로 떨어져 Job이 한없이 느려진다. 위 코드의 `total_gb <= 0` 검사가 그 방어선이다.
+
+#### 검토했으나 채택하지 않은 대안: 직전 회차 값 캐싱
+
+시간대별 데이터 양이 완만하게 변하므로(실측 37 → 42.3 → 40.7 → 39.6 → 38.3GB, 시간당 10% 내외) 직전 회차의 실측 크기를 저장해 재사용하는 방식을 검토했다. 매 회차 갱신되므로 값이 고정되지는 않는다.
+
+**채택하지 않은 이유**: "실제 크기"를 Spark pod에서 Airflow로 되돌리는 배관이 필요하다. 로그 파싱은 깨지기 쉽고, Spark job이 별도 저장소에 기록하는 방식은 코드 변경 범위가 커진다. Compaction 후 `.partitions`를 조회하는 방식은 결국 조회를 하는 것이라 목적을 달성하지 못한다. **조회를 피하려다 구현이 더 늘어난다.**
+
+pruning 측정 결과 조회 비용이 과하게 나올 때만 재검토한다.
 
 ### 6.4 산정식 (⚠️ 계수 미확정)
 
@@ -483,7 +566,15 @@ num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 | 미측정 | 12 | — | 0.32 | ? | ? | 측정 예정 |
 | 미측정 | 8 | — | 0.22 | ? | ? | 측정 예정 |
 
-`spill to disk = 0b`를 유지하면서 `idle cores`가 가장 낮은 지점의 C를 채택한다.
+**판정 기준** — `spill to disk = 0b` 유지가 절대 조건이고, 그 안에서 아래 파생 지표로 비교한다.
+
+| 지표 | 계산 | 의미 |
+|------|------|------|
+| 초/GB | `duration ÷ sum_size` | 소요시간. **executor를 줄이면 커지는 것이 정상** |
+| **core·초/GB** | `(num_executors × 4 × duration) ÷ sum_size` | **리소스 비용.** 줄어야 축소가 성공 |
+| DAG 전체 | `초/GB × 평균 크기 × 4 테이블` | `:45`~`:57` 창(12분) 안에 여유롭게 들어가야 함 |
+
+`duration`만 보면 "느려졌다"로 오판한다. **소요시간 증가와 리소스 절감을 맞바꾸는 것이 목적**이며, DAG 전체가 창 안에 들어가는 한 절감이 이득이다. `dcu`가 `core·초/GB`와 같은 방향으로 움직이는지 함께 확인한다.
 
 **상한·하한**
 
@@ -571,6 +662,7 @@ daily 단계에서 최우선으로 확인할 항목이다.
 | `max-file-group-size-bytes` 100GB 검증 | 30GB와 동일하게 동작하는지. **min_size > 384MB, duration 1.2~1.4분** 확인 | 높음 |
 | `num-executors` 축소 (C 캘리브레이션) | 12, 8 두 지점 측정. `spill 0` 유지가 조건 (섹션 6.4) | 높음 |
 | `MAX_EXECUTORS` 확정 | K8S namespace quota 확인. append(batch당 약 10 executor)와 동시 실행됨 | 중간 |
+| metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `parallelismFirst` 판정 | 제거 후 `file_count` 확인 (섹션 3.2) | 낮음 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
