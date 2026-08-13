@@ -112,8 +112,12 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **`sort` 전략은 데이터를 2번 읽는다** (정렬 범위 샘플링 + 실제 쓰기). DataFlint `input = output × 2.0`이 정상값
   - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번 사례의 원인은 후자다. alert는 전자만 제안한다
   - **`memory usage` 84~94%는 `spill to disk 0b`와 짝으로 읽는다** — 낭비 없이 맞게 쓰는 중이라는 뜻이며 줄이면 spill이 시작된다
-- **동적 산정 (`num-executors`)**: 당초 6개 값을 동적화하려 했으나 **`num-executors` 하나로 좁혀졌다** (나머지는 데이터 양과 무관하거나 크게 고정이 우월). 구현 스켈레톤: **`pipeline/examples/compaction_executor_sizing_example.py`**
-  - `num_executors = clamp(ceil(총 크기GB × 0.32), 4, MAX)`, **C=0.32 확정**. `MAX_EXECUTORS`만 미확정(K8S quota 필요, 잠정 32)
+- **동적 산정 (`num-executors`) — 설계 완료, 도입 보류**: 설계 `pipeline/compaction-executor-sizing-design.md`, 구현 스켈레톤 `pipeline/examples/compaction_executor_sizing_example.py`
+  - **지금 도입할 필요 없다.** 고정 core는 duration이 데이터에 비례하므로 정적 12로 테이블당 **74.7GB까지 창(12분) 내 처리**. 현재 최대 42.3GB → **여유 1.77배**. 도입 시점은 **55~60GB 도달 시**. 즉시 할 일은 `com_num_executor`를 12로 바꾸는 것뿐
+  - 당초 6개 값을 동적화하려 했으나 **`num-executors` 하나로 좁혀졌다** (나머지는 데이터 양과 무관하거나 크게 고정이 우월)
+  - `num_executors = clamp(ceil(총 크기GB × 0.32), 4, MAX)`, **C=0.32 확정**. `MAX_EXECUTORS`만 미확정(K8S quota 필요, 잠정 32). **상한에 걸리면 조치 신호** — K8S에 여유가 없으면 executor를 늘려도 pod Pending으로 duration이 늘어 동적 산정이 무의미해진다
+  - 산정 위치는 `compaction_specs` 내부(테이블별 try/except로 실패 격리). 조회 전용 task 분리·mapped task 실행 직전 조회는 미채택 (설계 §4)
+  - **선행 조건: Compaction DAG의 mapped task 전환** (`compaction_dag_example.py`)
   - 입력 측정은 **`.files`가 아니라 `.partitions`** (파티션당 1행 집계, `.files`는 컬럼 19개 통계를 전부 끌고 옴). **범위 조회**여야 한다 — 재처리 DAG trigger 시 여러 시간에 걸친다
   - **파티션 값 변환은 naive datetime으로** — `ts`가 `timestamp_ntz`라 timezone을 붙이면 엉뚱한 시간대를 조회한다. `int((dt − 1970-01-01).total_seconds() // 3600)`, 2026-08-11 13:00 → 496237 (Spark UI 실측 일치)
   - 기존 `com_num_executor` 상수는 **fallback으로 유지** (조회 실패·0 반환·비정상 크기 전부). 지우면 Trino 장애가 곧 Compaction 실패가 된다
@@ -137,6 +141,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 └── pipeline/
     ├── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
     ├── reprocess-flow.md               # 재처리 DAG 처리 흐름 (보고용 요약)
+    ├── compaction-executor-sizing-design.md  # Compaction executor 동적 산정 설계
     ├── dags/
     │   └── iceberg_reprocess.py        # 재처리 DAG 정의 (신규 파일은 이것 하나)
     └── examples/

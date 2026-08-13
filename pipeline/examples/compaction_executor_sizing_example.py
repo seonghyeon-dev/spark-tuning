@@ -4,15 +4,29 @@
    반영한다. `compaction_dag_example.py`가 만든 `compaction_specs` task의
    `instances` 값 한 줄을 계산값으로 바꾸는 것이 전부다.
 
+⚠ **도입 시점: 데이터가 테이블당 55~60GB에 도달할 때.** 현재(최대 42.3GB)는
+   `com_num_executor`를 12로 고정하는 것으로 충분하다. 정적 12개는 테이블당
+   74.7GB까지 실행 창에 들어가므로 여유가 1.77배 남아 있다.
+   판단 근거는 `pipeline/compaction-executor-sizing-design.md` §3.
+
+설계 문서
+  `pipeline/compaction-executor-sizing-design.md` — 산정 위치·조회 경로 대안 비교,
+  실패 모드, 적용 순서. 이 파일은 그 설계의 구현 스켈레톤이다.
+
 왜 필요한가
-  정적 executor 수는 데이터가 늘면 duration이 늘고, hourly Compaction의 실행 창
-  제약(`M ≤ 60 − duration − 여유` = `:45`, reprocessing-dag-design.md §6.2)이
-  조용히 깨진다. 데이터 증가를 executor 수로 흡수해 duration을 일정하게 유지한다.
+  정적 executor 수는 데이터가 늘면 duration이 비례해 늘고, hourly Compaction의
+  실행 창 제약(`M ≤ 60 − duration − 여유` = `:45`, reprocessing-dag-design.md
+  §6.2)이 조용히 깨진다. 동적 산정은 증가분을 executor 수로 흡수해 duration을
+  일정하게 유지한다.
 
 동적화 대상은 `num-executors` 하나다
   9회 측정 결과 나머지 값은 데이터 양과 무관하거나 크게 고정하는 것이 우월하다
   (compaction-tuning-guide.md §6.1). executor cpu/memory는 task 하나가 처리하는
   단위가 512MB로 고정이라 데이터 양이 늘면 task 수만 늘고 크기는 그대로다.
+
+선행 조건
+  Compaction DAG의 mapped task 전환 (`compaction_dag_example.py`). 이 산정 코드가
+  `compaction_specs` 안에 들어가므로 그 구조가 먼저 필요하다.
 
 적용 범위
   **hourly 전용이다.** daily Compaction은 아직 튜닝하지 않았고 `rewrite-all` 낭비
@@ -200,10 +214,10 @@ def compaction_specs_fragment(params):
 
 # --- 도입 전 확인 -------------------------------------------------------------
 #
-# ① 정적 12로 두고 미루는 선택도 있다
-#    현재 데이터(36~42GB)에서 산정값이 12~14로 폭이 좁다. 즉 당장의 이득은 작고,
-#    값어치는 데이터가 늘 때 duration을 붙잡아 주는 것이다. Trino 연결을 새로 깔
-#    공수가 부담이면 `com_num_executor`를 12로 고정해 두고 나중에 전환해도 된다.
+# ① 지금 도입할 필요가 있는가
+#    설계 §3의 결론은 아니다. 정적 12개로 테이블당 74.7GB까지 실행 창에 들어가고
+#    현재 최대는 42.3GB다(여유 1.77배). 산정값도 12~14로 정적값과 거의 같다.
+#    55~60GB 도달 시 도입한다. 그때까지는 `com_num_executor`를 12로 고정한다.
 #
 # ② com_num_executor 상수를 지우지 않았는가
 #    fallback 경로가 이 값을 쓴다. 지우면 Trino 장애가 곧 Compaction 실패가 된다.
