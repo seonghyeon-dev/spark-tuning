@@ -142,9 +142,11 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **주의**: `S3FileIO`는 `fs.s3a.*`를 읽지 않는다. **원천 avro 읽기·경로 목록 파일은 여전히 S3A**이므로 `fs.s3a.*`와 `s3.*` 설정이 **공존**해야 한다
 - **전환 순서**: maintenance Job(expire/orphan) → Compaction → append. FileIO는 세션 단위 설정이라 Job별 혼용이 안전하다(같은 테이블도 무방). **append는 삭제가 거의 없어 이득이 없으므로 S3A로 남겨도 된다**
 - **기존 `fs.s3a.*` 설정 처리** (가이드 §5.1.1): `connection.ssl.enabled=false`와 `aws.credentials.provider=SimpleAWSCredentialsProvider`는 **대응 설정 불필요**(전자는 `s3.endpoint`에 `http://` 포함으로 해결, 후자는 Iceberg 자체 순서를 따름). **`acl.default=PublicReadWrite`는 옮기지 말 것** — 익명 읽기/쓰기를 여는 값이고 MinIO에서 무효일 가능성이 높다(확인 필요). `client.region`은 `s3.` 접두어가 아니며 **실질적으로 필수** — S3A는 못 찾으면 US_EAST_2로 폴백하지만 Iceberg는 폴백이 없어 클라이언트 생성 시 죽는다
-- **`s3.staging-dir`은 업로드 전 파트 파일(32MB) 로컬 버퍼** = `fs.s3a.buffer.dir`과 동일 개념. **K8s에는 `LOCAL_DIRS`가 없어 `fs.s3a.buffer.dir` 기본값이 `/tmp/hadoop-<user>/s3a`로 떨어진다** — 마운트한 hostPath(보통 `SPARK_LOCAL_DIRS`, shuffle용)와 다른 경로일 가능성이 높다. 둘 다 명시 권장
-- **maintenance Job 리소스**: manifest 스캔은 executor 분산, **삭제는 driver 단독**. executor 0은 불가하나 축소 여지 있음. **driver cpu가 실질 병목** — `s3.delete.num-threads` 기본값이 driver의 `availableProcessors()`다
-- **미확인**: 실제 삭제 파일 수(추정치 사용), 읽기/쓰기 성능 영향(`dcu/GB` A/B 필요, 노이즈 기준선 ±15%), `fs.s3a.acl.default`의 MinIO 실제 효력, `fs.s3a.buffer.dir` 현재 경로
+- **`s3.staging-dir`은 업로드 전 파트 파일 로컬 버퍼** = `fs.s3a.buffer.dir`과 동일 개념. **명시하지 않는 것이 현상 유지다** — 마운트한 hostPath는 `spark-local-dir-1`(shuffle 전용)이고, `LocalDirsFeatureStep`이 `java.io.tmpdir`을 건드리지 않아 현재 `fs.s3a.buffer.dir`(`/tmp/hadoop-<user>/s3a`)도 전환 후 `s3.staging-dir`(`/tmp`)도 둘 다 `/tmp`다. **Phase 1(maintenance)은 데이터 파일을 안 쓰므로 아예 무관**
+- **multipart 기본값이 S3A와 다르다** (§5.1.3): S3A `multipart.size=64M`/`threshold=128M` vs Iceberg `part-size-bytes=32MB`/`threshold=1.5`(→48MB). Phase 2 진입 시 **`s3.multipart.part-size-bytes=67108864`로 맞추는 것이 현상 유지**. 파트는 32MB 채워질 때마다 비동기 업로드되고 완료 즉시 삭제되므로 디스크 점유는 `동시 파트 수 × 파트 크기`
+- **maintenance Job 리소스** (현재 driver 1core/1g, executor 4core/4g×4): manifest 스캔은 executor 분산, **삭제는 driver 단독**. **executor 0은 불가**. **driver cores는 1로 둬도 된다** — 삭제는 IO bound라 `s3.delete.num-threads`만 명시하면 충분(전환 후 삭제는 10초 안쪽). executor 축소는 **전환과 동시에 하지 말 것**(A/B 교란). **driver 삭제 구간은 Spark UI에 stage로 안 잡힌다** — `Job duration − stage 합계`가 삭제 시간
+- **⚠️ `availableProcessors()` 함정**: `driver cores=1`은 K8s **request**라 `coreLimit` 미설정 시 JVM이 노드 전체 코어를 본다. 그러면 현재 `iceberg.hadoop.delete-file-parallelism`(= `코어×4`)이 100+ 스레드가 되어 **MinIO 부하 급증의 원인 후보**다. `limits.cpu` 확인 필요
+- **미확인**: 실제 삭제 파일 수(추정치 사용), 읽기/쓰기 성능 영향(`dcu/GB` A/B 필요, 노이즈 기준선 ±15%), `fs.s3a.acl.default`의 MinIO 실제 효력, driver Pod `limits.cpu` 유무
 
 ## 파일 구조
 

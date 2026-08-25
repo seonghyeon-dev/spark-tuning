@@ -422,7 +422,7 @@ private void newStream() throws IOException {
 
 **S3A에도 같은 개념이 있다.** `fs.s3a.fast.upload.buffer`의 기본값이 `disk`이고, 그때 쓰는 경로가 `fs.s3a.buffer.dir`다. 즉 **`s3.staging-dir` ≡ `fs.s3a.buffer.dir`**로 보면 된다. 📘
 
-#### ⚠️ K8s에서 주의할 점 — 지금 이미 `/tmp`를 쓰고 있을 수 있다
+#### 우리 환경에서의 결론 — 명시하지 않는 것이 현상 유지다 ✅ 확인 완료
 
 `fs.s3a.buffer.dir`의 기본값은 다음과 같다. ✅ 소스 검증 (`core-default.xml`, Hadoop 3.4.1)
 
@@ -435,29 +435,26 @@ private void newStream() throws IOException {
 </property>
 ```
 
-`LOCAL_DIRS`는 **YARN이 넣어주는 환경변수**다. **Kubernetes에는 이 변수가 없다** — Spark on K8s는 `SPARK_LOCAL_DIRS`를 쓴다. 따라서 K8s에서 `fs.s3a.buffer.dir`을 명시하지 않았다면 **`${hadoop.tmp.dir}/s3a` = `/tmp/hadoop-<user>/s3a`로 떨어진다.**
+`LOCAL_DIRS`는 **YARN이 넣어주는 환경변수**이고 **Kubernetes에는 없다** — Spark on K8s는 `SPARK_LOCAL_DIRS`를 쓴다. 따라서 `hadoop.tmp.dir`(기본 `/tmp/hadoop-${user.name}`)로 폴백한다.
 
-여기서 갈리는 지점이 있다. **Spark의 로컬 디렉터리(`SPARK_LOCAL_DIRS`, shuffle/spill용)와 S3 업로드 버퍼는 서로 다른 설정이다.** hostPath 볼륨을 마운트해 뒀다면 그건 십중팔구 전자이고, 후자는 여전히 컨테이너 `/tmp`를 쓰고 있을 가능성이 높다.
+현재 환경을 대입하면 이렇다:
 
-| 용도 | 설정 | 무엇이 쌓이나 |
-|------|------|---------------|
-| shuffle / spill | `spark.local.dir` (K8s에서는 `SPARK_LOCAL_DIRS`, 볼륨 이름 `spark-local-dir-*`로 자동 연결) | shuffle 블록, spill 파일 |
-| S3 업로드 버퍼 (현재) | `fs.s3a.buffer.dir` — **K8s 기본값은 `/tmp/hadoop-<user>/s3a`** | 업로드 대기 중인 파트 파일 |
-| S3 업로드 버퍼 (전환 후) | `s3.staging-dir` — 기본값 `java.io.tmpdir` | 동일 |
+| 항목 | 실제 경로 | 근거 |
+|------|-----------|------|
+| 마운트한 hostPath 볼륨 `spark-local-dir-1` | `SPARK_LOCAL_DIRS` (shuffle / spill 전용) | Spark on K8s는 `spark-local-dir-` 접두 볼륨을 로컬 디렉터리로 자동 연결한다 ✅ (`LocalDirsFeatureStep.scala:39, 60, 84`) |
+| `java.io.tmpdir` | **`/tmp`** (컨테이너 기본값) | `LocalDirsFeatureStep`은 `java.io.tmpdir`을 건드리지 않는다 ✅ (해당 문자열 자체가 없음) |
+| `fs.s3a.buffer.dir` (현재, 미설정) | **`/tmp/hadoop-<user>/s3a`** | 위 폴백 |
+| `s3.staging-dir` (전환 후, 미설정 시) | **`/tmp`** | `java.io.tmpdir` |
 
-**확인할 것** ⚠️:
-1. 현재 `fs.s3a.buffer.dir`을 명시적으로 설정하고 있는가? (없다면 `/tmp` 사용 중)
-2. 마운트한 hostPath의 볼륨 이름이 `spark-local-dir-*`인가? (그렇다면 그건 shuffle용이고 S3 버퍼와 무관)
-3. `/tmp`가 컨테이너 overlay filesystem인가 emptyDir인가? ephemeral-storage limit은 얼마인가?
+**즉 지금도 `/tmp`, 전환 후에도 `/tmp`다. 둘 다 명시하지 않으면 동작이 달라지지 않는다.** 마운트한 hostPath는 shuffle 전용이고 S3 업로드 버퍼와는 애초에 무관했다.
 
-**권장**: `fs.s3a.buffer.dir`과 `s3.staging-dir`을 **둘 다 마운트한 hostPath 하위 경로로 명시**한다. 전환 여부와 무관하게 지금 해두는 게 맞는 설정이다.
+> **판단**: `s3.staging-dir`을 **명시하지 않는 것이 맞다.** 명시하면 오히려 지금과 다른 경로로 바뀌어 변경 폭이 늘어난다. 전환의 목적은 삭제 요청 감소이므로, 무관한 변수를 같이 건드리지 않는 편이 A/B 판정에도 유리하다.
 
-```properties
-spark.hadoop.fs.s3a.buffer.dir=<hostPath 마운트 경로>/s3a          # 지금도 유효
-spark.sql.catalog.<카탈로그>.s3.staging-dir=<hostPath 마운트 경로>/s3fileio   # 전환 시
-```
+#### 그래도 언젠가는 봐야 할 것 ⚠️
 
-> 소요량 감각: 파트 파일은 업로드 완료 후 삭제되므로 무한정 쌓이지는 않는다. 다만 executor 1개가 동시에 여는 출력 파일 수 × 32MB만큼이 순간 점유된다. Compaction executor는 512MB 목표 파일을 쓰므로 무시할 양은 아니다.
+- **Phase 1(maintenance)에서는 완전히 무관하다.** `expire_snapshots`와 `remove_orphan_files`는 데이터 파일을 쓰지 않는다. 쓰는 것은 metadata.json 정도(KB~MB)로 multipart 임계값(48MB) 근처에도 못 간다. **staging 디렉터리를 아예 쓰지 않는다**
+- **Phase 2(Compaction) / Phase 3(append)에서 실제 사용이 시작된다.** 이때 `/tmp`의 성격(overlay filesystem인지 emptyDir인지)과 ephemeral-storage limit을 확인해야 한다
+- 다만 점유량은 생각보다 작다. 파트 파일은 업로드가 끝나는 즉시 삭제된다 ✅ (`S3OutputStream.java` — `whenComplete`에서 `Files.deleteIfExists(f.toPath())`). 즉 **파일 크기가 아니라 "동시에 떠 있는 파트 수 × 파트 크기"만큼**만 점유한다
 
 ### 4.7 읽기/쓰기 성능은 미측정이다 ⚠️
 
@@ -533,8 +530,13 @@ spark.sql.catalog.<카탈로그>.client.region=us-east-1
 spark.sql.catalog.<카탈로그>.s3.delete.batch-size=1000
 spark.sql.catalog.<카탈로그>.s3.delete.num-threads=8
 
-# ── staging (섹션 4.6) ───────────────────────────────────────
-spark.sql.catalog.<카탈로그>.s3.staging-dir=<fs.s3a.buffer.dir와 동일 경로>
+# ── 설정하지 않는 것 ──────────────────────────────────────────
+#   s3.staging-dir       : 현재도 /tmp, 미설정 시 전환 후에도 /tmp → 현상 유지 (섹션 4.6)
+#   s3.acl               : 익명 읽기/쓰기를 여는 값이므로 옮기지 않는다 (섹션 5.1.1)
+#   s3.access-key-id 등  : Spark UI에 노출되므로 환경변수로 (아래)
+
+# ── Phase 2(Compaction) 진입 시 함께 (섹션 5.1.3) ─────────────
+#   spark.sql.catalog.<카탈로그>.s3.multipart.part-size-bytes=67108864
 
 # ── 기존 S3A 설정은 그대로 유지 (섹션 4.4) ────────────────────
 spark.hadoop.fs.s3a.endpoint=...
@@ -549,7 +551,7 @@ spark.hadoop.fs.s3a.secret.key=...
 | `s3.path-style-access` | `true` | MinIO는 virtual-host 스타일 미지원이 일반적. 기본값이 `false`라 **반드시 명시** ✅ (`S3FileIOProperties.java:240`) |
 | `client.region` | 아무 값 (`us-east-1`) | AWS SDK v2는 region이 없으면 클라이언트 생성 자체가 실패한다. MinIO는 값을 무시한다 📘 |
 | `s3.delete.batch-size` | `1000` | 최대값. 250이 기본이나 요청 수를 4배 더 줄인다. MinIO의 DeleteObjects 한도도 1000 ✅ (`DELETE_BATCH_SIZE_MAX`) |
-| `s3.delete.num-threads` | `8` | driver 코어 수(기본값)로는 배치 8개도 동시에 못 돌린다. IO bound라 코어 수보다 크게 잡아도 된다 ⚠️ 조정 여지 |
+| `s3.delete.num-threads` | `8` | 기본값이 `availableProcessors()`라 K8s에서 예측이 어렵다(섹션 5.1.2). IO bound이므로 코어 수와 무관하게 명시한다 |
 
 **인증 정보 주입 방식** — `s3.access-key-id` / `s3.secret-access-key`를 Spark conf에 직접 쓰는 것은 **비권장**한다. Spark UI의 Environment 탭에 그대로 노출된다. 대신 K8s Secret → 환경변수를 쓴다. AWS SDK v2의 기본 자격증명 체인이 자동으로 읽는다. 📘
 
@@ -663,7 +665,7 @@ void applyClientRegionConfiguration(BuilderT builder) {
 
 값 자체는 무엇이든 상관없다(MinIO는 검증하지 않고 서명 계산에만 쓴다). 관례상 `us-east-1`. ⚠️ 단 MinIO에 `MINIO_SITE_REGION`(구 `MINIO_REGION`)이 설정돼 있다면 **그 값과 맞춰야** 서명 불일치를 피한다.
 
-### 5.1.2 리소스 산정 — driver 중심으로 잡는다
+### 5.1.2 maintenance Job 리소스 산정
 
 maintenance Job에서 **executor와 driver의 역할이 다르다.** ✅ 소스 검증
 
@@ -672,17 +674,89 @@ maintenance Job에서 **executor와 driver의 역할이 다르다.** ✅ 소스 
 | 삭제 대상 산출 (manifest 스캔 + anti-join) | **executor** (분산) | `BaseSparkAction.java:151-170` — manifest 목록을 `repartition` 후 `flatMap(new ReadManifest(...))`로 병렬 읽기 |
 | 실제 삭제 요청 | **driver 단독** | `ExpireSnapshotsSparkAction.java:222-228` — `collectAsList()` / `toLocalIterator()` 후 driver JVM |
 
-따라서:
+따라서 **executor를 0으로 둘 수 없다.** manifest 스캔이 실제 Spark Job이므로 executor가 없으면 진행되지 않는다. 다만 읽는 것이 데이터 파일이 아니라 **manifest**이므로, Compaction처럼 데이터 양에 비례해 키울 이유는 없다.
 
-- **executor는 0으로 둘 수 없다.** manifest 스캔이 실제 Spark Job이므로 executor가 없으면 진행되지 않는다. 다만 **읽는 것이 데이터 파일이 아니라 manifest**이므로, Compaction처럼 데이터 양에 비례해 키울 필요는 없다. 적게 잡는 것이 맞다
-- **driver가 병목이다.** 삭제 요청이 전부 driver에서 나가고, `s3.delete.num-threads`의 기본값이 `Runtime.getRuntime().availableProcessors()` = **driver의 cgroup CPU limit**이다 ✅ (`S3FileIOProperties.java:657-659`). driver cpu가 1이면 스레드도 1개다
-- `stream-results` 옵션(기본 `false` ✅ `ExpireSnapshotsSparkAction.java:68-69`)을 `true`로 주면 `collectAsList()` 대신 `toLocalIterator()`를 써서 driver 메모리 부담이 준다. 삭제 대상이 매우 많을 때 검토
+#### 현재 설정과 권장
 
-| 설정 | 권장 방향 |
-|------|-----------|
-| `num-executors` | 낮게. manifest 스캔량 기준 (⚠️ 현재 값 확인 후 축소 여지 판단) |
-| `driver cpu` | **2 이상.** `s3.delete.num-threads` 기본값의 근거이자 삭제 병렬도의 실질 상한 |
-| `s3.delete.num-threads` | 8 (driver cpu와 분리해 명시적으로 지정) |
+| 설정 | 현재 | Phase 1 권장 | 근거 |
+|------|------|--------------|------|
+| `driver cores` | 1 | **1 유지** | 삭제는 네트워크 IO bound다. `s3.delete.num-threads`를 명시하면 코어 1개로도 동시 요청 8개를 충분히 흘린다 |
+| `driver memory` | 1g | **1g 유지** | `collectAsList()`가 담는 것은 경로 문자열이다. 파일 4만 개라도 수십 MB 수준 |
+| `executor cores` | 4 | **4 유지** | 전환 A/B의 교란 변수를 만들지 않는다 |
+| `executor instances` | 4 | **4 유지 → 측정 후 조정** | 아래 참조 |
+| `s3.delete.num-threads` | — | **8 (명시)** | 기본값이 `availableProcessors()`라 예측이 어렵다 (아래 참조) |
+
+**`driver cores`를 올리지 않아도 되는 이유**: 전환 후 삭제 요청은 파일 4만 개 기준 `DeleteObjects` 40건(batch 1000)이다. 스레드 8개면 5라운드, 요청당 1~2초로 잡아도 10초 안쪽이다. 현재 6~12분에 비하면 무시할 수준이라 **코어를 늘려 얻을 것이 없다.** (스레드 풀 크기는 코어 수와 무관하게 지정할 수 있고, 네트워크 대기 중인 스레드는 CPU를 쓰지 않는다.)
+
+> ⚠️ **`availableProcessors()`의 함정 — 현재 상태 점검용**
+>
+> `driver cores = 1`은 K8s의 **request**이지 **limit**이 아니다. JVM의 컨테이너 인식은 cgroup의 CPU **quota**(= limit)를 읽으므로, `coreLimit`(`spark.kubernetes.driver.limit.cores`)을 설정하지 않았다면 **`availableProcessors()`가 노드 전체 코어 수를 반환한다.**
+>
+> 그렇다면 현재 `iceberg.hadoop.delete-file-parallelism`의 기본값(`availableProcessors × 4`)이 노드 코어가 32일 때 **128 스레드**가 된다. 각 스레드가 파일 1개씩, 요청 3개씩 쏘고 있다는 뜻이다. **관측된 MinIO 부하 급증의 원인 중 하나일 수 있다.** ⚠️ driver Pod spec의 `limits.cpu` 유무를 확인할 것
+>
+> 어느 쪽이든 결론은 같다 — **`s3.delete.num-threads`는 기본값에 맡기지 말고 명시한다.**
+
+#### executor 수는 전환 후에 조정한다
+
+지금 줄이면 FileIO 전환과 리소스 변경이 겹쳐 A/B 판정이 불가능해진다. 전환 후 Spark UI에서 다음을 보고 판단한다:
+
+| 확인 대상 | 보는 법 |
+|-----------|---------|
+| executor 구간 | `ReadManifest` flatMap stage와 `except`(shuffle) stage의 소요 시간 |
+| **driver 삭제 구간** | **stage로 잡히지 않는다.** Job 전체 duration − stage 소요 시간 합계 = 삭제 시간. Spark UI상 Job이 끝난 것처럼 보이는데 Pod이 살아 있는 구간이 이것이다 |
+| idle cores | DataFlint. executor 구간이 짧은데 16코어를 잡고 있으면 축소 대상 |
+
+전환 후에는 삭제 구간이 거의 사라지므로 **manifest 스캔 구간이 duration의 대부분**이 된다. 그때 idle cores를 보고 `instances`를 4 → 2로 줄이는 식으로 접근한다. `contentFileDS`가 `spark.sql.shuffle.partitions`로 repartition하므로 태스크 수 자체는 부족하지 않다.
+
+### 5.1.3 multipart 업로드 설정 — 기본값이 S3A와 다르다
+
+`fs.s3a.multipart.*`를 설정한 적이 없더라도 **대응되는 기본값은 존재하며, Iceberg의 기본값과 다르다.** ✅ 소스 검증
+
+| 항목 | S3A (현재, 미설정 시) | S3FileIO (전환 후, 미설정 시) |
+|------|----------------------|------------------------------|
+| 파트 크기 | `fs.s3a.multipart.size` = **64MB** | `s3.multipart.part-size-bytes` = **32MB** |
+| multipart 전환 임계값 | `fs.s3a.multipart.threshold` = **128MB** | `s3.multipart.threshold` = 1.5 (배수) → **48MB** |
+| 업로드 스레드 | `fs.s3a.threads.max` 등 | `s3.multipart.num-threads` = `availableProcessors()` |
+
+출처: `core-default.xml`(Hadoop 3.4.1), `S3FileIOProperties.java:195-206, 603`.
+
+#### 32MB가 하는 일
+
+```java
+// S3OutputStream.java:183-208 (요약)
+while (stream.getCount() + remaining > multiPartSize) {   // 32MB 채워지면
+  ...
+  newStream();      // 새 staging 파일로 회전
+  uploadParts();    // 완성된 파트를 비동기 업로드
+}
+```
+
+1. 쓰기 데이터가 staging 파일에 쌓인다
+2. 32MB가 차면 새 staging 파일로 넘어가고, 방금 채운 파일을 **비동기로 `UploadPart` 전송**한다 (`CompletableFuture.supplyAsync(..., executorService)`, 풀 이름 `iceberg-s3fileio-upload-%d`)
+3. 업로드가 끝나면 **staging 파일을 즉시 삭제**한다
+4. `close()` 시점에 남은 파트를 올리고 `CompleteMultipartUpload`
+
+즉 **업로드가 쓰기와 겹쳐서 진행된다.** 파일을 다 쓴 뒤 통째로 올리는 방식이 아니다.
+
+#### 성능을 올릴 수 있는가
+
+**가능은 하지만, 이번 전환의 이득 영역은 아니다.** 판단 근거를 순서대로 정리하면:
+
+| 질문 | 답 |
+|------|-----|
+| Phase 1(maintenance)에 영향이 있나 | **없다.** expire/orphan은 데이터 파일을 쓰지 않으므로 multipart 경로 자체를 타지 않는다 |
+| Phase 2/3에서는 | 512MB 목표 파일 기준 **32MB면 16파트, 64MB면 8파트**. 파트 수가 절반이면 `UploadPart` 요청도 절반이다 |
+| 그럼 올려야 하나 | 올린다기보다 **`64MB`로 맞추는 것이 "현상 유지"다.** S3A가 지금 64MB로 동작 중이므로, 기본값을 그대로 두면 오히려 파트가 절반 크기로 쪼개지는 변경이 된다 |
+| 체감될 만한 차이인가 | ⚠️ 불확실. 노이즈 기준선 ±15%를 넘길지는 측정해야 안다. Compaction 튜닝에서 확인된 병목은 file group 분할이었지 업로드가 아니었다 |
+
+**권장**: Phase 2 진입 시 `s3.multipart.part-size-bytes=67108864`(64MB)를 함께 설정해 **현재 S3A 동작과 동일하게 맞춘다.** 그 이상의 튜닝(128MB 등)은 A/B로 별도 검증한다.
+
+```properties
+# Phase 2(Compaction) 진입 시
+spark.sql.catalog.<카탈로그>.s3.multipart.part-size-bytes=67108864   # 64MB, S3A 현재값과 동일
+```
+
+> 파트를 키울 때의 대가: 업로드 실패 시 재전송 단위가 커지고, `동시 파트 수 × 파트 크기`만큼 로컬 디스크 점유가 늘어난다. S3의 파트 수 상한(10,000개)은 32MB 기준 320GB라 우리 파일 크기에서는 고려 대상이 아니다.
 
 ### 5.2 Phase 1 — maintenance Job에만 적용 (권장 시작점)
 
@@ -820,9 +894,10 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | **`s3.delete.num-threads` 적정값** | 기본값(driver 코어 수)은 너무 작다. 8로 시작하되 MinIO 순간 부하를 보며 조정 | 중간 |
 | **`remove_orphan_files`의 `prefix_listing => true`** | LIST 요청을 추가로 크게 줄일 수 있으나, 기존 S3A 디렉터리 마커 오탐 위험 검증 필요 (섹션 2.2, 4.8) | 중간 |
 | **`fs.s3a.acl.default=PublicReadWrite`의 실제 효력** | MinIO에서 ACL이 무시되는지 확인. 무시된다면 전환과 무관하게 제거 대상이고, 효력이 있다면 익명 읽기/쓰기가 열려 있다는 뜻이라 더 시급하다 (섹션 5.1.1) | **높음(보안)** |
-| **`fs.s3a.buffer.dir` 현재 경로** | K8s에는 `LOCAL_DIRS`가 없어 기본값이 `/tmp/hadoop-<user>/s3a`로 떨어진다. 마운트한 hostPath와 다른 경로일 가능성이 높다 (섹션 4.6) | 중간 |
-| **`s3.staging-dir`와 ephemeral-storage** | 위 확인 후 `fs.s3a.buffer.dir`과 동일 볼륨으로 맞출 것 (섹션 4.6) | 중간 |
-| **maintenance Job의 executor 수** | 삭제는 driver에서만 일어나므로 executor는 manifest 스캔량 기준으로 축소 여지가 있다. driver cpu는 반대로 올릴 것 (섹션 5.1.2) | 중간 |
+| **driver Pod의 `limits.cpu` 설정 여부** | 없다면 `availableProcessors()`가 노드 전체 코어를 반환해 현재 삭제 스레드가 예상보다 훨씬 많을 수 있다 — MinIO 부하 급증의 원인 후보 (섹션 5.1.2) | 높음 |
+| **maintenance Job의 executor 수** | 삭제는 driver에서만 일어나므로 축소 여지가 있으나, **전환과 동시에 바꾸면 A/B 판정이 불가능하다.** 전환 후 Spark UI로 stage 구간을 보고 조정 (섹션 5.1.2) | 중간 (전환 후) |
+| **`/tmp`의 성격과 ephemeral-storage limit** | Phase 1에는 무관(데이터 파일을 쓰지 않음). Phase 2/3 진입 전 확인 (섹션 4.6) | 중간 (Phase 2 전) |
+| **`s3.multipart.part-size-bytes` 조정 효과** | 64MB로 맞추면 S3A 현재 동작과 동일해진다. 그 이상은 A/B 필요 (섹션 5.1.3) | 낮음 (Phase 2) |
 | **Spark 4.1.1 ↔ iceberg-spark-runtime 4.0 조합** | 현재 어떤 runtime jar를 쓰는지 확인하고 `iceberg-aws-bundle` 버전을 정확히 맞출 것 | 중간 |
 | **maintenance 스케줄 재조정** | expire duration이 줄면 `reprocessing-dag-design.md` §6.2의 슬롯에 여유가 생긴다. 재배치 재검토 가능 | 낮음 (전환 후) |
 | **daily maintenance DAG 통합** | 기존 후속 과제. FileIO 전환과 함께 하면 측정을 한 번에 끝낼 수 있다 | 낮음 |
@@ -848,10 +923,11 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | `S3AFileSystem.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/` | :3581-3606 delete 흐름, :3624-3648 마커 생성 |
 | `BulkDeleteOperation.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/.../impl/` | S3A의 bulk delete API 존재 확인 |
 | `AwsClientProperties.java` | `iceberg 1.10.1` / `aws/.../aws/` | :145-149 region 미설정 시 동작, :211-235 자격증명 결정 순서 |
-| `S3OutputStream.java` | `iceberg 1.10.1` / `aws/.../s3/` | :213-228 staging 파트 파일 생성 |
+| `S3OutputStream.java` | `iceberg 1.10.1` / `aws/.../s3/` | :183-208 파트 회전, :213-228 staging 파일 생성, `uploadParts()` 비동기 업로드 및 업로드 후 삭제 |
+| `LocalDirsFeatureStep.scala` | `spark 4.0.0` / `resource-managers/kubernetes/` | :39, :60, :84 `spark-local-dir-*` 볼륨 → `SPARK_LOCAL_DIRS`. `java.io.tmpdir`은 건드리지 않음 |
 | `BaseSparkAction.java` | `iceberg 1.10.1` / `spark/v4.0/.../actions/` | :151-170 manifest 병렬 스캔(executor 작업) |
 | `DefaultS3ClientFactory.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/` | :258-263 region 폴백(US_EAST_2), :358-371 ssl.enabled |
-| `core-default.xml` | `hadoop 3.4.1` / `hadoop-common/` | `fs.s3a.buffer.dir` 기본값, `fs.s3a.fast.upload.buffer=disk` |
+| `core-default.xml` | `hadoop 3.4.1` / `hadoop-common/` | `fs.s3a.buffer.dir`·`hadoop.tmp.dir` 기본값, `fast.upload.buffer=disk`, `multipart.size=64M`, `multipart.threshold=128M` |
 | `gradle/libs.versions.toml` | `iceberg 1.10.1` | `awssdk-bom = 2.33.0`, `hadoop3 = 3.4.1` |
 
 ### 공식 문서
