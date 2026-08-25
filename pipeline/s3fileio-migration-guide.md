@@ -515,7 +515,98 @@ mc admin trace --verbose <alias> | grep -E "DeleteObject|ListObjects|HeadObject"
 | 배치 방법 | Spark 이미지의 `$SPARK_HOME/jars/`에 포함 (K8s 환경에서 `--packages`로 매번 받는 것은 비권장) |
 | 주의 | 버전을 Iceberg와 **정확히 일치**시킬 것 |
 
+> ⚠️ **개별 SDK jar로 대체하지 말 것 — S3만 넣으면 실패한다.** 상세는 아래 5.0.1.
+
 **③ MinIO checksum 호환성 확인** (섹션 4.5). 이게 Phase 0의 실질적 게이트다.
+
+### 5.0.1 `NoClassDefFoundError: .../services/kms/...` — S3만 쓰는데 KMS가 왜 필요한가
+
+**증상**
+
+```
+NoClassDefFoundError: software/amazon/awssdk/services/kms/model/EncryptionAlgorithmSpec
+```
+
+(`glue`, `dynamodb` 쪽 클래스로 나타날 수도 있다.)
+
+**원인** ✅ 소스 검증
+
+`S3FileIO.initialize()`가 클라이언트 팩토리를 만드는 경로가 S3 전용이 아니다.
+
+```java
+// S3FileIO.java:495
+Object clientFactory = S3FileIOAwsClientFactories.initialize(properties);
+
+// S3FileIOAwsClientFactories.java:41-47
+public static <T> T initialize(Map<String, String> properties) {
+  String factoryImpl = PropertyUtil.propertyAsString(properties, S3FileIOProperties.CLIENT_FACTORY, null);
+  if (Strings.isNullOrEmpty(factoryImpl)) {
+    return (T) AwsClientFactories.from(properties);   // ← s3.client-factory 미설정 시 여기로
+  }
+  ...
+}
+```
+
+그리고 `AwsClientFactories.from()`이 돌려주는 `DefaultAwsClientFactory`는 **`AwsClientFactory` 인터페이스**를 구현하는데, 그 인터페이스의 메서드 시그니처가 이렇다.
+
+```java
+// AwsClientFactory.java:23-25, 61
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.kms.KmsClient;
+...
+KmsClient kms();
+GlueClient glue();
+DynamoDbClient dynamo();
+```
+
+JVM이 이 클래스를 링크하려면 **메서드 시그니처에 등장하는 타입을 전부 해결해야 한다.** 즉 KMS·Glue·DynamoDB를 한 줄도 쓰지 않아도 **해당 클래스가 classpath에 존재해야 한다.** MinIO에 S3만 쓰는 우리 상황도 예외가 아니다.
+
+**`iceberg-aws-bundle`은 정확히 이 이유로 서비스 모듈을 전부 담고 있다.** ✅ 소스 검증 (`aws-bundle/build.gradle:27-42`)
+
+```gradle
+implementation platform(libs.awssdk.bom)
+implementation "software.amazon.awssdk:apache-client"
+implementation "software.amazon.awssdk:auth"
+implementation "software.amazon.awssdk:s3"
+implementation "software.amazon.awssdk:kms"          // ← 이것
+implementation "software.amazon.awssdk:glue"         // ← 이것
+implementation "software.amazon.awssdk:sts"
+implementation "software.amazon.awssdk:dynamodb"     // ← 이것
+implementation "software.amazon.awssdk:iam"
+implementation "software.amazon.awssdk:sso"
+implementation "software.amazon.awssdk:lakeformation"
+```
+
+**해결**
+
+`iceberg-aws` + 개별 SDK jar 조합을 버리고 **`iceberg-aws-bundle:1.10.1` 단일 jar**를 쓴다. 버전은 Iceberg와 정확히 일치시킨다.
+
+**확인 명령**
+
+```bash
+# 1) 현재 classpath에 어떤 aws 관련 jar가 있는지
+kubectl exec <driver-pod> -- ls $SPARK_HOME/jars | grep -iE "iceberg|awssdk|aws-java|bundle"
+
+# 2) kms 클래스가 실제로 들어 있는지 (0이면 이 문제가 맞다)
+kubectl exec <driver-pod> -- sh -c \
+  'for j in $SPARK_HOME/jars/*.jar; do \
+     n=$(unzip -l "$j" 2>/dev/null | grep -c "software/amazon/awssdk/services/kms/"); \
+     [ "$n" -gt 0 ] && echo "$n  $j"; \
+   done'
+```
+
+**주의 — 섞어 쓰지 말 것**
+
+`iceberg-aws-bundle`은 `org.apache.http`와 `io.netty`를 relocate(shade)한다 ✅ (`aws-bundle/build.gradle:62-63`). 여기에 별도의 `software.amazon.awssdk:*` jar나 구버전 `iceberg-aws`를 함께 넣으면 클래스가 이중으로 존재해 더 찾기 어려운 충돌이 난다. **bundle 하나로 통일한다.**
+
+| 구성 | 판정 |
+|------|------|
+| `iceberg-aws-bundle:1.10.1` 단독 | ✅ 권장 |
+| `iceberg-aws` + `awssdk:s3` + `awssdk:auth` 등 개별 | ❌ 이 에러의 원인 |
+| `iceberg-aws-bundle` + 개별 `awssdk:*` 혼재 | ❌ 중복 클래스 충돌 위험 |
+
+> 참고: `s3.client-factory`로 커스텀 팩토리를 지정해도 해결되지 않는다. 그 인터페이스(`S3FileIOAwsClientFactory`)를 구현하더라도, 기본 경로를 벗어나기 전에 이미 같은 링크 문제가 발생할 수 있고 무엇보다 우회할 이유가 없다.
 
 ### 5.1 설정 값
 
@@ -947,6 +1038,9 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | `S3AFileSystem.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/` | :3581-3606 delete 흐름, :3624-3648 마커 생성 |
 | `BulkDeleteOperation.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/.../impl/` | S3A의 bulk delete API 존재 확인 |
 | `AwsClientProperties.java` | `iceberg 1.10.1` / `aws/.../aws/` | :145-149 region 미설정 시 동작, :211-235 자격증명 결정 순서 |
+| `AwsClientFactory.java` | `iceberg 1.10.1` / `aws/.../aws/` | :23-25, :61 KMS/Glue/DynamoDB가 메서드 시그니처에 등장 (KMS jar 필수 원인) |
+| `S3FileIOAwsClientFactories.java` | `iceberg 1.10.1` / `aws/.../aws/` | :41-47 `s3.client-factory` 미설정 시 `AwsClientFactories.from()`으로 폴백 |
+| `aws-bundle/build.gradle` | `iceberg 1.10.1` | :27-42 번들 포함 모듈(kms/glue/dynamodb 등), :62-63 relocate 대상 |
 | `S3OutputStream.java` | `iceberg 1.10.1` / `aws/.../s3/` | :183-208 파트 회전, :213-228 staging 파일 생성, `uploadParts()` 비동기 업로드 및 업로드 후 삭제 |
 | `LocalDirsFeatureStep.scala` | `spark 4.0.0` / `resource-managers/kubernetes/` | :39, :60, :84 `spark-local-dir-*` 볼륨 → `SPARK_LOCAL_DIRS`. `java.io.tmpdir`은 건드리지 않음 |
 | `BaseSparkAction.java` | `iceberg 1.10.1` / `spark/v4.0/.../actions/` | :151-170 manifest 병렬 스캔(executor 작업) |
