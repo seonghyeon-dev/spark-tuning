@@ -400,20 +400,64 @@ Iceberg 1.10.1은 **AWS SDK v2 BOM 2.33.0**을 쓴다 ✅ (`gradle/libs.versions
 
 > **PoC의 첫 단계는 이것 하나만 확인하는 것이어야 한다.** 이게 막히면 나머지 계획이 전부 무의미하고, 통과하면 나머지는 대부분 설정 문제다. 확인 방법은 섹션 6.2.
 
-### 4.6 staging 디렉터리와 K8s ephemeral storage ⚠️ 확인 필요
+### 4.6 staging 디렉터리와 K8s 로컬 볼륨 ⚠️ 확인 필요
 
-`S3FileIO`의 쓰기는 로컬에 파트 파일을 만든 뒤 multipart upload로 올린다.
+**`s3.staging-dir`은 "업로드 전 파트 파일을 쌓아두는 로컬 디스크 버퍼"다.** S3FileIO는 파일을 쓸 때 메모리에 다 들고 있다가 한 번에 올리지 않는다. `multiPartSize`(기본 32MB)만큼 로컬 임시 파일에 채우고, 다 차면 다음 파일로 넘어가면서 채워진 파트를 multipart upload로 올린다. ✅ 소스 검증
+
+```java
+// S3OutputStream.java:213-228 (Iceberg 1.10.1)
+private void newStream() throws IOException {
+  ...
+  currentStagingFile = File.createTempFile("s3fileio-", ".tmp", stagingDirectory);
+  ...
+  stagingFiles.add(new FileAndDigest(currentStagingFile, currentPartMessageDigest));
+}
+```
 
 | 프로퍼티 | 기본값 | 의미 |
 |----------|--------|------|
-| `s3.staging-dir` | `java.io.tmpdir` | 파트 파일 임시 경로 |
-| `s3.multipart.part-size-bytes` | 32MB | 파트 크기 |
-| `s3.multipart.threshold` | 1.5 | 이 배수를 넘으면 multipart |
+| `s3.staging-dir` | `java.io.tmpdir` (컨테이너에서는 보통 `/tmp`) | 파트 파일 임시 경로 |
+| `s3.multipart.part-size-bytes` | 32MB | 파트 1개 크기 = 임시 파일 1개 크기 |
+| `s3.multipart.threshold` | 1.5 | 이 배수를 넘으면 multipart 전환 |
 
-S3A도 기본적으로 디스크 버퍼(`fs.s3a.buffer.dir`)를 쓰므로 **성격은 같다.** 다만 경로가 달라지므로:
+**S3A에도 같은 개념이 있다.** `fs.s3a.fast.upload.buffer`의 기본값이 `disk`이고, 그때 쓰는 경로가 `fs.s3a.buffer.dir`다. 즉 **`s3.staging-dir` ≡ `fs.s3a.buffer.dir`**로 보면 된다. 📘
 
-- `fs.s3a.buffer.dir`로 별도 볼륨을 지정해 뒀다면 **`s3.staging-dir`에 같은 경로를 지정**해야 한다
-- 안 그러면 파트 파일이 컨테이너 기본 `/tmp`로 가서 **ephemeral-storage 한도에 걸릴 수 있다.** Compaction executor는 512MB 목표 파일을 쓰므로 무시할 양이 아니다
+#### ⚠️ K8s에서 주의할 점 — 지금 이미 `/tmp`를 쓰고 있을 수 있다
+
+`fs.s3a.buffer.dir`의 기본값은 다음과 같다. ✅ 소스 검증 (`core-default.xml`, Hadoop 3.4.1)
+
+```xml
+<property>
+  <name>fs.s3a.buffer.dir</name>
+  <value>${env.LOCAL_DIRS:-${hadoop.tmp.dir}}/s3a</value>
+  <description>... Yarn container path will be used as default value on yarn applications,
+    otherwise fall back to hadoop.tmp.dir</description>
+</property>
+```
+
+`LOCAL_DIRS`는 **YARN이 넣어주는 환경변수**다. **Kubernetes에는 이 변수가 없다** — Spark on K8s는 `SPARK_LOCAL_DIRS`를 쓴다. 따라서 K8s에서 `fs.s3a.buffer.dir`을 명시하지 않았다면 **`${hadoop.tmp.dir}/s3a` = `/tmp/hadoop-<user>/s3a`로 떨어진다.**
+
+여기서 갈리는 지점이 있다. **Spark의 로컬 디렉터리(`SPARK_LOCAL_DIRS`, shuffle/spill용)와 S3 업로드 버퍼는 서로 다른 설정이다.** hostPath 볼륨을 마운트해 뒀다면 그건 십중팔구 전자이고, 후자는 여전히 컨테이너 `/tmp`를 쓰고 있을 가능성이 높다.
+
+| 용도 | 설정 | 무엇이 쌓이나 |
+|------|------|---------------|
+| shuffle / spill | `spark.local.dir` (K8s에서는 `SPARK_LOCAL_DIRS`, 볼륨 이름 `spark-local-dir-*`로 자동 연결) | shuffle 블록, spill 파일 |
+| S3 업로드 버퍼 (현재) | `fs.s3a.buffer.dir` — **K8s 기본값은 `/tmp/hadoop-<user>/s3a`** | 업로드 대기 중인 파트 파일 |
+| S3 업로드 버퍼 (전환 후) | `s3.staging-dir` — 기본값 `java.io.tmpdir` | 동일 |
+
+**확인할 것** ⚠️:
+1. 현재 `fs.s3a.buffer.dir`을 명시적으로 설정하고 있는가? (없다면 `/tmp` 사용 중)
+2. 마운트한 hostPath의 볼륨 이름이 `spark-local-dir-*`인가? (그렇다면 그건 shuffle용이고 S3 버퍼와 무관)
+3. `/tmp`가 컨테이너 overlay filesystem인가 emptyDir인가? ephemeral-storage limit은 얼마인가?
+
+**권장**: `fs.s3a.buffer.dir`과 `s3.staging-dir`을 **둘 다 마운트한 hostPath 하위 경로로 명시**한다. 전환 여부와 무관하게 지금 해두는 게 맞는 설정이다.
+
+```properties
+spark.hadoop.fs.s3a.buffer.dir=<hostPath 마운트 경로>/s3a          # 지금도 유효
+spark.sql.catalog.<카탈로그>.s3.staging-dir=<hostPath 마운트 경로>/s3fileio   # 전환 시
+```
+
+> 소요량 감각: 파트 파일은 업로드 완료 후 삭제되므로 무한정 쌓이지는 않는다. 다만 executor 1개가 동시에 여는 출력 파일 수 × 32MB만큼이 순간 점유된다. Compaction executor는 512MB 목표 파일을 쓰므로 무시할 양은 아니다.
 
 ### 4.7 읽기/쓰기 성능은 미측정이다 ⚠️
 
@@ -526,6 +570,119 @@ env:
 ```
 
 > **`ResolvingFileIO` 대안**: `io-impl`을 `org.apache.iceberg.io.ResolvingFileIO`로 두면 scheme별로 위임한다(`s3a` → S3FileIO, 그 외 → HadoopFileIO). 나중에 다른 스토리지가 섞일 가능성이 있으면 이쪽이 유연하다. 지금은 전부 `s3a://` 단일이므로 **어느 쪽을 써도 동작은 같다.** 명시성을 위해 `S3FileIO` 직접 지정을 권한다.
+
+### 5.1.1 기존 `fs.s3a.*` 설정 대응표
+
+현재 쓰고 있는 S3A 설정을 어떻게 처리할지 정리한다. **공통 원칙은 "기존 `fs.s3a.*`는 그대로 두고, 필요한 것만 `s3.*`에 추가"**다 (섹션 4.4).
+
+| 기존 설정 | S3FileIO 대응 | 판정 |
+|-----------|---------------|------|
+| `fs.s3a.endpoint` | `s3.endpoint` (스킴 포함) | 이전 |
+| `fs.s3a.path.style.access=true` | `s3.path-style-access=true` | 이전 (기본값이 `false`라 필수) |
+| `fs.s3a.access.key` / `fs.s3a.secret.key` | 환경변수 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` 권장 | 이전 (방식 변경) |
+| `fs.s3a.connection.ssl.enabled=false` | **없음** | **불필요** — `s3.endpoint`에 `http://` 포함으로 해결 |
+| `fs.s3a.aws.credentials.provider=SimpleAWSCredentialsProvider` | **없음** | **불필요** — Iceberg 자체 순서를 따름 |
+| `fs.s3a.acl.default=PublicReadWrite` | `s3.acl=public-read-write` | **옮기지 말 것** — 아래 참조 |
+| `fs.s3a.buffer.dir` | `s3.staging-dir` | 이전 (섹션 4.6) |
+| `fs.s3a.connection.maximum` | `http-client.apache.max-connections` 등 | 필요 시 (기본값으로 시작) |
+
+#### `fs.s3a.connection.ssl.enabled=false`
+
+엔드포인트에 스킴이 없을 때 http/https 중 무엇을 쓸지 정하는 설정이다. ✅ 소스 검증
+
+```java
+// DefaultS3ClientFactory.java:358-371 (Hadoop 3.4.1)
+boolean secureConnections = conf.getBoolean(SECURE_CONNECTIONS, DEFAULT_SECURE_CONNECTIONS);
+String protocol = secureConnections ? "https" : "http";
+...
+if (!endpoint.contains("://")) {        // ← 스킴이 이미 있으면 그대로 사용
+  endpoint = String.format("%s://%s", protocol, endpoint);
+}
+```
+
+즉 `fs.s3a.endpoint`를 `minio:9000`처럼 스킴 없이 적었기 때문에 필요했던 설정이다. S3FileIO에는 대응 프로퍼티가 없고 필요도 없다 — **`s3.endpoint=http://minio:9000`으로 끝난다.**
+
+#### `fs.s3a.aws.credentials.provider=SimpleAWSCredentialsProvider`
+
+S3A가 자격증명을 어디서 읽을지 고정하는 설정이다. `SimpleAWSCredentialsProvider`는 `fs.s3a.access.key` / `fs.s3a.secret.key`**만** 보며, 환경변수·IAM role·EC2 메타데이터는 보지 않는다. 기본값이 여러 provider의 체인이라, 명시하면 "설정에 적힌 키만 쓴다"로 못박고 불필요한 메타데이터 조회도 없앤다.
+
+**S3FileIO에는 1:1 대응을 만들 필요가 없다.** Iceberg가 자체 순서를 따른다. ✅ 소스 검증 (`AwsClientProperties.java:211-235`)
+
+| 순위 | 조건 | 결과 |
+|------|------|------|
+| 1 | `s3.access-key-id` + `s3.secret-access-key` 존재 | `StaticCredentialsProvider` (= SimpleAWSCredentialsProvider와 동등) |
+| 2 | `client.credentials-provider` 지정 | 해당 클래스를 동적 로드 |
+| 3 | 아무것도 없음 | `DefaultCredentialsProvider` (환경변수 → 시스템 프로퍼티 → 프로파일 → 컨테이너/IMDS) |
+
+**권장은 3번 경로**다. K8s Secret → 환경변수만 주고 Iceberg 쪽 설정은 비워두면 체인 첫 단계에서 잡히므로 IMDS 조회 같은 건 발생하지 않는다.
+
+> **함정**: `SimpleAWSCredentialsProvider`를 `client.credentials-provider`에 그대로 넣으면 안 된다. 그것은 **Hadoop 클래스**이고, Iceberg는 SDK v2의 `AwsCredentialsProvider` 구현을 요구한다 (`AwsClientProperties.java:285-291`에서 타입 검사 후 예외).
+
+#### `fs.s3a.acl.default=PublicReadWrite` ⚠️ 보안 재검토 대상
+
+S3A가 객체 생성 시 붙이는 **canned ACL**이다. `PublicReadWrite`는 canned ACL 중 가장 개방적인 값으로, **익명 사용자에게 읽기와 쓰기를 모두 허용**한다. 실제 AWS S3였다면 심각한 노출이다.
+
+지금 문제가 되지 않는 이유는 **MinIO가 S3 ACL을 사실상 지원하지 않기** 때문일 가능성이 높다. MinIO는 접근 제어를 IAM/버킷 정책으로 하며 ACL 헤더는 무시하거나 제한적으로만 처리한다. 즉 **이 설정이 현재 아무 효과도 내지 못하고 있을 공산이 크다.** ⚠️ 우리 MinIO에서 확인 필요
+
+**전환 시 권장: 옮기지 말고 제거를 검토한다.** Iceberg는 `s3.acl`이 없으면 ACL 헤더를 붙이지 않는다 ✅ (`S3FileIOProperties.java:215-216` — "If not set, ACL will not be set for requests"). 제거 후 문제가 생긴다면(다른 시스템이 익명 접근으로 읽고 있었다면) 그때 추가한다. 애초에 왜 설정됐는지 히스토리 확인을 권한다.
+
+굳이 옮긴다면 **표기법이 다르다.** Iceberg는 SDK v2 enum value를 요구한다 ✅ (`S3FileIOProperties.java:638-641`).
+
+```properties
+# ❌ s3.acl=PublicReadWrite   → ObjectCannedACL.fromValue()가 UNKNOWN_TO_SDK_VERSION을 리턴
+#                               → Preconditions 검증 실패로 예외
+# ✅ s3.acl=public-read-write
+```
+
+#### `client.region`은 실질적으로 필수다
+
+표기에 주의한다. `s3.` 접두어가 아니라 **`client.region`**이다 (`spark.sql.catalog.<카탈로그>.client.region`).
+
+Iceberg 프로퍼티로서는 선택이지만, region 자체는 어딘가에서 반드시 해결되어야 한다. ✅ 소스 검증
+
+```java
+// AwsClientProperties.java:145-149
+void applyClientRegionConfiguration(BuilderT builder) {
+  if (clientRegion != null) {        // ← 없으면 아예 설정하지 않는다
+    builder.region(Region.of(clientRegion));
+  }
+}
+```
+
+주지 않으면 SDK 기본 region 체인(`AWS_REGION` → `aws.region` → `~/.aws/config` → 컨테이너/EC2 메타데이터)이 돌고, **전부 실패하면 클라이언트 생성 시점에 `SdkClientException: Unable to load region from any of the providers in the chain`으로 죽는다.** K8s Pod에는 저 중 아무것도 없으므로 `client.region` 또는 `AWS_REGION` 중 **하나는 반드시 줘야 한다.**
+
+**S3A에서는 왜 필요 없었나** — S3A가 대신 채워주고 있었다. ✅ 소스 검증
+
+```
+// DefaultS3ClientFactory.java:258-263 (Hadoop 3.4.1, 주석)
+ * If region is configured via fs.s3a.endpoint.region, use it.
+ * If no region is configured, try to parse region from endpoint.
+ * If no region is configured, and it could not be parsed from the endpoint,
+ *     set the default region as US_EAST_2 and enable cross region access.
+```
+
+값 자체는 무엇이든 상관없다(MinIO는 검증하지 않고 서명 계산에만 쓴다). 관례상 `us-east-1`. ⚠️ 단 MinIO에 `MINIO_SITE_REGION`(구 `MINIO_REGION`)이 설정돼 있다면 **그 값과 맞춰야** 서명 불일치를 피한다.
+
+### 5.1.2 리소스 산정 — driver 중심으로 잡는다
+
+maintenance Job에서 **executor와 driver의 역할이 다르다.** ✅ 소스 검증
+
+| 단계 | 실행 위치 | 근거 |
+|------|-----------|------|
+| 삭제 대상 산출 (manifest 스캔 + anti-join) | **executor** (분산) | `BaseSparkAction.java:151-170` — manifest 목록을 `repartition` 후 `flatMap(new ReadManifest(...))`로 병렬 읽기 |
+| 실제 삭제 요청 | **driver 단독** | `ExpireSnapshotsSparkAction.java:222-228` — `collectAsList()` / `toLocalIterator()` 후 driver JVM |
+
+따라서:
+
+- **executor는 0으로 둘 수 없다.** manifest 스캔이 실제 Spark Job이므로 executor가 없으면 진행되지 않는다. 다만 **읽는 것이 데이터 파일이 아니라 manifest**이므로, Compaction처럼 데이터 양에 비례해 키울 필요는 없다. 적게 잡는 것이 맞다
+- **driver가 병목이다.** 삭제 요청이 전부 driver에서 나가고, `s3.delete.num-threads`의 기본값이 `Runtime.getRuntime().availableProcessors()` = **driver의 cgroup CPU limit**이다 ✅ (`S3FileIOProperties.java:657-659`). driver cpu가 1이면 스레드도 1개다
+- `stream-results` 옵션(기본 `false` ✅ `ExpireSnapshotsSparkAction.java:68-69`)을 `true`로 주면 `collectAsList()` 대신 `toLocalIterator()`를 써서 driver 메모리 부담이 준다. 삭제 대상이 매우 많을 때 검토
+
+| 설정 | 권장 방향 |
+|------|-----------|
+| `num-executors` | 낮게. manifest 스캔량 기준 (⚠️ 현재 값 확인 후 축소 여지 판단) |
+| `driver cpu` | **2 이상.** `s3.delete.num-threads` 기본값의 근거이자 삭제 병렬도의 실질 상한 |
+| `s3.delete.num-threads` | 8 (driver cpu와 분리해 명시적으로 지정) |
 
 ### 5.2 Phase 1 — maintenance Job에만 적용 (권장 시작점)
 
@@ -662,7 +819,10 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | **읽기/쓰기 성능 영향** | Compaction `dcu/GB` A/B (섹션 5.3). 노이즈 기준선 ±15% | 높음 |
 | **`s3.delete.num-threads` 적정값** | 기본값(driver 코어 수)은 너무 작다. 8로 시작하되 MinIO 순간 부하를 보며 조정 | 중간 |
 | **`remove_orphan_files`의 `prefix_listing => true`** | LIST 요청을 추가로 크게 줄일 수 있으나, 기존 S3A 디렉터리 마커 오탐 위험 검증 필요 (섹션 2.2, 4.8) | 중간 |
-| **`s3.staging-dir`와 ephemeral-storage** | 현재 `fs.s3a.buffer.dir` 설정값 확인 후 동일하게 맞출 것 (섹션 4.6) | 중간 |
+| **`fs.s3a.acl.default=PublicReadWrite`의 실제 효력** | MinIO에서 ACL이 무시되는지 확인. 무시된다면 전환과 무관하게 제거 대상이고, 효력이 있다면 익명 읽기/쓰기가 열려 있다는 뜻이라 더 시급하다 (섹션 5.1.1) | **높음(보안)** |
+| **`fs.s3a.buffer.dir` 현재 경로** | K8s에는 `LOCAL_DIRS`가 없어 기본값이 `/tmp/hadoop-<user>/s3a`로 떨어진다. 마운트한 hostPath와 다른 경로일 가능성이 높다 (섹션 4.6) | 중간 |
+| **`s3.staging-dir`와 ephemeral-storage** | 위 확인 후 `fs.s3a.buffer.dir`과 동일 볼륨으로 맞출 것 (섹션 4.6) | 중간 |
+| **maintenance Job의 executor 수** | 삭제는 driver에서만 일어나므로 executor는 manifest 스캔량 기준으로 축소 여지가 있다. driver cpu는 반대로 올릴 것 (섹션 5.1.2) | 중간 |
 | **Spark 4.1.1 ↔ iceberg-spark-runtime 4.0 조합** | 현재 어떤 runtime jar를 쓰는지 확인하고 `iceberg-aws-bundle` 버전을 정확히 맞출 것 | 중간 |
 | **maintenance 스케줄 재조정** | expire duration이 줄면 `reprocessing-dag-design.md` §6.2의 슬롯에 여유가 생긴다. 재배치 재검토 가능 | 낮음 (전환 후) |
 | **daily maintenance DAG 통합** | 기존 후속 과제. FileIO 전환과 함께 하면 측정을 한 번에 끝낼 수 있다 | 낮음 |
@@ -687,6 +847,11 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | `DeleteOrphanFilesSparkAction.java` | `iceberg 1.10.1` / `spark/v4.0/.../actions/` | :255-272 동일 삭제 분기, :308-330 listing 분기 |
 | `S3AFileSystem.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/` | :3581-3606 delete 흐름, :3624-3648 마커 생성 |
 | `BulkDeleteOperation.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/.../impl/` | S3A의 bulk delete API 존재 확인 |
+| `AwsClientProperties.java` | `iceberg 1.10.1` / `aws/.../aws/` | :145-149 region 미설정 시 동작, :211-235 자격증명 결정 순서 |
+| `S3OutputStream.java` | `iceberg 1.10.1` / `aws/.../s3/` | :213-228 staging 파트 파일 생성 |
+| `BaseSparkAction.java` | `iceberg 1.10.1` / `spark/v4.0/.../actions/` | :151-170 manifest 병렬 스캔(executor 작업) |
+| `DefaultS3ClientFactory.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/` | :258-263 region 폴백(US_EAST_2), :358-371 ssl.enabled |
+| `core-default.xml` | `hadoop 3.4.1` / `hadoop-common/` | `fs.s3a.buffer.dir` 기본값, `fs.s3a.fast.upload.buffer=disk` |
 | `gradle/libs.versions.toml` | `iceberg 1.10.1` | `awssdk-bom = 2.33.0`, `hadoop3 = 3.4.1` |
 
 ### 공식 문서
