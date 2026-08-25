@@ -145,7 +145,9 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **`s3.staging-dir`은 업로드 전 파트 파일 로컬 버퍼** = `fs.s3a.buffer.dir`과 동일 개념. **명시하지 않는 것이 현상 유지다** — 마운트한 hostPath는 `spark-local-dir-1`(shuffle 전용)이고, `LocalDirsFeatureStep`이 `java.io.tmpdir`을 건드리지 않아 현재 `fs.s3a.buffer.dir`(`/tmp/hadoop-<user>/s3a`)도 전환 후 `s3.staging-dir`(`/tmp`)도 둘 다 `/tmp`다. **Phase 1(maintenance)은 데이터 파일을 안 쓰므로 아예 무관**
 - **multipart 기본값이 S3A와 다르다** (§5.1.3): S3A `multipart.size=64M`/`threshold=128M` vs Iceberg `part-size-bytes=32MB`/`threshold=1.5`(→48MB). Phase 2 진입 시 **`s3.multipart.part-size-bytes=67108864`로 맞추는 것이 현상 유지**. 파트는 32MB 채워질 때마다 비동기 업로드되고 완료 즉시 삭제되므로 디스크 점유는 `동시 파트 수 × 파트 크기`
 - **maintenance Job 리소스** (현재 driver 1core/1g, executor 4core/4g×4): manifest 스캔은 executor 분산, **삭제는 driver 단독**. **executor 0은 불가**. **driver cores는 1로 둬도 된다** — 삭제는 IO bound라 `s3.delete.num-threads`만 명시하면 충분(전환 후 삭제는 10초 안쪽). executor 축소는 **전환과 동시에 하지 말 것**(A/B 교란). **driver 삭제 구간은 Spark UI에 stage로 안 잡힌다** — `Job duration − stage 합계`가 삭제 시간
-- **⚠️ `availableProcessors()` 함정**: `driver cores=1`은 K8s **request**라 `coreLimit` 미설정 시 JVM이 노드 전체 코어를 본다. 그러면 현재 `iceberg.hadoop.delete-file-parallelism`(= `코어×4`)이 100+ 스레드가 되어 **MinIO 부하 급증의 원인 후보**다. `limits.cpu` 확인 필요
+- **⚠️ `availableProcessors()` 함정 (확인 완료)**: `driver cores=1`은 K8s **request**라 `coreLimit` 미설정 시 JVM이 노드 전체 코어를 본다. **Compaction은 `coreLimit=1`이 설정돼 있으나 expire snapshots는 미설정** — `iceberg.hadoop.delete-file-parallelism`(= `코어×4`)이 100+ 스레드가 되어 **MinIO 부하 급증의 원인 후보**다. `coreLimit=1` 적용 예정
+- **⚠️ 계측 순서**: `coreLimit=1`만 넣어도 삭제 스레드가 128→4로 줄어 MinIO 순간 RPS가 크게 바뀐다(총 요청 수는 동일, duration은 오히려 증가). **baseline 계측을 `coreLimit` 변경보다 먼저** 해야 전환 효과가 과소평가되지 않는다. `coreLimit=1` 이후에는 `s3.delete.num-threads` 기본값이 1이 되므로 명시가 더 중요해진다
+- **결정 사항**: `s3.staging-dir` 미명시(현상 유지), `s3.multipart.part-size-bytes` 미명시(기본 32MB로 테스트 후 판단), `coreLimit=1` 적용
 - **미확인**: 실제 삭제 파일 수(추정치 사용), 읽기/쓰기 성능 영향(`dcu/GB` A/B 필요, 노이즈 기준선 ±15%), `fs.s3a.acl.default`의 MinIO 실제 효력, driver Pod `limits.cpu` 유무
 
 ## 파일 구조

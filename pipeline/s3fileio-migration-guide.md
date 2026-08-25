@@ -694,7 +694,31 @@ maintenance Job에서 **executor와 driver의 역할이 다르다.** ✅ 소스 
 >
 > 그렇다면 현재 `iceberg.hadoop.delete-file-parallelism`의 기본값(`availableProcessors × 4`)이 노드 코어가 32일 때 **128 스레드**가 된다. 각 스레드가 파일 1개씩, 요청 3개씩 쏘고 있다는 뜻이다. **관측된 MinIO 부하 급증의 원인 중 하나일 수 있다.** ⚠️ driver Pod spec의 `limits.cpu` 유무를 확인할 것
 >
+> **현재 상태 (확인 완료)**: Compaction Job은 `coreLimit`을 `cores`와 동일하게 1로 지정해 뒀으나, **expire snapshots Job에는 지정되어 있지 않다.** 즉 expire의 driver JVM은 노드 전체 코어를 보고 있고, 삭제 스레드가 `노드 코어 × 4`로 생성된다. **두 Job의 MinIO 부하 성격이 다른 이유가 여기 있을 수 있다.**
+>
 > 어느 쪽이든 결론은 같다 — **`s3.delete.num-threads`는 기본값에 맡기지 말고 명시한다.**
+
+#### ⚠️ `coreLimit` 적용 순서 — baseline 계측 전에 바꾸지 말 것
+
+expire Job에 `coreLimit=1`을 넣는 것은 맞는 방향이지만, **그 자체가 삭제 동작을 크게 바꾸는 변경**이다.
+
+| 상태 | `availableProcessors()` | `iceberg.hadoop.delete-file-parallelism` (기본 `×4`) |
+|------|------------------------|----------------------------------------------------|
+| 현재 (`coreLimit` 미설정) | 노드 전체 코어 (예: 32) | **128 스레드** |
+| `coreLimit=1` 적용 후 | 1 | **4 스레드** |
+
+즉 `coreLimit=1`만 넣어도 MinIO의 **순간 요청률(RPS)이 크게 떨어진다.** 총 요청 수는 그대로이므로 expire duration은 오히려 늘어난다.
+
+**따라서 계측 순서를 다음 중 하나로 고정한다:**
+
+| 방식 | 순서 | 얻는 것 |
+|------|------|---------|
+| **A. 분리 측정 (권장)** | ① 현재 상태 baseline 계측 → ② `coreLimit=1` 적용 후 1회 계측 → ③ S3FileIO 전환 후 계측 | 데이터 포인트 3개. "부하의 몇 %가 스레드 폭주 탓이었나"를 분리해서 답할 수 있다 |
+| **B. 일괄 적용** | ① 현재 상태 baseline 계측 → ② `coreLimit=1` + S3FileIO 동시 적용 후 계측 | 빠르지만 두 효과가 섞인다. 최종 결과만 필요하면 충분 |
+
+**어느 쪽이든 baseline 계측은 `coreLimit` 변경 전에 해야 한다.** 바꾼 뒤에 재면 "전환 전" 숫자가 이미 개선된 값이라 전환 효과가 과소평가된다.
+
+> **`coreLimit=1` 적용 후에는 `s3.delete.num-threads` 명시가 더 중요해진다.** `availableProcessors()`가 1이 되므로 기본값도 1이다 — `DeleteObjects` 40건을 순차로 보내게 된다. 8로 지정하면 5라운드로 끝난다.
 
 #### executor 수는 전환 후에 조정한다
 
@@ -894,7 +918,7 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | **`s3.delete.num-threads` 적정값** | 기본값(driver 코어 수)은 너무 작다. 8로 시작하되 MinIO 순간 부하를 보며 조정 | 중간 |
 | **`remove_orphan_files`의 `prefix_listing => true`** | LIST 요청을 추가로 크게 줄일 수 있으나, 기존 S3A 디렉터리 마커 오탐 위험 검증 필요 (섹션 2.2, 4.8) | 중간 |
 | **`fs.s3a.acl.default=PublicReadWrite`의 실제 효력** | MinIO에서 ACL이 무시되는지 확인. 무시된다면 전환과 무관하게 제거 대상이고, 효력이 있다면 익명 읽기/쓰기가 열려 있다는 뜻이라 더 시급하다 (섹션 5.1.1) | **높음(보안)** |
-| **driver Pod의 `limits.cpu` 설정 여부** | 없다면 `availableProcessors()`가 노드 전체 코어를 반환해 현재 삭제 스레드가 예상보다 훨씬 많을 수 있다 — MinIO 부하 급증의 원인 후보 (섹션 5.1.2) | 높음 |
+| ~~driver Pod의 `limits.cpu` 설정 여부~~ | ✅ 확인 완료 — Compaction은 `coreLimit=1`, **expire snapshots는 미설정**(노드 코어 × 4 = 삭제 스레드). `coreLimit=1` 적용 예정이나 **baseline 계측 후에** 적용할 것 (섹션 5.1.2) | 완료 |
 | **maintenance Job의 executor 수** | 삭제는 driver에서만 일어나므로 축소 여지가 있으나, **전환과 동시에 바꾸면 A/B 판정이 불가능하다.** 전환 후 Spark UI로 stage 구간을 보고 조정 (섹션 5.1.2) | 중간 (전환 후) |
 | **`/tmp`의 성격과 ephemeral-storage limit** | Phase 1에는 무관(데이터 파일을 쓰지 않음). Phase 2/3 진입 전 확인 (섹션 4.6) | 중간 (Phase 2 전) |
 | **`s3.multipart.part-size-bytes` 조정 효과** | 64MB로 맞추면 S3A 현재 동작과 동일해진다. 그 이상은 A/B 필요 (섹션 5.1.3) | 낮음 (Phase 2) |
