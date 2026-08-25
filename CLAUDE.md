@@ -125,6 +125,24 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - 현재 데이터(36~42GB)에서 산정값이 12~14로 좁아 **정적 12로 운영하며 동적화를 미루는 선택도 가능**. `C=0.32`은 hourly 전용 — daily는 별도 측정 필요
 - **후속 과제**: **daily Compaction의 `rewrite-all` 낭비 의심** — hourly가 정리한 뒤라 no-op이어야 하는데 888GB에 30~60분(데이터 양에 선형). daily 단계 최우선 확인 항목
 
+## 작업 6: FileIO 전환 (S3AFileSystem → S3FileIO) — 분석 완료, 적용 대기
+
+- **산출물**: `pipeline/s3fileio-migration-guide.md`
+- **상태**: 원인 검증 완료(Iceberg 1.10.1 / Hadoop 3.4.1 소스 기준), 전환 절차 설계 완료. **MinIO checksum 호환성 확인이 게이트**
+- **배경**: 1일 배치 삭제 후 `expire_snapshots`가 MinIO에 과도한 `listObject`/`deleteObject`를 발생시켜 부하 유발
+- **핵심 발견**:
+  - **`HadoopFileIO`의 bulk delete는 가짜다.** `SupportsBulkOperations`를 구현해 Iceberg는 bulk 분기를 타지만, 내부 `deleteFiles()`가 `Tasks.foreach(...).run(this::deleteFile)`로 단건 삭제를 흩뿌린다 → `DeleteObjects` 요청이 0건
+  - **S3A는 파일 1개 삭제에 요청 3개를 쓴다.** `HeadObject` + `DeleteObject` + 부모 디렉터리 확인용 `ListObjectsV2`(+ 조건부 마커 `PutObject`). **관측된 listObject의 정체가 이것** — 삭제와 무관한, 디렉터리 시맨틱 흉내용 요청이다
+  - **삭제는 driver 단일 지점에서 나간다** (`collectAsList()` 후 driver JVM). 요청은 많은데 동시성은 driver 코어에 묶여 낮다
+  - S3FileIO 전환 시 **요청 수 −99.6%** (250개당 `DeleteObjects` 1건, `s3.delete.batch-size` 최대 1000)
+  - **`max_concurrent_deletes`는 이미 무시되고 있다** — `HadoopFileIO`가 `SupportsBulkOperations`라고 자기 신고하는 탓에 WARN만 남기고 버려진다
+  - **기존 `s3a://` 경로는 그대로 동작한다.** `S3URI`가 scheme을 검증하지 않는다(소스 확인) → **메타데이터 rewrite·테이블 재생성 불필요, 설정 제거만으로 롤백**
+  - `remove_orphan_files`도 동일한 삭제 분기를 쓰므로 같이 개선된다. `prefix_listing => true`는 추가 옵션이나 **기존 S3A 디렉터리 마커 오탐 위험**이 있어 별도 검증 후 도입
+- **최대 위험**: **AWS SDK v2 BOM 2.33.0의 checksum 기본 활성화 ↔ MinIO 버전 궁합**. 구버전 MinIO는 `501`/`XAmzContentChecksumMismatch`로 거부한다. MinIO 업그레이드 또는 `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`로 대응
+- **주의**: `S3FileIO`는 `fs.s3a.*`를 읽지 않는다. **원천 avro 읽기·경로 목록 파일은 여전히 S3A**이므로 `fs.s3a.*`와 `s3.*` 설정이 **공존**해야 한다
+- **전환 순서**: maintenance Job(expire/orphan) → Compaction → append. FileIO는 세션 단위 설정이라 Job별 혼용이 안전하다(같은 테이블도 무방). **append는 삭제가 거의 없어 이득이 없으므로 S3A로 남겨도 된다**
+- **미확인**: 실제 삭제 파일 수(추정치 사용), 읽기/쓰기 성능 영향(`dcu/GB` A/B 필요, 노이즈 기준선 ±15%), `s3.staging-dir`와 ephemeral-storage
+
 ## 파일 구조
 
 ```
@@ -139,6 +157,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 │   ├── spark-query-metrics-guide.md    # Spark 쿼리 메트릭 가이드
 │   └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
 └── pipeline/
+    ├── s3fileio-migration-guide.md      # FileIO 전환 가이드 (S3A → S3FileIO)
     ├── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
     ├── reprocess-flow.md               # 재처리 DAG 처리 흐름 (보고용 요약)
     ├── compaction-executor-sizing-design.md  # Compaction executor 동적 산정 설계
