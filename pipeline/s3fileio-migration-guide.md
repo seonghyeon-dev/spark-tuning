@@ -7,7 +7,7 @@
 | 작성 목적 | expire_snapshots의 MinIO 부하 원인 검증 및 S3FileIO 전환 타당성/절차 정리 |
 | 대상 독자 | 데이터 엔지니어, 운영팀, 스토리지 담당자 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Iceberg 1.10.1(카탈로그: HMS), Airflow 3.2.2 |
-| ⚠️ Spark 런타임 | **실측: Spark 3.5 / Scala 2.12 / Hadoop 3.3.4** (driver Pod의 jar 기준, 섹션 5.0.2). 기존 문서의 "Spark 4.1.1"과 불일치 — 확인 필요 |
+| ⚠️ Spark 런타임 | **실측: Spark 3.5.8 / Scala 2.12 / Hadoop 3.3.4** (driver Pod의 jar 기준, 섹션 5.0.2). Spark 4에서 maintenance 함수 오류로 **임시 다운그레이드 중**이며 추후 Spark 4로 복귀 예정 |
 | 검증 기준 | Apache Iceberg `apache-iceberg-1.10.1` 태그 소스(**`spark/v3.5`·`spark/v4.0` 모듈 동일 로직 확인**), Apache Hadoop `rel/release-3.3.4`·`rel/release-3.4.1` 소스 |
 | 최종 수정일 | 2026-08-24 |
 
@@ -686,7 +686,94 @@ Hadoop 쪽도 삭제 경로가 같다. ✅ (`S3AFileSystem.java` 3.3.4 기준 :3
 | `buffer.dir` | `${hadoop.tmp.dir}/s3a` | `${env.LOCAL_DIRS:-${hadoop.tmp.dir}}/s3a` | K8s엔 `LOCAL_DIRS`가 없으므로 **결과 경로 동일** (`/tmp/hadoop-<user>/s3a`) |
 | `fast.upload.buffer` | disk | disk | 동일 |
 
-> **다만 문서의 스택 기재는 정리가 필요하다.** Spark 4.1.1이 다른 Job/다른 환경의 값인지, 계획값이었는지, 단순 오기인지 확인해서 맞춰야 한다. 이 문서는 실측 기준(Spark 3.5 / Hadoop 3.3.4)으로 작성되어 있다.
+> **배경 (확인됨)**: Spark 4에서 Scala 코드로 maintenance 함수를 실행할 때 오류가 발생해 **Spark 3.5.8로 임시 다운그레이드**한 상태다. 추후 해결되면 Spark 4로 복귀할 예정이다. 따라서 다른 문서들의 "Spark 4.1.1" 기재는 **목표 버전이지 현재 운영 버전이 아니다** — 구분해서 표기할 필요가 있다. Spark 4 복귀 시 jar 변경 사항은 섹션 5.0.3 말미를 참조한다.
+
+### 5.0.3 jar 배치 — 이미지의 `$SPARK_HOME/jars`에 넣는다
+
+#### 필요한 라이브러리는 하나뿐이다
+
+| 항목 | 값 |
+|------|-----|
+| artifact | `org.apache.iceberg:iceberg-aws-bundle:1.10.1` |
+| 파일명 | `iceberg-aws-bundle-1.10.1.jar` |
+| 크기 | **약 60MB** (62,673,230 bytes) ✅ Maven Central 확인 |
+| Scala 접미사 | **없음** — `_2.12` / `_2.13` 구분이 존재하지 않는다 |
+| Spark 버전 의존성 | **없음** — Spark 3.5든 4.0이든 동일한 jar |
+| 맞춰야 할 것 | **Iceberg 버전만** (`iceberg-spark-runtime`과 동일하게 1.10.1) |
+
+#### 결론: 이미지 빌드 시 `$SPARK_HOME/jars/`에 넣는다
+
+```dockerfile
+# 예시
+ARG ICEBERG_VERSION=1.10.1
+RUN curl -fsSL -o $SPARK_HOME/jars/iceberg-aws-bundle-${ICEBERG_VERSION}.jar \
+    https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar
+```
+
+기존 jar는 **그대로 둔다.**
+
+```
+$SPARK_HOME/jars/
+├── aws-java-sdk-bundle-1.12.262.jar          # 유지 — S3A(원천 avro 읽기)가 쓴다
+├── iceberg-spark-runtime-3.5_2.12-1.10.1.jar # 유지
+└── iceberg-aws-bundle-1.10.1.jar             # ★ 추가
+```
+
+#### 왜 `pom.xml`이 아닌가
+
+| 방식 | 판정 | 이유 |
+|------|------|------|
+| **이미지 `$SPARK_HOME/jars/`** | ✅ **권장** | system classpath라 **driver·executor 양쪽에 자동으로** 올라간다. `iceberg-spark-runtime`이 이미 이 방식이므로 구성이 일관된다 |
+| `pom.xml` + fat jar (shade) | ❌ | ① 60MB가 **매 submit마다 전송**된다 ② `iceberg-aws-bundle`은 이미 `org.apache.http`/`io.netty`를 relocate한 jar인데, maven-shade가 이를 **다시 재배치하면 relocation이 깨질 수 있다** ③ `iceberg-spark-runtime`에 이미 들어 있는 `iceberg-aws` 클래스와 **중복**된다 |
+| `--packages` / `spark.jars.packages` | ❌ | driver·executor가 **매 실행마다 Maven 저장소에 접근**해야 한다. K8s 폐쇄망·재현성·기동 시간 모두 불리하다 |
+| `--jars` / `spark.jars` | △ | 동작은 하지만 user classloader로 올라가 `userClassPathFirst` 등과 얽힌다. 상시 필요한 라이브러리를 매번 붙일 이유가 없다 |
+
+#### `pom.xml`에는 무엇을 넣나 — 아마 아무것도 필요 없다
+
+maintenance Job이 SQL 프로시저만 호출한다면(`CALL <카탈로그>.system.expire_snapshots(...)`), **애플리케이션 코드는 `org.apache.iceberg.aws.*`를 전혀 참조하지 않는다.** 컴파일 의존성이 없으므로 pom에 추가할 것이 없다. 순수하게 **런타임 classpath** 문제다.
+
+코드에서 `S3FileIO`나 `AwsProperties`를 직접 import하는 경우에만 pom에 넣되, **반드시 `provided`로 한다** (런타임 jar는 이미지가 제공하므로 패키징에 포함시키지 않는다).
+
+```xml
+<!-- 코드에서 직접 참조할 때만. 대부분은 불필요하다 -->
+<dependency>
+  <groupId>org.apache.iceberg</groupId>
+  <artifactId>iceberg-aws-bundle</artifactId>
+  <version>1.10.1</version>
+  <scope>provided</scope>
+</dependency>
+```
+
+#### 배치 후 검증
+
+```bash
+# 1) jar가 올라갔는지
+kubectl exec <driver-pod> -- ls -la $SPARK_HOME/jars/ | grep iceberg
+
+# 2) SDK v2 클래스가 실제로 로드 가능한지 (숫자가 나오면 정상)
+kubectl exec <driver-pod> -- sh -c \
+  'unzip -l $SPARK_HOME/jars/iceberg-aws-bundle-1.10.1.jar | grep -c "software/amazon/awssdk/services/kms/"'
+
+# 3) v1도 그대로 있는지 (S3A용)
+kubectl exec <driver-pod> -- sh -c \
+  'unzip -l $SPARK_HOME/jars/aws-java-sdk-bundle-1.12.262.jar | grep -c "com/amazonaws/services/s3/"'
+```
+
+#### Spark 4 업그레이드 시 무엇이 바뀌나
+
+**`iceberg-aws-bundle`은 바꿀 필요가 없다.** Spark/Scala와 무관한 artifact이기 때문이다.
+
+| jar | Spark 3.5 (현재) | Spark 4.0 |
+|-----|------------------|-----------|
+| `iceberg-spark-runtime` | `-3.5_2.12-1.10.1` | **`-4.0_2.13-1.10.1`로 교체** |
+| `iceberg-aws-bundle` | `-1.10.1` | **동일 (그대로)** |
+| `aws-java-sdk-bundle` (S3A) | v1 `1.12.262` (Hadoop 3.3.4) | Spark 4는 Hadoop 3.4.x → **`software.amazon.awssdk:bundle`(v2)로 바뀐다**. 이때는 S3A와 S3FileIO가 같은 SDK v2를 쓰게 되므로 **버전 정합성 확인 필요** ⚠️ |
+
+> ⚠️ **Spark 4 전환 시 참고 — Iceberg 1.10.1은 Spark 4.1을 지원하지 않는다.** ✅ 확인
+>
+> Iceberg 1.10.1의 Spark 모듈은 `spark/v3.4`, `spark/v3.5`, `spark/v4.0` 세 개뿐이며 `spark/v4.1`은 존재하지 않는다(빌드 대상 버전: `spark34=3.4.4`, `spark35=3.5.6`, `spark40=4.0.0`).
+>
+> 즉 **Spark 4.1.1 + `iceberg-spark-runtime-4.0_2.13`은 지원 조합이 아니다.** maintenance 함수 실행 시 발생했던 에러의 원인일 가능성이 있다. Iceberg 버전업을 기다리기보다 **Spark 4.0.x로 맞춰 재시도**해보는 것이 더 빠른 경로일 수 있다. (⚠️ 가설 — 당시 에러 메시지 확인 필요)
 
 ### 5.1 설정 값
 
@@ -1092,7 +1179,8 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | ~~driver Pod의 `limits.cpu` 설정 여부~~ | ✅ 확인 완료 — Compaction은 `coreLimit=1`, **expire snapshots는 미설정**(노드 코어 × 4 = 삭제 스레드). `coreLimit=1` 적용 예정이나 **baseline 계측 후에** 적용할 것 (섹션 5.1.2) | 완료 |
 | **maintenance Job의 executor 수** | 삭제는 driver에서만 일어나므로 축소 여지가 있으나, **전환과 동시에 바꾸면 A/B 판정이 불가능하다.** 전환 후 Spark UI로 stage 구간을 보고 조정 (섹션 5.1.2) | 중간 (전환 후) |
 | **`/tmp`의 성격과 ephemeral-storage limit** | Phase 1에는 무관(데이터 파일을 쓰지 않음). Phase 2/3 진입 전 확인 (섹션 4.6) | 중간 (Phase 2 전) |
-| **Spark 런타임 버전 불일치** | driver Pod의 jar는 `iceberg-spark-runtime-3.5_2.12`(Spark 3.5/Scala 2.12)인데 문서는 Spark 4.1.1로 기재되어 있다. 전환에는 영향 없음(로직 동일 확인)이나 **다른 문서들의 스택 기재를 정리해야 한다** (섹션 5.0.2) | **높음(문서 정합성)** |
+| **다른 문서의 Spark 버전 기재** | 현재 운영은 **Spark 3.5.8**(임시), 목표가 4.x다. 다른 가이드들이 4.1.1을 현재 값처럼 적고 있어 구분 표기가 필요하다 (섹션 5.0.2) | 중간(문서 정합성) |
+| **Spark 4 복귀 시 조합** | Iceberg 1.10.1은 **Spark 4.1 미지원**(`spark/v4.0`까지만 존재). 당시 maintenance 함수 오류가 이 때문인지 확인하고, Spark 4.0.x 재시도를 검토 (섹션 5.0.3) | 중간(후속) |
 | **`s3.multipart.part-size-bytes` 조정 효과** | 64MB로 맞추면 S3A 현재 동작과 동일해진다. 그 이상은 A/B 필요 (섹션 5.1.3) | 낮음 (Phase 2) |
 | **Spark 4.1.1 ↔ iceberg-spark-runtime 4.0 조합** | 현재 어떤 runtime jar를 쓰는지 확인하고 `iceberg-aws-bundle` 버전을 정확히 맞출 것 | 중간 |
 | **maintenance 스케줄 재조정** | expire duration이 줄면 `reprocessing-dag-design.md` §6.2의 슬롯에 여유가 생긴다. 재배치 재검토 가능 | 낮음 (전환 후) |
