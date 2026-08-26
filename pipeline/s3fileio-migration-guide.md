@@ -30,6 +30,7 @@
 - [6. 검증 방법](#6-검증-방법)
 - [7. 미확인 사항 및 후속 과제](#7-미확인-사항-및-후속-과제)
 - [8. 참고 자료](#8-참고-자료)
+- [9. 부록 — Iceberg 1.11.0 / Spark 4.1 업그레이드 검토](#9-부록--iceberg-1110--spark-41-업그레이드-검토)
 
 ---
 
@@ -1235,3 +1236,166 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 - `pipeline/reprocessing-dag-design.md` §6.2 — maintenance 스케줄 배치 (expire 6~12분, orphan 5~9분)
 - `tuning/compaction-tuning-guide.md` — `dcu/GB` 판정 지표, 노이즈 기준선 15%
 - `schema/trino-query-guide.md` — Trino 조회 (본 전환의 영향 없음)
+
+---
+
+## 9. 부록 — Iceberg 1.11.0 / Spark 4.1 업그레이드 검토
+
+### 9.1 결론
+
+**업그레이드에 찬성한다. 특히 Iceberg 1.11.0이 막혀 있던 Spark 4 문제의 직접적인 해답이다.**
+
+다만 **FileIO 전환과 동시에 진행하지 않는다.** 두 변경을 겹치면 전환 효과를 측정할 수 없다 (섹션 9.5).
+
+### 9.2 검증된 사실
+
+| 항목 | 확인 내용 | 출처 |
+|------|-----------|------|
+| **Iceberg 1.11.0이 Spark 4.1을 정식 지원** | 릴리스 노트 Spark 항목 첫 줄이 `Support Spark 4.1 (#14155)`. `spark/v4.1` 모듈 존재 | ✅ `site/docs/releases.md`, 태그 소스 |
+| 빌드 대상 Spark 버전 | `spark41 = "4.1.1"` — **목표 버전과 정확히 일치** | ✅ `gradle/libs.versions.toml` (1.11.0) |
+| 런타임 jar 존재 | `iceberg-spark-runtime-4.1_2.13` 은 **1.11.0에만** 존재 | ✅ Maven Central |
+| 1.10.1의 Spark 4.1 지원 | **없음** (`spark/v4.0`까지) — 기존 오류의 유력한 원인 | ✅ 태그 소스 |
+| 릴리스 시점 | 1.11.0 = 2026-05-19 | ✅ 릴리스 노트 |
+| JDK 요구사항 | Spark 4.1.1 `java.version = 17` — 현재 JDK 17로 충족 | ✅ `spark-parent_2.13-4.1.1.pom` |
+| Scala | Spark 4.1.1 `scala.version = 2.13.17` — 2.13 계열 일치 | ✅ 동일 pom |
+
+즉 **`iceberg-spark-runtime-4.1_2.13-1.11.0`이라는 조합이 지금 처음으로 성립한다.** "해결된 버전이 나오면 올린다"고 하신 그 버전이 이미 나와 있다.
+
+### 9.3 기존 Iceberg 테이블 사이드 이펙트 — 사실상 없다 ✅
+
+가장 중요한 근거는 format-version이다.
+
+```java
+// TableMetadata.java — 1.10.1과 1.11.0이 동일
+static final int DEFAULT_TABLE_FORMAT_VERSION = 2;
+static final int SUPPORTED_TABLE_FORMAT_VERSION = 4;
+```
+
+| 우려 | 실제 |
+|------|------|
+| 기존 테이블이 자동으로 format v3/v4로 올라가나 | **아니다.** Iceberg는 테이블 메타데이터에 선언된 `format-version`을 따른다. 라이브러리 업그레이드가 이를 바꾸지 않으며, 올리려면 `ALTER TABLE ... SET TBLPROPERTIES('format-version'='3')`을 **명시적으로** 실행해야 한다 |
+| 새로 만드는 테이블은 | **여전히 v2다.** 기본값이 1.10.1과 동일하다 |
+| 데이터 파일(Parquet) 포맷이 바뀌나 | 아니다 |
+| 기존 snapshot / time travel | 영향 없음 |
+| 파티션 스펙 / Sort Order / 테이블 프로퍼티 | 영향 없음 |
+| HMS 카탈로그 등록 정보 | 영향 없음 |
+
+**테이블은 그대로 있고 읽고 쓰는 라이브러리만 바뀐다.** FileIO 전환과 같은 성격이다.
+
+### 9.4 진짜 위험은 테이블이 아니라 스택에 있다
+
+#### ⚠️ ① Hadoop 3.3.4 → 3.4.2: S3A의 AWS SDK가 v1에서 v2로 바뀐다
+
+이것이 **가장 큰 항목**이다. Spark 4.1.1은 Hadoop 3.4.2를 번들한다.
+
+| | 현재 (Spark 3.5.8) | 업그레이드 후 (Spark 4.1.1) |
+|---|---|---|
+| Hadoop | 3.3.4 | **3.4.2** |
+| S3A의 AWS SDK | v1 `com.amazonaws:aws-java-sdk-bundle` | **v2 `software.amazon.awssdk:bundle`** ✅ (`hadoop-aws-3.4.2.pom`) |
+| Iceberg의 AWS SDK | 2.33.0 (1.10.1) | 2.44.4 (1.11.0) ✅ (`libs.versions.toml`) |
+
+파급 두 가지:
+
+1. **SDK v2가 한 JVM에 두 벌 올라온다.** 지금은 v1(S3A)과 v2(S3FileIO)가 패키지가 달라 평화롭게 공존하지만, 업그레이드 후에는 **둘 다 `software.amazon.awssdk.*`**다. Hadoop이 가져오는 버전과 `iceberg-aws-bundle 1.11.0`의 2.44.4가 충돌할 수 있다. ⚠️ 클래스패스 우선순위 확인 필요
+2. **MinIO checksum 이슈가 S3A로도 번진다.** 지금까지 섹션 4.5의 checksum 문제는 S3FileIO만의 문제였다(S3A는 SDK v1이라 무관). 업그레이드 후에는 **원천 avro 읽기까지 SDK v2를 타므로**, MinIO 호환성이 안 맞으면 파이프라인 전체가 멈춘다. **즉 MinIO checksum 확인은 이번 전환뿐 아니라 Spark 4 업그레이드의 선결 조건이기도 하다**
+
+#### ⚠️ ② `Remove deprecations for 1.11.0` (#14059)
+
+릴리스 노트의 Deprecation 항목에 **`AWS, Core, Data, Spark: Remove deprecations for 1.11.0`**이 있다. deprecated API가 실제로 제거됐다는 뜻이다.
+
+**maintenance 함수를 실행하는 Scala 코드가 Iceberg API를 직접 호출한다면 컴파일/런타임 실패 가능성이 있다.** SQL 프로시저(`CALL ... expire_snapshots`)만 쓴다면 영향이 없다. 코드에서 `org.apache.iceberg.*`를 얼마나 직접 참조하는지에 따라 공수가 갈린다 — **업그레이드 전에 확인할 첫 번째 항목이다.**
+
+함께 확인할 것: **Java 11 지원 중단** (JDK 17이므로 무관), **Spark 3.4 지원 deprecate** (무관).
+
+#### ⚠️ ③ Trino 호환성
+
+Trino가 같은 테이블을 조회한다. v2 테이블에 새 기능을 켜지 않는 한 안전하지만, Iceberg 1.11.0이 새로운 optional 메타데이터(partition statistics, content stats 등)를 쓰기 시작하면 구버전 Trino 커넥터가 읽지 못할 수 있다. **Trino의 Iceberg 커넥터 버전을 확인하고, 업그레이드 후 Trino 조회를 반드시 회귀 테스트한다.** ⚠️
+
+#### ⚠️ ④ 튜닝 결과 재검증
+
+작업 1/5의 확정 설정은 **Iceberg 1.10.1 + Spark 3.5 기준 실측값**이다. 릴리스 노트에 `Fix BinPackRewriteFilePlanner producing incorrect output file count with max-files-to-rewrite (#15576)` 같은 Compaction 계획 로직 변경이 포함되어 있다.
+
+| 재검증 대상 | 현재 기준값 |
+|-------------|-------------|
+| Compaction `dcu/GB` | 0.00219 |
+| Compaction `초/GB` | 2.41 |
+| `max-concurrent-file-group-rewrites` | 10 |
+| `num-executors` | 12 (C=0.32 동적 산정식 포함) |
+| append Job 벤치마크 | `spark-tuning-guide.md` |
+
+Spark 3.5 → 4.1은 실행 엔진 자체가 바뀌므로 **AQE 동작, ANSI 모드 기본값 등이 달라질 수 있다.** 노이즈 기준선 ±15%로 재측정이 필요하다.
+
+#### ⚠️ ⑤ Scala 버전 확인
+
+현재 런타임 jar가 `iceberg-spark-runtime-**3.5_2.12**`인데 Scala 2.13을 쓰신다고 하셨다. **Spark 3.5.8 이미지가 Scala 2.12 빌드일 가능성이 높다.** 애플리케이션 jar가 2.13으로 빌드되어 있다면 현재 조합이 성립하지 않으므로, 어느 쪽이 맞는지 먼저 확인해야 한다. (SQL만 실행하는 Job이라면 문제가 드러나지 않았을 수 있다.)
+
+### 9.5 업그레이드하면 얻는 것 — maintenance 관련
+
+부수적이지만 이번 작업과 직결되는 개선이 여럿 있다.
+
+| 변경 | 의미 |
+|------|------|
+| **`Refresh table in ListMetadataFiles to prevent incorrect orphan file deletion` (#16324)** | **`remove_orphan_files`의 오삭제 방지 수정.** 데이터 안전성 항목이므로 우리 환경에 해당하는지 확인할 가치가 있다 ⚠️ |
+| `enable stream-results option for remove orphan files` (#14278) | orphan에도 `stream-results` 적용 가능 → driver 메모리 부담 감소 |
+| `Support cleanupMode in snapshot expiration` (#14287), `expire-snapshots with cleanupLevel=None` (#14695) | expire의 파일 정리 동작을 제어할 수 있다 |
+| `Fix BinPackRewriteFilePlanner ... max-files-to-rewrite` (#15576) | Compaction 출력 파일 수 계산 버그 수정 |
+| `AWS: Add scheduled refresh for the S3FileIO held storage credentials` (#15678) | 장기 실행 Job의 자격증명 갱신 |
+| `Don't Use table FileIO for Spark Checkpoints` (#15239) | FileIO 분리 관련 정리 |
+| `Add sort_by parameter to rewrite_manifests procedure` (#15467) | manifest 정리 옵션 |
+
+### 9.6 권장 순서
+
+**FileIO 전환(Phase 1)을 먼저 끝내고, 그다음 버전업한다.**
+
+| 단계 | 내용 | 이유 |
+|------|------|------|
+| **1** | 현재 스택(Spark 3.5.8 + Iceberg 1.10.1)에 `iceberg-aws-bundle-1.10.1` 추가 → **Phase 1 측정 완료** | MinIO 부하는 **지금 겪고 있는 운영 문제**다. 전환은 저위험·즉시 롤백 가능하므로 먼저 해소한다 |
+| **2** | 측정 결과 확정 (요청 수 −99.6% 검증) | 이 숫자가 **버전과 무관한 구조적 개선**이므로 한 번 증명하면 재증명이 필요 없다 |
+| **3** | Scala 코드의 Iceberg API 직접 참조 범위 조사 (§9.4-②) | 업그레이드 공수를 여기서 가늠한다 |
+| **4** | Iceberg 1.11.0 + Spark 4.1.1로 업그레이드 | jar는 `iceberg-spark-runtime-4.1_2.13-1.11.0` + `iceberg-aws-bundle-1.11.0` |
+| **5** | 회귀 검증 — Trino 조회, Compaction/append 벤치마크 재측정 | §9.4-③④ |
+
+**동시에 하지 말아야 하는 이유**: FileIO 전환 효과(`DeleteObjects` 요청 수)와 버전업 효과(엔진 변경)가 섞이면 어느 쪽이 무엇을 했는지 분리할 수 없다. 특히 §9.4-①에서 S3A까지 SDK v2로 바뀌므로, 문제가 생겼을 때 원인 후보가 두 배가 된다.
+
+> **반론도 성립한다**: Spark 3.5.8은 어차피 임시 환경이므로 거기서 잰 baseline은 곧 폐기된다는 관점이다. 그렇다면 버전업을 먼저 하고 FileIO 전환을 한 번만 측정하는 것도 합리적이다. **다만 그동안 MinIO 부하는 계속된다.** 부하가 당장 견딜 만하고 Spark 4 전환 일정이 이미 잡혀 있다면 이쪽을 택해도 된다.
+
+### 9.7 업그레이드 시 jar 구성
+
+```
+# 현재 (Spark 3.5.8 + Iceberg 1.10.1)
+$SPARK_HOME/jars/
+├── aws-java-sdk-bundle-1.12.262.jar            # S3A용 (SDK v1)
+├── iceberg-spark-runtime-3.5_2.12-1.10.1.jar
+└── iceberg-aws-bundle-1.10.1.jar               # 이번에 추가
+
+# 업그레이드 후 (Spark 4.1.1 + Iceberg 1.11.0)
+$SPARK_HOME/jars/
+├── bundle-<Hadoop 3.4.2가 가져오는 버전>.jar    # S3A용 (SDK v2) — Spark 배포판에 포함
+├── iceberg-spark-runtime-4.1_2.13-1.11.0.jar   # ★ 교체 (Spark·Scala 버전 변경)
+└── iceberg-aws-bundle-1.11.0.jar               # ★ 버전만 교체
+```
+
+`iceberg-aws-bundle`은 여전히 **Scala 접미사도 Spark 버전 의존성도 없다.** Iceberg 버전만 맞추면 된다.
+
+⚠️ **SDK v2 중복 확인**: 업그레이드 후 `software.amazon.awssdk` 클래스가 두 jar에 존재하게 된다. 실제 로드되는 버전을 확인해야 한다.
+
+```bash
+kubectl exec <driver-pod> -- sh -c \
+  'for j in $SPARK_HOME/jars/*.jar; do \
+     n=$(unzip -l "$j" 2>/dev/null | grep -c "software/amazon/awssdk/services/s3/S3Client.class"); \
+     [ "$n" -gt 0 ] && echo "$j"; \
+   done'
+```
+
+### 9.8 확인이 필요한 항목
+
+| 항목 | 우선순위 |
+|------|----------|
+| Scala 코드의 Iceberg API 직접 참조 범위 (§9.4-②) | **최우선** — 업그레이드 공수를 결정한다 |
+| MinIO checksum 호환성 | **최우선** — FileIO 전환과 Spark 4 업그레이드 **양쪽의 게이트** (§9.4-①) |
+| 현재 Spark 3.5.8 이미지의 Scala 버전 (2.12 / 2.13) | 높음 (§9.4-⑤) |
+| Trino Iceberg 커넥터 버전과 호환성 | 높음 (§9.4-③) |
+| 업그레이드 후 SDK v2 중복 해소 | 높음 (§9.7) |
+| Compaction / append 튜닝값 재검증 | 중간 (§9.4-④) |
+| `remove_orphan_files` 오삭제 버그(#16324) 해당 여부 | 중간 (§9.5) |
+| 과거 Spark 4 오류 메시지 확보 | 중간 — 1.11.0으로 해소되는지 확인 근거 |
