@@ -836,7 +836,7 @@ RUN rm -f /opt/spark/jars/hadoop-client-runtime-3.3.4.jar
 | `iceberg-aws-bundle-**1.9.2**` | ❌ → **1.10.1** | `iceberg-spark-runtime`과 **정확히 일치**시켜야 한다 |
 | `spark-avro_2.12-3.5.6.jar` | ⚠️ **추가하지 말고 확인만** | 원천 avro를 지금도 읽고 있으므로 베이스 이미지에 이미 있거나 앱 jar가 제공하는 중이다. 버전이 3.5.6이라 3.5.8과도 안 맞는다 |
 | `postgresql-42.7.7.jar` | ⚠️ 추가하지 않음 | 용도 불명. 베이스 이미지에 필요한 것이 있다면 이미 들어 있다 |
-| `ENV TZ=Asia/Seoul` | ⚠️ **베이스에 없다면 추가하지 말 것** | 아래 상세 |
+| `ENV TZ=Asia/Seoul` | ❌ **제거 확정** | 운영 Pod의 TZ가 **UTC**로 확인됐다(2026-08-26). 이를 Asia/Seoul로 바꾸면 FileIO 전환과 무관한 시각 관련 동작 변경이 섞인다. 아래 상세 |
 
 #### Hadoop 교체를 금지하는 이유
 
@@ -848,7 +848,9 @@ RUN rm -f /opt/spark/jars/hadoop-client-runtime-3.3.4.jar
 
 #### `ENV TZ`를 조심해야 하는 이유
 
-대상 테이블의 `ts`는 **`timestamp_ntz`**이고 파티션이 `hour(ts)`다. 컨테이너 TZ 변경은 Spark session timezone·avro 파싱·로그 시각 등에 영향을 줄 수 있다. **베이스 이미지가 이미 원하는 TZ로 설정되어 있다면 건드리지 않는다.** 현재 파이프라인이 정상 동작 중이라는 것이 곧 현재 TZ 설정이 맞다는 뜻이다.
+대상 테이블의 `ts`는 **`timestamp_ntz`**이고 파티션이 `hour(ts)`다. 컨테이너 TZ 변경은 Spark session timezone·avro 파싱·로그 시각 등에 영향을 줄 수 있다.
+
+**확인 결과 운영 Pod의 TZ는 `UTC`다.** 현재 파이프라인이 이 상태로 정상 동작 중이므로 **UTC가 곧 검증된 설정**이다. `ENV TZ=Asia/Seoul`은 파생 이미지에서 제외한다.
 
 #### 이미지 배포와 설정 전환은 분리한다
 
@@ -877,6 +879,112 @@ kubectl exec <driver-pod> -- ls $SPARK_HOME/jars | grep hadoop-client
 # ③ SDK v2 클래스 적재 가능 확인
 kubectl exec <driver-pod> -- sh -c \
   'unzip -l $SPARK_HOME/jars/iceberg-aws-bundle-1.10.1.jar | grep -c "software/amazon/awssdk/services/kms/"'
+```
+
+### 5.0.5 라이브러리를 어디에 둘 것인가 — 배치 원칙
+
+#### 세 개의 축을 구분한다
+
+혼동하기 쉬운데, **Maven scope / fat jar / Spark classpath는 서로 다른 축**이다.
+
+**축 ①: Maven scope — 빌드 시점 이야기**
+
+| scope | 컴파일에 사용 | **fat jar에 포함** |
+|-------|--------------|-------------------|
+| `compile` (기본) | O | **O** |
+| `provided` | O | **X** — "런타임 환경이 제공한다"는 선언 |
+| `runtime` | X | O |
+| `test` | 테스트만 | X |
+
+**축 ②: fat jar란**
+
+- **thin jar**: 내가 쓴 코드만 (수십 KB ~ 수 MB)
+- **fat jar (uber jar)**: 내 코드 + 모든 의존성을 하나로 합친 jar. `maven-shade-plugin` 또는 `maven-assembly-plugin`이 만든다
+- `shade`는 추가로 **패키지 relocation**(`com.google.guava` → `myapp.shaded.guava`)을 해서 버전 충돌을 피할 수 있다. `iceberg-aws-bundle`이 `org.apache.http`를 relocate한 것이 정확히 이 기법이다 (섹션 5.0.1)
+
+**축 ③: Spark 런타임 classpath에 올라가는 경로**
+
+| 경로 | 위치 | driver/executor | 전송 비용 |
+|------|------|-----------------|-----------|
+| `$SPARK_HOME/jars/` | 이미지 | 둘 다 | **없음** (노드 이미지 캐시) |
+| 애플리케이션 jar | spark-submit 인자 | 둘 다 | 매 실행 전송 |
+| `--jars` / `--packages` | submit 옵션 | 둘 다 | 매 실행 전송(+의존성 해석) |
+
+#### 배치 판단 기준
+
+| 라이브러리 성격 | 위치 | pom scope | 예시 |
+|-----------------|------|-----------|------|
+| Spark 자체 | 이미 이미지에 있음 | `provided` | `spark-core`, `spark-sql` |
+| **Spark 버전에 묶인 것** | **이미지** | `provided` | **`spark-avro`**, `spark-hadoop-cloud` |
+| 인프라 공통 (모든 Job이 씀) | **이미지** | `provided` | `iceberg-spark-runtime`, `iceberg-aws-bundle`, `hadoop-aws` |
+| 이 앱만 쓰는 비즈니스 라이브러리 | **fat jar** | `compile` | 사내 공통 모듈, JSON/유틸 |
+
+**성능 관점의 결론**: 실행 성능(쿼리 속도)에는 **차이가 없다.** classpath 위치는 클래스 로딩 시점에만 영향을 준다. 차이가 나는 것은 **Job 기동 시간**뿐이고, 수 MB 수준이면 무시할 만하다. `--packages`만은 예외로 매번 의존성 해석과 다운로드가 필요해 느리고 폐쇄망에 취약하다.
+
+#### ⚠️ 절대 피할 것 — 같은 라이브러리를 양쪽에 두기
+
+이미지와 fat jar 양쪽에 같은 라이브러리가 있으면 클래스가 두 벌 존재한다. 기본적으로 system classpath(이미지)가 이기지만 `spark.driver.userClassPathFirst=true` 같은 설정으로 뒤집힐 수 있고, **버전이 다르면 `NoSuchMethodError` 같은 재현하기 어려운 오류**가 난다.
+
+> **원칙: 한 라이브러리는 한 곳에만 둔다.**
+
+#### `spark-avro`의 경우
+
+**`spark-avro`는 Spark 배포판에 포함되어 있지 않다.** ✅ 공식 문서 확인
+
+> The `spark-avro` module is external and not included in `spark-submit` or `spark-shell` by default.
+> — Spark 3.5.8 `docs/sql-data-sources-avro.md`
+
+(`assembly/pom.xml`에서도 `connect` 프로파일 아래에만 등장한다.)
+
+따라서 현재 어딘가에서 공급되고 있다. 어디인지 먼저 확인한다.
+
+```bash
+# ① 앱 jar에 포함되어 있나 (= fat jar 방식)
+unzip -l target/<app>.jar | grep -i "org/apache/spark/sql/avro"
+
+# ② pom에 fat jar 플러그인이 있나
+grep -E "maven-shade-plugin|maven-assembly-plugin" pom.xml
+
+# ③ 이미지에 있나
+kubectl exec <pod> -- ls $SPARK_HOME/jars | grep -i avro
+
+# ④ CRD에서 주고 있나
+kubectl get sparkapplication <name> -o yaml | grep -A5 "deps:"
+```
+
+| 결과 | 현재 방식 | 올바른 pom scope |
+|------|-----------|------------------|
+| ①에만 있음 | fat jar | `compile` (현재 그대로 맞다) |
+| ③에만 있음 | 이미지 | **`provided`** — `compile`이면 fat jar에도 들어가 중복된다 |
+| ①③ 둘 다 | **중복** | 정리 필요 |
+
+**권장 방향은 이미지**다. `spark-avro_2.12-3.5.8`은 Spark 3.5.8과 짝이어야 하는데, fat jar에 넣어두면 이미지의 Spark를 올릴 때 앱 jar가 뒤처져 **버전 드리프트**가 생긴다. 실제로 과거 테스트 Dockerfile에는 `spark-avro_2.12-**3.5.6**`이 들어 있었고 현재 런타임은 **3.5.8**이다 — 정확히 그 드리프트다.
+
+> **다만 지금 옮기지 않는다.** 현재 정상 동작 중이고 FileIO 전환 A/B가 진행 중이다. Spark 4 업그레이드 때 어차피 `spark-avro_2.13-4.1.1`로 교체해야 하므로, **그 시점에 이미지로 옮기는 것이 자연스럽다.**
+
+#### 체크섬(`sha512`)은 무엇이고 필요한가
+
+Maven Central은 모든 artifact 옆에 `.jar.sha512` / `.jar.sha1`을 함께 배포한다. 받은 파일이 원본과 **바이트 단위로 같은지** 확인하는 값이다.
+
+| 목적 | 설명 |
+|------|------|
+| **손상된 다운로드 탐지** | 60MB 파일이 사내 프록시에서 잘려 받아지면 `NoClassDefFoundError` 같은 **엉뚱한 증상**으로 나타나 원인 추적이 어렵다. 실제로 이번에 겪은 에러와 구분이 안 된다 |
+| 공급망 무결성 | 미러/중간 경로에서의 변조 탐지 |
+
+**테스트 단계에서 `wget`으로 받아 넣는 것은 문제없다.** 정상 동작을 확인했다면 파일은 온전하다. 다만 **운영 이미지 빌드에는 넣는 것을 권한다** — Dockerfile이 매번 같은 파일을 받는다는 보장(재현성)이 생긴다.
+
+```bash
+# 받은 파일 검증
+sha512sum iceberg-aws-bundle-1.10.1.jar
+curl -s https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.10.1/iceberg-aws-bundle-1.10.1.jar.sha512
+# 두 값이 같으면 정상
+```
+
+1.10.1의 값은 다음과 같다.
+
+```
+sha512: a649f50fd8508b3e179002ecbc28b3ae3de374c6851ce2ed203fe29d3bbf7794780075bd8ad8f41655d4f8684ff064f58d32218d329b0937bce034199afb900a
+sha1:   9c02c851a2356f287f040ed784170c758369d134
 ```
 
 ### 5.1 설정 값
