@@ -6,8 +6,9 @@
 |------|------|
 | 작성 목적 | expire_snapshots의 MinIO 부하 원인 검증 및 S3FileIO 전환 타당성/절차 정리 |
 | 대상 독자 | 데이터 엔지니어, 운영팀, 스토리지 담당자 |
-| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1(카탈로그: HMS), Airflow 3.2.2 |
-| 검증 기준 | Apache Iceberg `apache-iceberg-1.10.1` 태그 소스, Apache Hadoop `rel/release-3.4.1` 소스 |
+| 환경 | Kubernetes 클러스터, S3(MinIO), Iceberg 1.10.1(카탈로그: HMS), Airflow 3.2.2 |
+| ⚠️ Spark 런타임 | **실측: Spark 3.5 / Scala 2.12 / Hadoop 3.3.4** (driver Pod의 jar 기준, 섹션 5.0.2). 기존 문서의 "Spark 4.1.1"과 불일치 — 확인 필요 |
+| 검증 기준 | Apache Iceberg `apache-iceberg-1.10.1` 태그 소스(**`spark/v3.5`·`spark/v4.0` 모듈 동일 로직 확인**), Apache Hadoop `rel/release-3.3.4`·`rel/release-3.4.1` 소스 |
 | 최종 수정일 | 2026-08-24 |
 
 ### 근거 수준 라벨
@@ -608,6 +609,85 @@ kubectl exec <driver-pod> -- sh -c \
 
 > 참고: `s3.client-factory`로 커스텀 팩토리를 지정해도 해결되지 않는다. 그 인터페이스(`S3FileIOAwsClientFactory`)를 구현하더라도, 기본 경로를 벗어나기 전에 이미 같은 링크 문제가 발생할 수 있고 무엇보다 우회할 이유가 없다.
 
+### 5.0.2 실제 진단 결과 — driver Pod의 jar 구성 ✅ 확인 완료
+
+`$SPARK_HOME/jars`에서 확인된 관련 jar는 두 개뿐이었다.
+
+```
+aws-java-sdk-bundle-1.12.262.jar
+iceberg-spark-runtime-3.5_2.12-1.10.1.jar
+```
+
+여기서 두 가지가 드러난다.
+
+#### ① AWS SDK **v2가 하나도 없다** — 이번 에러의 직접 원인
+
+`aws-java-sdk-bundle`은 **AWS SDK v1**이다. 패키지가 `com.amazonaws.*`이며, `software.amazon.awssdk.*`는 단 하나도 들어 있지 않다. `S3FileIO`가 요구하는 것은 v2이므로 KMS뿐 아니라 **S3 클라이언트 클래스조차 없는 상태**다.
+
+버전도 정확히 들어맞는다. `aws-java-sdk-bundle 1.12.262`는 **Hadoop 3.3.4가 고정한 버전**이다. ✅ 소스 검증
+
+```xml
+<!-- hadoop-project-3.3.4.pom -->
+<aws-java-sdk.version>1.12.262</aws-java-sdk.version>
+```
+
+| hadoop-aws 버전 | 의존하는 AWS SDK |
+|-----------------|------------------|
+| **3.3.4** | `com.amazonaws:aws-java-sdk-bundle` (**v1**) ← 우리 환경 |
+| 3.4.1 | `software.amazon.awssdk:bundle` (v2) |
+
+`iceberg-spark-runtime`에는 **`iceberg-aws`가 포함되어 있지만 AWS SDK는 포함되어 있지 않다** ✅ (`spark/v3.5/build.gradle:241` — `implementation project(':iceberg-aws')`). 그래서 `S3FileIO` 클래스 자체는 로드되지만 SDK 클래스 링크에서 실패한다. **`iceberg-aws-bundle`이 별도 artifact로 존재하는 이유가 정확히 이것이다.**
+
+#### ✅ SDK v1과 v2는 공존해도 된다
+
+기존 `aws-java-sdk-bundle-1.12.262.jar`를 **제거할 필요가 없다.** 오히려 제거하면 안 된다 — Hadoop 3.3.4의 S3A(원천 avro 읽기)가 그것을 쓴다.
+
+| | 패키지 | 사용처 |
+|---|---|---|
+| SDK v1 (`aws-java-sdk-bundle`) | `com.amazonaws.*` | Hadoop S3A — 원천 avro 읽기, 경로 목록 파일 |
+| SDK v2 (`iceberg-aws-bundle`) | `software.amazon.awssdk.*` | Iceberg S3FileIO — 테이블 데이터/메타데이터 |
+
+**패키지 네임스페이스가 완전히 달라 충돌하지 않는다.** Hadoop 3.3.x + Iceberg S3FileIO 조합의 표준 구성이다. (shading도 겹치지 않는다 — v1 bundle은 httpclient를 `com.amazonaws.thirdparty.*`로, `iceberg-aws-bundle`은 `org.apache.iceberg.aws.shaded.*`로 relocate한다.)
+
+**조치**: `iceberg-aws-bundle-1.10.1.jar`를 `$SPARK_HOME/jars/`에 **추가**한다. 기존 jar는 그대로 둔다.
+
+```
+$SPARK_HOME/jars/
+├── aws-java-sdk-bundle-1.12.262.jar          # 유지 (S3A용)
+├── iceberg-spark-runtime-3.5_2.12-1.10.1.jar # 유지
+└── iceberg-aws-bundle-1.10.1.jar             # ★ 추가
+```
+
+> `iceberg-aws-bundle`은 Spark 버전과 무관한 artifact다. Scala 버전 접미사도 없다. Iceberg 버전(1.10.1)만 맞추면 된다.
+
+#### ② ⚠️ Spark 런타임이 문서와 다르다 — 별건으로 확인 필요
+
+`iceberg-spark-runtime-**3.5_2.12**`는 **Spark 3.5 / Scala 2.12**용이다. 기존 문서들이 기재한 **Spark 4.1.1**(Scala 2.13)과 맞지 않는다.
+
+Scala 2.12와 2.13은 바이너리 호환되지 않으므로 **Spark 4.1.1에서 이 jar는 동작할 수 없다.** 그런데 expire snapshots가 실제로 돌고 있었으므로(6~12분 실측), **이 Pod의 실제 런타임은 Spark 3.5.x로 보는 것이 타당하다.** `aws-java-sdk-bundle 1.12.262`(= Hadoop 3.3.4 = Spark 3.5.x 번들 버전)도 같은 결론을 가리킨다.
+
+**이번 전환에는 영향이 없다** — 확인한 Iceberg 로직이 두 모듈에서 동일하기 때문이다. ✅ 소스 대조
+
+| 확인 항목 | `spark/v4.0` | `spark/v3.5` | 동일 여부 |
+|-----------|--------------|--------------|-----------|
+| bulk delete 분기 | `ExpireSnapshotsSparkAction.java:257-272` | **:257-271** | ✅ 동일 |
+| driver 삭제 (`collectAsList`) | `:222-228` | **:223-229** | ✅ 동일 |
+| `max_concurrent_deletes` 무시 | `ExpireSnapshotsProcedure.java:133-143` | **:128-138** | ✅ 동일 |
+| `prefix_listing` 파라미터 | `RemoveOrphanFilesProcedure.java:71-73, 195` | **:67, 141, 189** | ✅ 동일 |
+
+Hadoop 쪽도 삭제 경로가 같다. ✅ (`S3AFileSystem.java` 3.3.4 기준 :3162 `delete` → :3172 `innerGetFileStatus(ALL)` → `DeleteOperation` → :3178 `maybeCreateFakeParentDirectory` → :3209 `s3Exists(DIRECTORIES)` LIST + PUT). **섹션 1.3의 "파일 1개 = 요청 3개" 분석은 그대로 유효하다.**
+
+`fs.s3a.*` 기본값도 실질적으로 동일하다:
+
+| 설정 | 3.3.4 | 3.4.1 | 우리 환경에서의 결과 |
+|------|-------|-------|---------------------|
+| `multipart.size` | 64M | 64M | 동일 |
+| `multipart.threshold` | 128M | 128M | 동일 |
+| `buffer.dir` | `${hadoop.tmp.dir}/s3a` | `${env.LOCAL_DIRS:-${hadoop.tmp.dir}}/s3a` | K8s엔 `LOCAL_DIRS`가 없으므로 **결과 경로 동일** (`/tmp/hadoop-<user>/s3a`) |
+| `fast.upload.buffer` | disk | disk | 동일 |
+
+> **다만 문서의 스택 기재는 정리가 필요하다.** Spark 4.1.1이 다른 Job/다른 환경의 값인지, 계획값이었는지, 단순 오기인지 확인해서 맞춰야 한다. 이 문서는 실측 기준(Spark 3.5 / Hadoop 3.3.4)으로 작성되어 있다.
+
 ### 5.1 설정 값
 
 ```properties
@@ -1012,6 +1092,7 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | ~~driver Pod의 `limits.cpu` 설정 여부~~ | ✅ 확인 완료 — Compaction은 `coreLimit=1`, **expire snapshots는 미설정**(노드 코어 × 4 = 삭제 스레드). `coreLimit=1` 적용 예정이나 **baseline 계측 후에** 적용할 것 (섹션 5.1.2) | 완료 |
 | **maintenance Job의 executor 수** | 삭제는 driver에서만 일어나므로 축소 여지가 있으나, **전환과 동시에 바꾸면 A/B 판정이 불가능하다.** 전환 후 Spark UI로 stage 구간을 보고 조정 (섹션 5.1.2) | 중간 (전환 후) |
 | **`/tmp`의 성격과 ephemeral-storage limit** | Phase 1에는 무관(데이터 파일을 쓰지 않음). Phase 2/3 진입 전 확인 (섹션 4.6) | 중간 (Phase 2 전) |
+| **Spark 런타임 버전 불일치** | driver Pod의 jar는 `iceberg-spark-runtime-3.5_2.12`(Spark 3.5/Scala 2.12)인데 문서는 Spark 4.1.1로 기재되어 있다. 전환에는 영향 없음(로직 동일 확인)이나 **다른 문서들의 스택 기재를 정리해야 한다** (섹션 5.0.2) | **높음(문서 정합성)** |
 | **`s3.multipart.part-size-bytes` 조정 효과** | 64MB로 맞추면 S3A 현재 동작과 동일해진다. 그 이상은 A/B 필요 (섹션 5.1.3) | 낮음 (Phase 2) |
 | **Spark 4.1.1 ↔ iceberg-spark-runtime 4.0 조합** | 현재 어떤 runtime jar를 쓰는지 확인하고 `iceberg-aws-bundle` 버전을 정확히 맞출 것 | 중간 |
 | **maintenance 스케줄 재조정** | expire duration이 줄면 `reprocessing-dag-design.md` §6.2의 슬롯에 여유가 생긴다. 재배치 재검토 가능 | 낮음 (전환 후) |
@@ -1036,6 +1117,10 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | `RemoveOrphanFilesProcedure.java` | `iceberg 1.10.1` / `spark/v4.0/.../procedures/` | :71-73, :195 `prefix_listing` |
 | `DeleteOrphanFilesSparkAction.java` | `iceberg 1.10.1` / `spark/v4.0/.../actions/` | :255-272 동일 삭제 분기, :308-330 listing 분기 |
 | `S3AFileSystem.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/` | :3581-3606 delete 흐름, :3624-3648 마커 생성 |
+| `S3AFileSystem.java` | **`hadoop 3.3.4`** (실제 환경) | :3162 delete, :3172 HEAD, :3178·:3209 마커 LIST/PUT — 3.4.1과 동일 구조 |
+| `hadoop-project-3.3.4.pom` | `hadoop 3.3.4` | `aws-java-sdk.version = 1.12.262` (환경 식별 근거) |
+| `spark/v3.5/build.gradle` | `iceberg 1.10.1` | :241 `iceberg-spark-runtime`이 `iceberg-aws`는 포함하되 AWS SDK는 미포함 |
+| `spark/v3.5/.../ExpireSnapshotsSparkAction.java` | `iceberg 1.10.1` | :223-229, :257-271 — v4.0 모듈과 동일 로직 |
 | `BulkDeleteOperation.java` | `hadoop 3.4.1` / `hadoop-tools/hadoop-aws/.../impl/` | S3A의 bulk delete API 존재 확인 |
 | `AwsClientProperties.java` | `iceberg 1.10.1` / `aws/.../aws/` | :145-149 region 미설정 시 동작, :211-235 자격증명 결정 순서 |
 | `AwsClientFactory.java` | `iceberg 1.10.1` / `aws/.../aws/` | :23-25, :61 KMS/Glue/DynamoDB가 메서드 시그니처에 등장 (KMS jar 필수 원인) |
