@@ -776,6 +776,109 @@ kubectl exec <driver-pod> -- sh -c \
 >
 > 즉 **Spark 4.1.1 + `iceberg-spark-runtime-4.0_2.13`은 지원 조합이 아니다.** maintenance 함수 실행 시 발생했던 에러의 원인일 가능성이 있다. Iceberg 버전업을 기다리기보다 **Spark 4.0.x로 맞춰 재시도**해보는 것이 더 빠른 경로일 수 있다. (⚠️ 가설 — 당시 에러 메시지 확인 필요)
 
+### 5.0.4 이미지 구성 — 추가하는 것은 jar 하나뿐이다
+
+운영 이미지가 타 팀 소유라 자체 이미지를 파생 빌드해야 하는 상황이다. **이때 원칙은 하나다.**
+
+> **이번 이미지에서 바꾸는 것은 `iceberg-aws-bundle-1.10.1.jar` 추가, 그것 하나뿐이어야 한다.**
+
+FileIO 전환 효과를 측정하는 것이 목적이므로, 이미지에 다른 변경이 섞이면 그 측정이 무의미해진다.
+
+#### Dockerfile
+
+```dockerfile
+# ① 베이스는 "현재 운영 중인 그 이미지" — 새로 apache/spark를 받지 않는다
+FROM <타팀-레지스트리>/<이미지>:<현재-운영-태그>
+
+# ② 공식 Spark 이미지는 USER spark(비root)로 끝나므로 root로 전환
+#    (apache/spark-docker의 Dockerfile 마지막이 `USER spark`)
+USER root
+
+ARG ICEBERG_VERSION=1.10.1
+ARG BUNDLE_SHA512=a649f50fd8508b3e179002ecbc28b3ae3de374c6851ce2ed203fe29d3bbf7794780075bd8ad8f41655d4f8684ff064f58d32218d329b0937bce034199afb900a
+
+# ③ jar 추가 (사내 저장소가 있으면 COPY, 없으면 curl)
+RUN set -eux; \
+    curl -fsSL -o /opt/spark/jars/iceberg-aws-bundle-${ICEBERG_VERSION}.jar \
+      https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar; \
+    echo "${BUNDLE_SHA512}  /opt/spark/jars/iceberg-aws-bundle-${ICEBERG_VERSION}.jar" | sha512sum -c -; \
+    chmod 644 /opt/spark/jars/iceberg-aws-bundle-${ICEBERG_VERSION}.jar
+
+# ④ 원래 USER로 복귀 (공식 이미지는 spark, UID 185)
+USER spark
+```
+
+`COPY` 방식을 쓴다면 ③만 바꾼다.
+
+```dockerfile
+COPY --chown=root:root jars/iceberg-aws-bundle-1.10.1.jar /opt/spark/jars/
+```
+
+#### ⚠️ 예전 Dockerfile에서 가져오면 안 되는 것
+
+과거 테스트용 Dockerfile에는 다음이 있었다.
+
+```dockerfile
+FROM apache/spark:3.5.6-java
+ENV TZ=Asia/Seoul
+# jars: hadoop-common-3.4.1, hadoop-aws-3.4.1, bundle-2.32.29,
+#       hadoop-client-api-3.4.1, hadoop-client-runtime-3.4.1, ...
+RUN rm -f /opt/spark/jars/hadoop-client-api-3.3.4.jar
+RUN rm -f /opt/spark/jars/hadoop-client-runtime-3.3.4.jar
+```
+
+| 항목 | 판정 | 이유 |
+|------|------|------|
+| `FROM apache/spark:3.5.6-java` | ❌ | 운영은 **3.5.8**이다. 3.5.6으로 내리면 Spark 버전이 바뀌고, 타 팀 이미지의 커스터마이징(설정·패치·유저)도 전부 잃는다 |
+| **Hadoop 3.3.4 → 3.4.1 교체** (`hadoop-*` jar 5종 + `rm`) | ❌ **절대 금지** | 아래 상세 |
+| `bundle-2.32.29.jar` (S3A용 SDK v2) | ❌ | 위 Hadoop 교체와 한 세트다. Hadoop 3.3.4를 유지하면 필요 없다 |
+| `iceberg-spark-runtime-3.5_2.12-**1.9.2**` | ❌ | 베이스 이미지에 이미 **1.10.1**이 있다. 버전을 내리면 안 된다 |
+| `iceberg-aws-bundle-**1.9.2**` | ❌ → **1.10.1** | `iceberg-spark-runtime`과 **정확히 일치**시켜야 한다 |
+| `spark-avro_2.12-3.5.6.jar` | ⚠️ **추가하지 말고 확인만** | 원천 avro를 지금도 읽고 있으므로 베이스 이미지에 이미 있거나 앱 jar가 제공하는 중이다. 버전이 3.5.6이라 3.5.8과도 안 맞는다 |
+| `postgresql-42.7.7.jar` | ⚠️ 추가하지 않음 | 용도 불명. 베이스 이미지에 필요한 것이 있다면 이미 들어 있다 |
+| `ENV TZ=Asia/Seoul` | ⚠️ **베이스에 없다면 추가하지 말 것** | 아래 상세 |
+
+#### Hadoop 교체를 금지하는 이유
+
+1. **S3A 구현이 통째로 바뀐다.** Hadoop 3.3.4는 AWS SDK **v1**, 3.4.1은 **v2**를 쓴다(섹션 5.0.2). 즉 **원천 avro 읽기 경로가 바뀐다.** FileIO 전환 효과와 섞여 A/B 판정이 불가능해진다
+2. **MinIO checksum 리스크를 미리 당겨온다.** S3A까지 SDK v2가 되면 checksum 문제가 avro 읽기에도 번진다(섹션 9.4-①). 이건 Spark 4 업그레이드 때 감당할 항목이지 지금 감당할 항목이 아니다
+3. **클래스 중복 위험.** `hadoop-client-api`/`hadoop-client-runtime`은 shaded fat jar인데, 여기에 unshaded `hadoop-common`을 얹으면 같은 클래스가 두 벌 존재한다. Spark 3.5.x는 Hadoop 3.3.4로 빌드·테스트된 배포판이다
+
+> **가장 중요한 오해 방지: `S3FileIO`는 Hadoop 버전과 무관하다.** 자체적으로 AWS SDK v2(`iceberg-aws-bundle`)를 들고 다니며 `fs.s3a.*`도 Hadoop `FileSystem`도 쓰지 않는다. **Hadoop 3.3.4 위에서 그대로 동작한다.** S3FileIO를 쓰려고 Hadoop을 올릴 필요가 전혀 없다.
+
+#### `ENV TZ`를 조심해야 하는 이유
+
+대상 테이블의 `ts`는 **`timestamp_ntz`**이고 파티션이 `hour(ts)`다. 컨테이너 TZ 변경은 Spark session timezone·avro 파싱·로그 시각 등에 영향을 줄 수 있다. **베이스 이미지가 이미 원하는 TZ로 설정되어 있다면 건드리지 않는다.** 현재 파이프라인이 정상 동작 중이라는 것이 곧 현재 TZ 설정이 맞다는 뜻이다.
+
+#### 이미지 배포와 설정 전환은 분리한다
+
+**jar를 추가하는 것만으로는 아무 일도 일어나지 않는다.** `io-impl`을 설정하지 않으면 Iceberg는 여전히 `HadoopFileIO`를 쓴다(섹션 1.1). 따라서 두 단계로 나눌 수 있고, 각각 독립적으로 롤백된다.
+
+| 단계 | 변경 | 성격 | 롤백 |
+|------|------|------|------|
+| **1. 이미지 교체** | jar 1개 추가 | **무해(inert)** — 동작 변화 없음 | 이전 이미지 태그로 되돌림 |
+| **2. `io-impl` 설정** | maintenance Job의 conf | 실제 전환 | 설정 제거 |
+
+이미지를 먼저 배포해 기존 Job들이 정상 동작하는지 확인한 뒤, maintenance Job에만 `io-impl`을 켜는 순서가 가장 안전하다.
+
+#### 빌드 후 검증
+
+```bash
+# ① iceberg 관련 jar 구성 — runtime과 bundle의 버전이 같아야 한다
+kubectl exec <driver-pod> -- ls $SPARK_HOME/jars | grep -iE "iceberg|aws"
+# 기대:
+#   aws-java-sdk-bundle-1.12.262.jar            (기존, S3A용 SDK v1)
+#   iceberg-spark-runtime-3.5_2.12-1.10.1.jar   (기존)
+#   iceberg-aws-bundle-1.10.1.jar               (추가됨)
+
+# ② Hadoop 버전이 그대로인지 (3.3.4여야 한다)
+kubectl exec <driver-pod> -- ls $SPARK_HOME/jars | grep hadoop-client
+
+# ③ SDK v2 클래스 적재 가능 확인
+kubectl exec <driver-pod> -- sh -c \
+  'unzip -l $SPARK_HOME/jars/iceberg-aws-bundle-1.10.1.jar | grep -c "software/amazon/awssdk/services/kms/"'
+```
+
 ### 5.1 설정 값
 
 ```properties
