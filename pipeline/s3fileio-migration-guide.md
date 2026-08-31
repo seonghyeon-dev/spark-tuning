@@ -371,7 +371,57 @@ spark.sql.catalog.<카탈로그>.s3.path-style-access=true
 
 **자격증명은 한 곳(K8s Secret)으로 통합되고, 남는 중복은 endpoint 1줄뿐이다.** `connection.ssl.enabled`는 endpoint에 `http://`를 명시하면 불필요하고(섹션 5.1.1), `client.region`도 `AWS_REGION`으로 대체된다.
 
-⚠️ 이 정리도 **동작을 바꾸는 변경**이므로 A/B 측정이 끝난 뒤 별건으로 적용한다.
+##### K8s Secret 등록과 참조
+
+Secret은 **네임스페이스 단위 리소스**다. Spark Job이 실행되는 네임스페이스에 만들어야 하고, 다른 네임스페이스에서는 보이지 않는다 (dev/prod가 분리돼 있다면 각각 만든다).
+
+```bash
+# 방법 ① kubectl 명령 (빠름)
+kubectl create secret generic minio-credentials \
+  --namespace=<spark-job-네임스페이스> \
+  --from-literal=access-key='<ACCESS_KEY>' \
+  --from-literal=secret-key='<SECRET_KEY>'
+```
+
+```yaml
+# 방법 ② YAML manifest (GitOps/버전관리 시)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: <spark-job-네임스페이스>
+type: Opaque
+stringData:            # stringData를 쓰면 base64 인코딩을 직접 하지 않아도 된다
+  access-key: "<ACCESS_KEY>"
+  secret-key: "<SECRET_KEY>"
+```
+
+SparkApplication에서 참조할 때는 **driver와 executor 양쪽 모두**에 넣는다. executor도 manifest·데이터 파일을 읽으므로 자격증명이 필요하다.
+
+```yaml
+spec:
+  driver:
+    env: &awsEnv
+      - name: AWS_ACCESS_KEY_ID
+        valueFrom: { secretKeyRef: { name: minio-credentials, key: access-key } }
+      - name: AWS_SECRET_ACCESS_KEY
+        valueFrom: { secretKeyRef: { name: minio-credentials, key: secret-key } }
+      - name: AWS_REGION
+        value: us-east-1
+  executor:
+    env: *awsEnv
+```
+
+확인:
+
+```bash
+kubectl get secret minio-credentials -n <네임스페이스>
+kubectl exec <driver-pod> -- printenv | grep AWS_        # 값이 주입됐는지
+```
+
+> ⚠️ **base64는 암호화가 아니다.** Secret YAML(`stringData` 포함)을 그대로 git에 올리면 평문 노출과 다름없다. 매니페스트를 버전관리한다면 SealedSecrets·External Secrets Operator·Vault 같은 도구를 쓰거나, Secret만 `kubectl create`로 별도 관리한다.
+
+⚠️ 이 정리는 **동작을 바꾸는 변경**이므로 다른 변경과 같은 배포에 섞지 말고 단독으로 적용해 확인한다 (성능과는 무관하므로 측정을 기다릴 필요는 없다).
 
 ### 1.1 현재 우리가 쓰고 있는 FileIO 확인
 
