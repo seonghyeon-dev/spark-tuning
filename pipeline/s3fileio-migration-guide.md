@@ -22,12 +22,12 @@
 ### 목차
 
 - [0. 결론 요약](#0-결론-요약)
-- [1. 현상 검증 — expire_snapshots가 MinIO에 요청을 쏟는 구조](#1-현상-검증--expire_snapshots가-minio에-요청을-쏟는-구조)
+- [1. 현상 검증 — expire_snapshots가 MinIO에 요청을 쏟는 구조](#1-현상-검증--expire_snapshots가-minio에-요청을-쏟는-구조) — **1.0 배경 개념(보고용)**
 - [2. S3FileIO로 바꾸면 무엇이 달라지는가](#2-s3fileio로-바꾸면-무엇이-달라지는가)
 - [3. 전환 명분 판단 — 대안과의 비교](#3-전환-명분-판단--대안과의-비교)
 - [4. 사이드 이펙트 분석](#4-사이드-이펙트-분석)
 - [5. 전환 방법](#5-전환-방법)
-- [6. 검증 방법](#6-검증-방법)
+- [6. 검증 방법](#6-검증-방법) — 6.5 실측 결과
 - [7. 미확인 사항 및 후속 과제](#7-미확인-사항-및-후속-과제)
 - [8. 참고 자료](#8-참고-자료)
 - [9. 부록 — Iceberg 1.11.0 / Spark 4.1 업그레이드 검토](#9-부록--iceberg-1110--spark-41-업그레이드-검토)
@@ -49,6 +49,96 @@
 ---
 
 ## 1. 현상 검증 — expire_snapshots가 MinIO에 요청을 쏟는 구조
+
+### 1.0 배경 개념 — `io-impl`이란 무엇이고, 왜 설정이 두 벌 필요한가
+
+> 보고 시 이 절만 읽어도 전환의 의미가 전달되도록 정리한다.
+
+#### `FileIO`는 Iceberg가 스토리지와 대화하는 "통역사"다
+
+Iceberg 테이블은 결국 **오브젝트 스토리지에 놓인 파일 묶음**이다 — metadata.json, manifest list, manifest, 그리고 데이터 파일(Parquet). Iceberg가 이 파일들을 다루려면 스토리지에 접근해야 한다.
+
+**`FileIO`는 그 "파일을 읽고·쓰고·지우는 동작"을 추상화한 인터페이스다.** 실질적인 메서드는 몇 개 되지 않는다.
+
+```java
+InputFile  newInputFile(String path);    // 읽기
+OutputFile newOutputFile(String path);   // 쓰기
+void       deleteFile(String path);      // 삭제
+void       deleteFiles(Iterable<String> paths);  // 일괄 삭제 (SupportsBulkOperations)
+Iterable<FileInfo> listPrefix(String prefix);    // 목록     (SupportsPrefixOperations)
+```
+
+**`io-impl`은 "이 인터페이스의 구현체로 무엇을 쓸 것인가"를 지정하는 설정이다.** 테이블도 데이터도 바뀌지 않는다. **누가 어떤 방식으로 S3에 요청을 보내느냐만 바뀐다.**
+
+| | `HadoopFileIO` (기본값) | `S3FileIO` |
+|---|---|---|
+| 실제 통신 경로 | Iceberg → **Hadoop `FileSystem`** → `S3AFileSystem` → AWS SDK v1 → S3 | Iceberg → AWS SDK v2 → S3 |
+| 추상화 단계 | **2단** | **1단** |
+| 설정 네임스페이스 | `fs.s3a.*` | `s3.*`, `client.*` |
+| 일괄 삭제 | 인터페이스는 있으나 **내부는 단건 루프** (섹션 1.2) | `DeleteObjects` API 실사용 |
+
+#### 그럼 기존에는 왜 `s3a`를 썼나
+
+두 가지다.
+
+1. **선택한 것이 아니라 기본값이다.** `io-impl`을 설정하지 않으면 HMS 카탈로그는 **무조건** `HadoopFileIO`를 쓴다 ✅ (`HiveCatalog.java:119-123`, 섹션 1.1). 즉 "S3A를 골랐다"기보다 **"아무것도 고르지 않아서 기본값이 됐다"**가 정확하다.
+2. **Spark 생태계의 오래된 표준 경로다.** Hive 시절부터 Spark에서 S3에 접근하는 표준은 S3A였고, 지금도 **원천 avro 읽기는 이 방식**이다. 나쁜 선택이 아니었다.
+
+다만 S3A의 목적은 **"S3를 파일시스템처럼 보이게 하는 것"**이다. 오브젝트 스토리지에는 디렉터리가 없는데, POSIX 디렉터리 시맨틱을 흉내 낸다. 그 흉내의 비용이 이번 문제였다.
+
+```
+S3A의 파일 1개 삭제 = HEAD(존재 확인) + DELETE + LIST(부모가 비었나?) + PUT(비었으면 마커 생성)
+```
+
+**Iceberg는 디렉터리가 필요 없다.** 지울 파일의 전체 경로 목록을 이미 손에 들고 있다. 그런데 S3A를 거치면 매번 디렉터리 확인 비용을 낸다. 관측된 `listObject` 폭주의 정체가 이것이다 (섹션 1.3).
+
+#### 왜 `s3.*` 설정을 새로 넣어야 하나
+
+**`S3FileIO`는 Hadoop을 전혀 사용하지 않기 때문이다.** AWS SDK v2로 S3와 직접 통신하므로 Hadoop 설정(`fs.s3a.*`)을 읽을 방법 자체가 없다. 엔드포인트·인증정보·path-style 여부를 **자기 네임스페이스로 다시 알려줘야 한다.**
+
+이것은 "설정 중복"이 아니라 **"서로 다른 두 클라이언트에게 각각 알려주는 것"**이다.
+
+#### ⚠️ 그리고 `fs.s3a.*`는 지우면 안 된다 — 구조적인 이유
+
+**`io-impl`은 Iceberg 테이블에만 적용된다.** 우리 시스템에서 S3에 접근하는 주체는 둘이다.
+
+```
+Airflow DAG
+  │
+  ├── Spark가 직접 읽음:  s3a://.../원천.avro         ← S3AFileSystem  (fs.s3a.*)
+  │        spark.read.format("avro").load(...)
+  │        └─ Iceberg를 거치지 않는다. Spark DataSource가 Hadoop FileSystem을 직접 호출
+  │
+  └── Iceberg가 읽고 씀:  s3a://.../warehouse/TABLE_A  ← S3FileIO      (s3.*, client.*)
+           df.writeTo("catalog.db.TABLE_A").append()
+           └─ io-impl이 적용되는 것은 여기뿐
+```
+
+| 접근 주체 | 대상 | 클라이언트 | 필요한 설정 |
+|-----------|------|-----------|-------------|
+| **Iceberg** | 테이블의 데이터·메타데이터 파일 | `S3FileIO` (전환 후) | `s3.*`, `client.*` |
+| **Spark 자체** | 원천 avro, 경로 목록 텍스트 파일 | `S3AFileSystem` | `fs.s3a.*` |
+
+`spark.read.format("avro").load("s3a://...")`는 Iceberg를 거치지 않는다. **`io-impl`은 이 경로에 아무런 영향이 없다.** 따라서 `fs.s3a.*`를 지우면 **원천 avro를 읽지 못해 append가 실패한다.**
+
+> **결론: 두 설정이 공존하는 것이 맞다. 과도기적 중복이 아니라 구조적으로 그렇다.** 원천 avro를 Iceberg가 아닌 Spark가 직접 읽는 한 계속 그렇다.
+
+#### 관리 포인트를 하나로 줄이는 방법 (선택)
+
+값 자체는 같은 MinIO를 가리키므로, **인증정보만큼은 한 곳에서 관리**할 수 있다. Hadoop 3.3.4의 `fs.s3a.aws.credentials.provider` 기본 체인에 `EnvironmentVariableCredentialsProvider`가 포함되어 있다 ✅ (`core-default.xml`).
+
+```xml
+<value>
+  org.apache.hadoop.fs.s3a.TemporaryAWSCredentialsProvider,
+  org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider,
+  com.amazonaws.auth.EnvironmentVariableCredentialsProvider,   ← 이것
+  org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider
+</value>
+```
+
+즉 `fs.s3a.aws.credentials.provider` 설정을 **제거해 기본값으로 되돌리면**, S3A도 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` 환경변수를 읽는다. S3FileIO(SDK v2)도 같은 환경변수를 읽으므로 **K8s Secret 하나로 양쪽이 커버된다.**
+
+엔드포인트는 여전히 `fs.s3a.endpoint`와 `s3.endpoint` 두 벌이 필요하다. ⚠️ 단 이 변경도 동작을 바꾸므로 **A/B가 끝난 뒤 별건으로** 적용한다.
 
 ### 1.1 현재 우리가 쓰고 있는 FileIO 확인
 
@@ -1377,6 +1467,69 @@ SELECT count(*) FROM <카탈로그>.<db>.<table> WHERE ts >= ... AND ts < ...;
 | Trino 조회 | 변화 없음 |
 
 ---
+
+### 6.5 실측 결과 (2026-08-27, 운영환경 expire snapshots) ✅
+
+#### 기능 검증
+
+`append`, `expire_snapshots`, `remove_orphan_files`, `rewrite_manifests`, `Compaction` **전부 정상 처리 확인.**
+
+#### MinIO API 호출 (peak req/s)
+
+| API | S3A만 | S3FileIO 추가 | 변화 |
+|-----|-------|---------------|------|
+| `deleteObject` | **481 req/s** | **17.4 req/s** | **−96.4%** |
+| `listObjectV2` | **680 req/s** | **281 req/s** | **−58.7%** |
+
+> **총 요청 수는 이보다 더 줄었다.** 위는 **peak rate**이고 Job duration이 동시에 3.5배 짧아졌으므로, 총량 기준으로는 `deleteObject`가 대략 **−99%** 수준이다 (섹션 1.4의 예측 −99.6%와 정합). 정확한 총량은 audit log 집계가 필요하다 ⚠️
+
+#### DataFlint 지표
+
+| 지표 | S3A만 | S3FileIO 추가 | 변화 |
+|------|-------|---------------|------|
+| **duration** | 13.5분 | **3.8분** | **−72%** |
+| **dcu** | 0.2002 | **0.0550** | **−72.5%** |
+| input | 20.74 MiB | 24.58 MiB | +18% |
+| output | 0 B | 0 B | — |
+| memory usage | 64.32% | 61.40% | −3%p |
+| shuffle read | 334.65 MiB | 241.35 MiB | −28% |
+| shuffle write | 241.83 MiB | 141.17 MiB | −41% |
+| spill | 0 B | 0 B | — |
+| **idle cores** | 89.59% | **90.25%** | +0.7%p |
+| DataFlint alerts | 18개 | **6개** | −12 |
+
+#### 해석
+
+**① 개선은 Spark stage가 아니라 "보이지 않는 driver 삭제 구간"에서 났다.**
+
+`input`이 오히려 **18% 늘었는데** duration은 **72% 줄었다.** 두 실행의 처리량이 애초에 같지 않다는 뜻이므로 엄밀한 통제 실험은 아니지만, **더 많은 데이터를 3.5배 빨리 처리했다**는 점에서 결론은 오히려 강화된다.
+
+stage 지표(shuffle read/write)는 같은 자릿수에 머무는 반면 duration만 급감했다. 이는 **executor 구간이 아니라 driver 삭제 구간이 사라졌다**는 뜻이며, 섹션 5.1.2에서 예측한 `Job duration − stage 소요 합계 = 삭제 시간` 구조와 정확히 일치한다.
+
+**② `dcu`와 `duration`이 같은 비율(−72%)로 움직였다.**
+
+`dcu ∝ cores × duration`인데 cores를 바꾸지 않았으므로 두 값이 함께 움직이는 것이 정상이다. 노이즈 기준선 **±15%를 압도적으로 초과**하므로 실제 효과로 판정한다.
+
+**③ `idle cores` 90%는 그대로다 — 이것이 다음 조치의 신호다.**
+
+executor 4개 × 4코어 = 16코어인데 90%가 놀고 있다. 전환 전에는 "driver가 삭제하는 동안 executor가 논다"는 설명이 가능했지만, **삭제 구간이 사라진 지금도 90%라면 순수하게 과다 할당**이다. 섹션 5.1.2의 예고대로 **executor 축소가 다음 작업**이다.
+
+**④ 남은 alert 4종 중 실제로 조치할 것은 하나다.**
+
+| alert | 판정 |
+|-------|------|
+| **idle cores too high** | ✅ **조치 대상** — executor 축소 |
+| executor memory over-provisioned | △ 보류 — 61.4% / spill 0B는 여유가 있다는 뜻이나, 3.8분짜리 Job에서 얻을 이득이 작다 |
+| long filter condition | ✕ 무시 — `expiredFileDS = deleteCandidateFileDS.except(validFileDS)`의 구조적 특성 |
+| broadcast small table in sort merge join | ✕ 무시 — 위 `except`가 sort-merge join으로 풀린 것. 3.8분 규모에서 실익 없음 |
+
+#### ⚠️ 측정 해석 시 주의
+
+| 항목 | 내용 |
+|------|------|
+| **MinIO 지표는 클러스터 전체일 가능성** | append(5분 주기)·Compaction이 동시에 돌고 있다면 그 트래픽이 섞인다. 잔존 `deleteObject` 17.4 req/s와 `listObjectV2` 281 req/s의 상당 부분이 **다른 Job의 것**일 수 있다 |
+| **`DeleteObjects`(복수형) 지표 확인** | bulk delete가 실제로 쓰였다는 직접 증거다. MinIO가 이를 별도 지표로 노출하는지 확인할 것 (섹션 6.2) |
+| 두 실행의 처리량 차이 | `input` +18% — 통제된 A/B가 아니다. 다만 효과 크기가 이를 압도한다 |
 
 ## 7. 미확인 사항 및 후속 과제
 

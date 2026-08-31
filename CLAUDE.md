@@ -128,7 +128,13 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 ## 작업 6: FileIO 전환 (S3AFileSystem → S3FileIO) — 분석 완료, 적용 대기
 
 - **산출물**: `pipeline/s3fileio-migration-guide.md`
-- **상태**: 원인 검증 완료, 전환 절차 설계 완료. **개발환경에서 `iceberg-aws-bundle-1.10.1` 추가만으로 expire_snapshots 정상 동작 확인(2026-08-26)** → 운영환경 테스트 대기. **MinIO checksum 호환성은 개발환경 통과**
+- **상태**: **운영환경 전환 완료·효과 검증 완료(2026-08-27)**. append/expire/orphan/rewrite manifests/Compaction 전부 정상. MinIO checksum 문제 없음
+- **실측 결과** (가이드 §6.5): `deleteObject` **481 → 17.4 req/s(−96.4%)**, `listObjectV2` **680 → 281 req/s(−58.7%)** (peak 기준). expire snapshots **duration 13.5분 → 3.8분(−72%)**, **dcu 0.2002 → 0.0550(−72.5%)**, DataFlint alert 18 → 6
+  - **개선은 Spark stage가 아니라 driver 삭제 구간에서 났다** — `input`이 오히려 +18%인데 duration이 −72%. shuffle 지표는 같은 자릿수 유지. 예측한 `Job duration − stage 합계 = 삭제 시간` 구조와 일치
+  - **`idle cores` 90%는 그대로 → executor 축소가 다음 조치.** 삭제 구간이 사라진 지금도 90%면 순수 과다 할당(16코어)
+  - ⚠️ MinIO 지표는 클러스터 전체일 수 있음(append 5분 주기·Compaction 동시 실행). 잔존 요청의 상당 부분이 다른 Job의 것일 가능성. **`DeleteObjects`(복수형) 지표 확인이 bulk 사용의 직접 증거**
+- **⚠️ `fs.s3a.*`는 지우면 안 된다 (실측 확인)**: 지우고 테스트했더니 실패. **`io-impl`은 Iceberg 테이블에만 적용**되고 원천 avro는 Spark DataSource가 Hadoop `FileSystem`을 직접 호출하므로 S3A가 담당한다. **두 설정 공존은 과도기적 중복이 아니라 구조적**이다 (가이드 §1.0)
+- **관리 통합 여지(선택, A/B 후)**: Hadoop 3.3.4의 `fs.s3a.aws.credentials.provider` 기본 체인에 `EnvironmentVariableCredentialsProvider`가 포함되므로, 이 설정을 **제거해 기본값으로 되돌리면** S3A도 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`를 읽어 **Secret 하나로 양쪽 커버 가능**. endpoint는 여전히 두 벌 필요
 - **배경**: 1일 배치 삭제 후 `expire_snapshots`가 MinIO에 과도한 `listObject`/`deleteObject`를 발생시켜 부하 유발
 - **핵심 발견**:
   - **`HadoopFileIO`의 bulk delete는 가짜다.** `SupportsBulkOperations`를 구현해 Iceberg는 bulk 분기를 타지만, 내부 `deleteFiles()`가 `Tasks.foreach(...).run(this::deleteFile)`로 단건 삭제를 흩뿌린다 → `DeleteObjects` 요청이 0건
