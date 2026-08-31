@@ -423,6 +423,70 @@ kubectl exec <driver-pod> -- printenv | grep AWS_        # 값이 주입됐는�
 
 ⚠️ 이 정리는 **동작을 바꾸는 변경**이므로 다른 변경과 같은 배포에 섞지 말고 단독으로 적용해 확인한다 (성능과는 무관하므로 측정을 기다릴 필요는 없다).
 
+#### Q7. 스킴(`s3://` / `s3a://` / `s3n://`)은 무엇이고 성능 차이가 있나
+
+##### "S3AFileSystem은 s3a, S3FileIO는 s3"가 아니다
+
+앞의 절반만 맞다.
+
+| | 스킴에 묶여 있나 |
+|---|---|
+| `S3AFileSystem` | **묶여 있다** — `fs.s3a.impl`로 `s3a://`에 매핑된다 |
+| `S3FileIO` | **묶여 있지 않다** |
+
+**증거는 우리 환경 자체다.** 전환 후에도 테이블 경로는 여전히 `s3a://`인데 `S3FileIO`가 정상 처리하고 있다. `S3URI`가 스킴을 검증조차 하지 않기 때문이다 (섹션 4.1). `S3FileIO`에게 스킴은 **bucket과 key를 뽑아내기 위한 문자열 앞부분**일 뿐이다.
+
+스킴을 누가 해석하는지가 핵심이다.
+
+| 계층 | 스킴의 역할 |
+|------|-------------|
+| **Hadoop `FileSystem`** | **구현체를 고르는 키다.** `fs.<scheme>.impl`을 찾아 클래스를 로드한다 |
+| **Iceberg `FileIO`** | **거의 의미 없다.** 구현체는 이미 `io-impl`로 정해져 있고, 스킴은 URI 파싱용이다 |
+
+##### 스킴별 성능 차이는 Hadoop 2.x 시절 이야기다
+
+세 스킴은 **서로 다른 구현체**였고, 그래서 실제로 성능이 달랐다.
+
+| 스킴 | 구현체 | 특징 | Hadoop 3.x 현재 |
+|------|--------|------|-----------------|
+| `s3://` | `S3FileSystem` | S3를 **블록 스토리지처럼** 사용. 파일을 조각내 저장해 S3에서 직접 열 수 없었다 | **제거됨** |
+| `s3n://` | `NativeS3FileSystem` | 파일을 원본 그대로 저장. 대신 파일 크기 제한, 멀티파트 업로드 미지원 | **제거됨** |
+| `s3a://` | `S3AFileSystem` | `s3n`의 후속. 멀티파트 업로드, 병렬 IO, 컬럼 포맷용 random IO 최적화 | **유일하게 남음** |
+
+공식 문서가 명확하다. ✅ (`hadoop-aws` 3.3.4 `index.md`)
+
+> ### Other S3 Connectors
+> There other Hadoop connectors to S3. **Only S3A is actively maintained by the Hadoop project itself.**
+> 1. Apache's Hadoop's original `s3://` client. **This is no longer included in Hadoop.**
+> 2. Amazon EMR's `s3://` client. This is from the Amazon EMR team, who actively maintain it.
+> 3. Apache's Hadoop's `s3n:` filesystem client. **This connector is no longer available: users must migrate to the newer `s3a:` client.**
+
+**즉 "스킴에 따라 성능이 다르다"는 셋이 공존하던 시절의 사실이고, Hadoop 3.x에는 `s3a`밖에 없어 비교 자체가 성립하지 않는다.** 블로그 글들이 그 시절 내용을 담고 있는 것이다.
+
+##### ⚠️ AWS EMR의 `s3://`는 완전히 다른 것이다
+
+위 문서 2번 항목이다. EMR의 `s3://`는 **EMRFS**라는 아마존 자체 구현이고 지금도 활발히 관리된다. AWS 문서가 "EMR에서는 `s3://`를 쓰라"고 하는 이유다. **vanilla Spark + MinIO인 우리와는 무관하다.**
+
+##### "`s3`가 레거시"인가 — 맥락에 따라 정반대다
+
+| 맥락 | `s3://`의 의미 |
+|------|---------------|
+| **Hadoop** | 제거된 레거시. `s3a://`가 표준 |
+| **AWS EMR** | EMRFS. **권장 스킴** |
+| **Iceberg / Trino 등** | 자체 S3 클라이언트를 쓰므로 스킴이 큰 의미 없음. 관례적으로 `s3://` 표기를 많이 쓴다 |
+
+같은 `s3://`라는 글자가 세 맥락에서 다른 것을 가리키기 때문에, 블로그 글들이 서로 모순돼 보인다.
+
+##### 우리는 `s3a://`를 유지한다
+
+| 이유 | 설명 |
+|------|------|
+| **바꿀 실익이 0이다** | `S3FileIO`는 스킴을 무시하고 bucket/key만 쓴다. 성능이 동일하다 |
+| **바꾸는 비용이 크다** | 기존 테이블 메타데이터에 절대 경로가 `s3a://`로 박혀 있다. 스킴을 바꾸려면 metadata rewrite가 필요한데, **이번 전환이 "마이그레이션 불필요"였던 이유가 정확히 그것을 안 했기 때문이다** (섹션 4.1) |
+| **어차피 S3A가 필요하다** | 원천 avro와 eventLog는 Hadoop `FileSystem`이 처리하고, 거기서 `s3a://`는 **유일한 선택지**다 (Q6) |
+
+> 신규 시스템을 처음부터 설계한다면 Hadoop `FileSystem`을 쓰지 않는 순수 Iceberg 스택에서는 `s3://`가 관례다. 다만 Spark를 쓰는 한 Hadoop `FileSystem`이 따라오므로 `s3a://`가 실용적이다.
+
 ### 1.1 현재 우리가 쓰고 있는 FileIO 확인
 
 `spark.sql.catalog.<카탈로그>.io-impl`을 명시하지 않으면 HMS 카탈로그는 **`HadoopFileIO`로 고정**된다. ✅ 소스 검증
