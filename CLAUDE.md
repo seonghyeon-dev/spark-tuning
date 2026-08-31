@@ -125,7 +125,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - 현재 데이터(36~42GB)에서 산정값이 12~14로 좁아 **정적 12로 운영하며 동적화를 미루는 선택도 가능**. `C=0.32`은 hourly 전용 — daily는 별도 측정 필요
 - **후속 과제**: **daily Compaction의 `rewrite-all` 낭비 의심** — hourly가 정리한 뒤라 no-op이어야 하는데 888GB에 30~60분(데이터 양에 선형). daily 단계 최우선 확인 항목
 
-## 작업 6: FileIO 전환 (S3AFileSystem → S3FileIO) — 분석 완료, 적용 대기
+## 작업 6: FileIO 전환 (S3AFileSystem → S3FileIO) — 전환 완료, 후속 작업 대기
 
 - **산출물**: `pipeline/s3fileio-migration-guide.md`
 - **상태**: **운영환경 전환 완료·효과 검증 완료(2026-08-27)**. append/expire/orphan/rewrite manifests/Compaction 전부 정상. MinIO checksum 문제 없음
@@ -170,7 +170,14 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **`spark-avro`는 Spark 배포판에 없다**(공식 문서 확인) — 현재 fat jar/이미지/`--packages` 중 어디서 오는지 확인 필요. **권장은 이미지**(Spark 버전과 짝이어야 하는데 fat jar에 두면 드리프트 — 예전 Dockerfile의 `3.5.6` vs 런타임 `3.5.8`이 실례). **단 지금 옮기지 말 것** — A/B 진행 중이며 Spark 4 전환 때 `_2.13-4.1.1`로 바꾸며 함께 정리하는 것이 자연스럽다
 - **배치 위치는 이미지의 `$SPARK_HOME/jars/`** — pom.xml fat jar는 ①60MB 매 submit 전송 ②bundle이 이미 relocate한 `org.apache.http`/`io.netty`를 shade가 다시 건드려 깨질 위험 ③`iceberg-spark-runtime`의 `iceberg-aws` 클래스와 중복 때문에 비권장. SQL 프로시저(`CALL ... expire_snapshots`)만 호출한다면 **pom에는 아무것도 추가할 필요 없다**(런타임 classpath 문제). Spark 4 복귀 시 `iceberg-spark-runtime`만 `4.0_2.13`으로 교체하고 **`iceberg-aws-bundle`은 그대로**
 - **⚠️ jar 구성 — `iceberg-aws-bundle` 단일 jar 필수** (가이드 §5.0.1, 실제 발생): `NoClassDefFoundError: software/amazon/awssdk/services/kms/...`는 개별 SDK jar 조합의 증상이다. `S3FileIO.initialize()` → `S3FileIOAwsClientFactories.initialize()` → `AwsClientFactories.from()`이 반환하는 `DefaultAwsClientFactory`가 **`AwsClientFactory` 인터페이스의 `KmsClient kms()`/`GlueClient glue()`/`DynamoDbClient dynamo()` 시그니처** 때문에 KMS·Glue·DynamoDB 클래스를 링크 시점에 요구한다 — **S3만 써도 예외 없음**. bundle은 이 모듈들을 전부 포함하므로(`aws-bundle/build.gradle:27-42`) bundle 하나로 통일할 것. bundle은 `org.apache.http`/`io.netty`를 relocate하므로 **개별 `awssdk:*` jar와 혼재시키면 중복 클래스 충돌**
-- **미확인**: 실제 삭제 파일 수(추정치 사용), 읽기/쓰기 성능 영향(`dcu/GB` A/B 필요, 노이즈 기준선 ±15%), `fs.s3a.acl.default`의 MinIO 실제 효력, driver Pod `limits.cpu` 유무
+- **미확인**: 실제 삭제 파일 수(추정치 사용), Compaction/append의 읽기·쓰기 성능 영향(`dcu/GB` 비교 필요, 노이즈 기준선 ±15%), `fs.s3a.acl.default`의 MinIO 실제 효력
+- **남은 후속 작업** (전부 보류 상태, 서로 독립):
+  1. **maintenance Job 리소스 축소** — `idle cores` 90%가 전환 후에도 그대로다. executor `instances` 4 → 2 검토 (§5.1.2). `coreLimit=1` 적용도 여기 포함
+  2. **자격증명 통합** — K8s Secret → 환경변수로 일원화, `fs.s3a.aws.credentials.provider` 제거 (§1.0.1 Q6). 절차와 매니페스트 예시까지 정리됨. 성능과 무관하므로 언제 해도 되나 **단독 배포로** 적용
+  3. **`fs.s3a.acl.default=PublicReadWrite` 제거 검토** — 보안 항목 (§5.1.1)
+  4. **`remove_orphan_files`의 `prefix_listing => true`** — LIST 추가 감소 여지. 기존 S3A 디렉터리 마커 오탐 검증 필요 (§2.2, §4.8)
+  5. **Compaction/append `dcu/GB` 비교** — 리소스 튜닝과 함께 진행
+  6. **Iceberg 1.11.0 + Spark 4.1 업그레이드** — 작업 7 참조
 
 ## 작업 7: Iceberg 1.11.0 / Spark 4.1 업그레이드 검토 — 분석 완료, 순서 확정
 
