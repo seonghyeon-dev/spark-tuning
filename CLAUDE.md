@@ -134,6 +134,11 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **`idle cores` 90%는 그대로 → executor 축소가 다음 조치.** 삭제 구간이 사라진 지금도 90%면 순수 과다 할당(16코어)
   - ⚠️ MinIO 지표는 클러스터 전체일 수 있음(append 5분 주기·Compaction 동시 실행). 잔존 요청의 상당 부분이 다른 Job의 것일 가능성. **`DeleteObjects`(복수형) 지표 확인이 bulk 사용의 직접 증거**
 - **⚠️ `fs.s3a.*`는 지우면 안 된다 (실측 확인)**: 지우고 테스트했더니 실패. **`io-impl`은 Iceberg 테이블에만 적용**되고 원천 avro는 Spark DataSource가 Hadoop `FileSystem`을 직접 호출하므로 S3A가 담당한다. **두 설정 공존은 과도기적 중복이 아니라 구조적**이다 (가이드 §1.0)
+- **회의 대응 FAQ (가이드 §1.0.1)**:
+  - **SDK v1/v2 차이는 시점 문제다** — S3A는 2010년대 초에 만들어져 당시 유일했던 SDK v1 위에 구현됐고, S3FileIO는 2021년경이라 처음부터 v2다. Hadoop은 **3.4.0에서야 v2로 전환**했으므로 우리 3.3.4가 v1인 것 (`hadoop-aws` pom 대조 확인). Spark 4.1(Hadoop 3.4.2) 가면 이 차이는 사라진다
+  - **AWS SDK는 FileIO에 포함돼 있지 않다** — `iceberg-aws`는 SDK를 참조만 한다. `iceberg-spark-runtime`(SDK 없음) / `iceberg-aws-bundle`(SDK v2) / `aws-java-sdk-bundle`(SDK v1) 3종 구분
+  - **`HadoopFileIO` ≠ `S3AFileSystem`** — 전자는 Iceberg의 FileIO 구현체(전환 후 미사용), 후자는 Hadoop의 FileSystem 구현체(계속 사용). avro read에 필요한 건 후자다
+  - **Job별 `fs.s3a.*` 필요 여부**: append **필요**(avro read) / **`remove_orphan_files` 필요** — `usePrefixListing` 기본값이 `false`라 목록 조회를 `listDirRecursivelyWithHadoop`으로 한다(`DeleteOrphanFilesSparkAction.java:118,124,329`) / `expire_snapshots` 불필요 — `hadoopConf`·`FileSystem` 참조가 소스에 **0건** / Compaction 미검증. **그래도 Job별로 갈라놓지 말 것** — 미사용 설정은 비용이 0(`S3AFileSystem`은 `s3a://` 접근 시에만 인스턴스화)인데 템플릿 분기는 장애 여지를 만든다
 - **관리 통합 여지(선택, A/B 후)**: Hadoop 3.3.4의 `fs.s3a.aws.credentials.provider` 기본 체인에 `EnvironmentVariableCredentialsProvider`가 포함되므로, 이 설정을 **제거해 기본값으로 되돌리면** S3A도 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`를 읽어 **Secret 하나로 양쪽 커버 가능**. endpoint는 여전히 두 벌 필요
 - **배경**: 1일 배치 삭제 후 `expire_snapshots`가 MinIO에 과도한 `listObject`/`deleteObject`를 발생시켜 부하 유발
 - **핵심 발견**:

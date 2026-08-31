@@ -140,6 +140,100 @@ Airflow DAG
 
 엔드포인트는 여전히 `fs.s3a.endpoint`와 `s3.endpoint` 두 벌이 필요하다. ⚠️ 단 이 변경도 동작을 바꾸므로 **A/B가 끝난 뒤 별건으로** 적용한다.
 
+### 1.0.1 자주 나오는 질문 (회의 대응)
+
+#### Q1. S3A는 왜 SDK v1을 쓰고 S3FileIO는 v2를 쓰나
+
+**둘 다 AWS SDK for Java다. 버전 선택의 문제가 아니라 만들어진 시점의 문제다.**
+
+| | 등장 시점 | 당시 상황 | 결과 |
+|---|---|---|---|
+| **S3A** (Hadoop) | 2010년대 초 | AWS SDK v1(`com.amazonaws.*`)만 존재 | v1 위에 구현 |
+| **S3FileIO** (Iceberg) | 2021년경 | v2(`software.amazon.awssdk.*`)가 이미 표준 | 처음부터 v2 |
+
+AWS SDK v2는 2018년 GA된 **완전히 새로 쓴 라이브러리**다. 패키지명·API·논블로킹 IO 지원이 전부 달라 v1과 호환되지 않는다. Hadoop은 이 마이그레이션을 오래 미루다 **3.4.0에서야 v2로 전환**했다.
+
+```
+hadoop-aws 3.3.4  →  com.amazonaws:aws-java-sdk-bundle      (v1)  ← 현재 우리 환경
+hadoop-aws 3.4.x  →  software.amazon.awssdk:bundle          (v2)
+```
+✅ 소스 검증 (`hadoop-aws-3.3.4.pom`, `hadoop-aws-3.4.1.pom`)
+
+**즉 "S3A는 v1을 고집한다"가 아니라 "우리가 쓰는 Hadoop 3.3.4가 v2 전환 이전 버전이다"가 정확하다.** Spark 4.1(Hadoop 3.4.2)로 올라가면 S3A도 v2가 되어 이 차이는 사라진다 (섹션 9.4-①).
+
+#### Q2. SDK는 AWS SDK를 말하는 것이고, FileIO에 포함된 라이브러리인가
+
+**AWS SDK for Java가 맞다. 그리고 FileIO에 포함되어 있지 않다.**
+
+`iceberg-aws` 모듈(= `S3FileIO` 코드)은 SDK를 **참조만 하고 포함하지 않는다.** 그래서 별도로 `iceberg-aws-bundle`을 넣어야 했고, 넣지 않았을 때 `NoClassDefFoundError`가 난 것이다 (섹션 5.0.1~5.0.2).
+
+| jar | 담고 있는 것 | 누가 쓰나 |
+|-----|-------------|-----------|
+| `iceberg-spark-runtime` | Iceberg 코드 (`iceberg-aws` = **S3FileIO 코드** 포함) — **SDK 없음** | Iceberg 전반 |
+| `iceberg-aws-bundle` | **AWS SDK v2** (s3, kms, glue, dynamodb, sts …) | `S3FileIO`가 호출 |
+| `aws-java-sdk-bundle` | **AWS SDK v1** | `hadoop-aws`(S3A)가 호출 |
+
+비유하자면 `S3FileIO`는 **"SDK를 사용하는 코드"**이고 SDK는 **"실제로 HTTP 요청을 만들어 보내는 라이브러리"**다. 설계도와 부품의 관계이며, 부품은 따로 조달해야 한다.
+
+#### Q3. avro read할 때만 `HadoopFileIO`가 필요한 것 아닌가
+
+**용어를 하나 분리해야 한다. `HadoopFileIO`와 `S3AFileSystem`은 다른 것이다.**
+
+| | 정체 | 소속 | 전환 후 |
+|---|---|---|---|
+| `HadoopFileIO` | Iceberg의 **FileIO 구현체** 중 하나 | Iceberg | **더 이상 안 쓴다** (`S3FileIO`로 교체됨) |
+| `S3AFileSystem` | Hadoop의 **FileSystem 구현체** | Hadoop | **계속 쓴다** (avro read 등) |
+
+**avro read는 `HadoopFileIO`를 거치지 않는다.** Iceberg를 아예 거치지 않기 때문이다.
+
+```
+[Iceberg 계층]                                                    ┌─ AWS SDK v1 ─┐
+  FileIO ─┬─ HadoopFileIO ──→ Hadoop FileSystem ─→ S3AFileSystem ─┤              │
+          │   (전환 전)                                            │              ├─→ MinIO
+          └─ S3FileIO ──────────────────────────→ AWS SDK v2 ─────┼──────────────┘
+              (전환 후)                                            │
+[Spark 계층]                                                      │
+  DataSource(avro) ──────────→ Hadoop FileSystem ─→ S3AFileSystem ┘
+```
+
+즉 정확한 문장은 **"avro read에 필요한 것은 `HadoopFileIO`가 아니라 `S3AFileSystem`(과 `fs.s3a.*` 설정)이다"**가 된다. 전환으로 사라지는 것은 `HadoopFileIO`이고, `S3AFileSystem`은 그대로 남는다.
+
+#### Q4. maintenance Job은 avro를 안 읽는데 `fs.s3a.*`가 필요한가
+
+**날카로운 지적이고, Job마다 답이 다르다.** ✅ 소스 검증
+
+| Job | Hadoop `FileSystem` 사용 여부 | `fs.s3a.*` 필요? |
+|-----|------------------------------|------------------|
+| **append** | 사용 — 원천 avro read | **필요** |
+| **expire_snapshots** | **사용하지 않음** — `hadoopConf`/`FileSystem` 참조가 소스에 **0건** | 불필요 |
+| **remove_orphan_files** | **사용함** — 아래 참조 | **필요** |
+| Compaction (`rewrite_data_files`) | 데이터 입출력은 FileIO 경유 | 불필요할 것으로 보이나 ⚠️ 미검증 |
+
+**`remove_orphan_files`가 함정이다.** 목록 조회 방식이 기본적으로 Hadoop `FileSystem`이다.
+
+```java
+// DeleteOrphanFilesSparkAction.java (Iceberg 1.10.1)
+:118   private boolean usePrefixListing = false;                                  // ← 기본값 false
+:124   this.hadoopConf = new SerializableConfiguration(spark.sessionState().newHadoopConf());
+:329   FileSystemWalker.listDirRecursivelyWithHadoop(location, ..., hadoopConf.value(), ...);
+```
+
+orphan 파일을 찾으려면 **스토리지에 실제로 있는 파일 목록**과 **테이블이 참조하는 목록**을 비교해야 하는데, 전자를 구하는 기본 경로가 Hadoop `FileSystem`이다. `prefix_listing => true`를 주면 FileIO(`listPrefix`)를 쓰지만 **기본값이 `false`**다.
+
+반면 `expire_snapshots`는 삭제 대상을 **테이블 메타데이터만으로** 계산하므로 Hadoop이 전혀 등장하지 않는다.
+
+#### 그럼 Job별로 설정을 다르게 가져갈까 — 권장하지 않는다
+
+이론적으로는 expire 전용 Job에서 `fs.s3a.*`를 뺄 수 있다. 그러나 **얻는 것이 없다.**
+
+| 관점 | 판단 |
+|------|------|
+| 성능/자원 | **비용이 0이다.** `S3AFileSystem`은 `s3a://` 경로에 실제로 접근할 때만 인스턴스화된다. 설정이 있어도 쓰이지 않으면 클라이언트가 만들어지지 않는다 |
+| 관리 | 카탈로그 설정을 Job별로 갈라놓으면 **템플릿이 분기되고 실수 여지가 생긴다.** 나중에 `prefix_listing`을 켜거나 Job 구성이 바뀌면 조용히 깨진다 |
+| 검증 범위 | Compaction 등 일부 Job은 아직 미검증이다. 지운 뒤 특정 조건에서만 실패하면 원인 추적이 어렵다 |
+
+> **결론: `fs.s3a.*`와 `s3.*`를 모든 Job에 함께 두는 현재 구성이 맞다.** 설정 몇 줄을 줄이자고 장애 가능성을 만들 이유가 없다. 관리 부담이 신경 쓰인다면 설정을 지우는 대신 **인증정보를 환경변수로 통합**하는 편이 낫다 (섹션 1.0 말미).
+
 ### 1.1 현재 우리가 쓰고 있는 FileIO 확인
 
 `spark.sql.catalog.<카탈로그>.io-impl`을 명시하지 않으면 HMS 카탈로그는 **`HadoopFileIO`로 고정**된다. ✅ 소스 검증
