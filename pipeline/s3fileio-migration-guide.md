@@ -200,39 +200,82 @@ hadoop-aws 3.4.x  →  software.amazon.awssdk:bundle          (v2)
 
 #### Q4. maintenance Job은 avro를 안 읽는데 `fs.s3a.*`가 필요한가
 
-**날카로운 지적이고, Job마다 답이 다르다.** ✅ 소스 검증
+**필요하다. 그것도 Job이 무엇을 하는지와 전혀 무관하게 필요하다.**
 
-| Job | Hadoop `FileSystem` 사용 여부 | `fs.s3a.*` 필요? |
-|-----|------------------------------|------------------|
-| **append** | 사용 — 원천 avro read | **필요** |
-| **expire_snapshots** | **사용하지 않음** — `hadoopConf`/`FileSystem` 참조가 소스에 **0건** | 불필요 |
-| **remove_orphan_files** | **사용함** — 아래 참조 | **필요** |
-| Compaction (`rewrite_data_files`) | 데이터 입출력은 FileIO 경유 | 불필요할 것으로 보이나 ⚠️ 미검증 |
+이유는 Iceberg가 아니라 **Spark 자체**에 있다. `fs.s3a.*`를 제거하고 실행하면 다음 오류로 실패한다.
 
-**`remove_orphan_files`가 함정이다.** 목록 조회 방식이 기본적으로 Hadoop `FileSystem`이다.
-
-```java
-// DeleteOrphanFilesSparkAction.java (Iceberg 1.10.1)
-:118   private boolean usePrefixListing = false;                                  // ← 기본값 false
-:124   this.hadoopConf = new SerializableConfiguration(spark.sessionState().newHadoopConf());
-:329   FileSystemWalker.listDirRecursivelyWithHadoop(location, ..., hadoopConf.value(), ...);
+```
+ERROR SparkContext: Error initializing SparkContext.
+java.nio.file.AccessDeniedException: s3a://bucket/logs/spark:
+  org.apache.hadoop.fs.s3a.auth.NoAuthWithAWSException:
+  No AWS Credentials provided by TemporaryAWSCredentialsProvider ...
 ```
 
-orphan 파일을 찾으려면 **스토리지에 실제로 있는 파일 목록**과 **테이블이 참조하는 목록**을 비교해야 하는데, 전자를 구하는 기본 경로가 Hadoop `FileSystem`이다. `prefix_listing => true`를 주면 FileIO(`listPrefix`)를 쓰지만 **기본값이 `false`**다.
+**`Error initializing SparkContext` — Iceberg 코드가 실행되기 한참 전에 죽는다.** 원인은 `spark.eventLog.dir`이 `s3a://` 스킴이기 때문이다. ✅ 소스 검증
 
-반면 `expire_snapshots`는 삭제 대상을 **테이블 메타데이터만으로** 계산하므로 Hadoop이 전혀 등장하지 않는다.
+```scala
+// SparkContext.scala:627-633 (Spark 3.5.8) — SparkContext 생성자 내부
+_eventLogger =
+  if (isEventLogEnabled) {
+    val logger = new EventLoggingListener(_applicationId, _applicationAttemptId,
+                                          _eventLogDir.get, _conf, _hadoopConfiguration)
+    logger.start()          // ← 여기서 로그 파일을 실제로 생성한다
+    ...
+```
 
-#### 그럼 Job별로 설정을 다르게 가져갈까 — 권장하지 않는다
+```scala
+// EventLoggingListener.scala:76-83
+/** Creates the log file in the configured log directory. */
+def start(): Unit = {
+  logWriter.start()
+  initEventLog()
+}
+```
 
-이론적으로는 expire 전용 Job에서 `fs.s3a.*`를 뺄 수 있다. 그러나 **얻는 것이 없다.**
+`logWriter.start()`가 Hadoop `FileSystem`으로 `s3a://bucket/logs/spark/` 아래에 이벤트 로그 파일을 만든다. 자격증명이 없으면 `NoAuthWithAWSException` → **SparkContext 생성 실패 → Job이 시작조차 못 한다.**
 
-| 관점 | 판단 |
-|------|------|
-| 성능/자원 | **비용이 0이다.** `S3AFileSystem`은 `s3a://` 경로에 실제로 접근할 때만 인스턴스화된다. 설정이 있어도 쓰이지 않으면 클라이언트가 만들어지지 않는다 |
-| 관리 | 카탈로그 설정을 Job별로 갈라놓으면 **템플릿이 분기되고 실수 여지가 생긴다.** 나중에 `prefix_listing`을 켜거나 Job 구성이 바뀌면 조용히 깨진다 |
-| 검증 범위 | Compaction 등 일부 Job은 아직 미검증이다. 지운 뒤 특정 조건에서만 실패하면 원인 추적이 어렵다 |
+> ⚠️ **따라서 "Job별로 필요 여부가 다르다"는 판단은 성립하지 않는다.** `spark.eventLog.enabled=true`이고 `spark.eventLog.dir`이 `s3a://`인 한, **append든 expire든 orphan이든 Compaction이든 전부 `fs.s3a.*`가 필요하다.** Iceberg 계층의 분석(아래)은 그보다 한 단계 아래 이야기이고, 애초에 거기까지 도달하지 못한다.
 
-> **결론: `fs.s3a.*`와 `s3.*`를 모든 Job에 함께 두는 현재 구성이 맞다.** 설정 몇 줄을 줄이자고 장애 가능성을 만들 이유가 없다. 관리 부담이 신경 쓰인다면 설정을 지우는 대신 **인증정보를 환경변수로 통합**하는 편이 낫다 (섹션 1.0 말미).
+참고로 `spark.history.fs.logDirectory`는 **History Server(별도 프로세스)**가 읽는 설정이라 이 오류의 직접 원인은 아니다. 다만 같은 위치를 가리키므로 History Server 쪽에도 S3A 자격증명이 필요하다.
+
+##### 참고 — Iceberg 계층만 놓고 보면 (실무적 결론은 위가 우선한다)
+
+`spark.eventLog.dir`을 로컬이나 다른 스토리지로 옮긴다고 가정했을 때, Iceberg 코드가 Hadoop `FileSystem`을 쓰는지는 Job마다 다르다. ✅ 소스 검증
+
+| Job | Iceberg가 Hadoop `FileSystem`을 쓰나 | 근거 |
+|-----|------------------------------------|------|
+| append | **쓴다** — 원천 avro read | Spark DataSource → Hadoop FS |
+| `expire_snapshots` | **안 쓴다** | `hadoopConf`·`FileSystem` 참조가 소스에 **0건** |
+| `remove_orphan_files` | **쓴다** | `usePrefixListing` 기본값 `false` → `listDirRecursivelyWithHadoop` (`DeleteOrphanFilesSparkAction.java:118, 124, 329`) |
+| Compaction | 데이터 입출력은 FileIO 경유 | ⚠️ 미검증 |
+
+**그래도 Job별로 설정을 갈라놓지 않는다.** eventLog 문제로 어차피 전부 필요하고, 설령 그것을 해결하더라도 얻는 것이 없다.
+
+- **비용이 0이다.** `S3AFileSystem`은 `s3a://` 경로에 실제로 접근할 때만 인스턴스화된다. 미사용 설정은 자원을 쓰지 않는다
+- **관리상 손해다.** 카탈로그 설정 템플릿이 Job별로 분기되면 나중에 `prefix_listing`을 켜거나 구성이 바뀔 때 조용히 깨진다
+
+#### Q5. Iceberg manifest도 avro인데, 그것 때문에 `fs.s3a.*`나 `spark-avro`가 필요한 것 아닌가
+
+**아니다. manifest avro는 완전히 다른 경로로 읽는다.** ✅ 소스 검증
+
+```java
+// BaseSparkAction.java:419-429 (ReadManifest)
+public CloseableIterator<FileInfo> entries(ManifestFileBean manifest) {
+  FileIO io = table.getValue().io();                        // ← FileIO를 통해 읽는다
+  ...
+  return CloseableIterator.transform(
+      ManifestFiles.read(manifest, io, specs).select(proj).iterator(), ...);
+}
+```
+
+| | 원천 avro (append 입력) | Iceberg manifest (avro) |
+|---|---|---|
+| 읽는 주체 | **Spark DataSource** | **Iceberg 자체 reader** (`org.apache.iceberg.avro`) |
+| 경로 | Spark → Hadoop `FileSystem` → `S3AFileSystem` | Iceberg → `FileIO` → **`S3FileIO`** (전환 후) |
+| `spark-avro` 필요? | **필요** | **불필요** — Avro 라이브러리는 `iceberg-spark-runtime`에 이미 포함 |
+| `fs.s3a.*` 필요? | **필요** | **불필요** |
+
+즉 **"avro 파일이니까 같은 경로로 읽는다"가 아니다.** 포맷이 같을 뿐, 읽는 주체와 스토리지 접근 경로가 다르다. `expire_snapshots`가 manifest를 대량으로 읽으면서도 `hadoopConf` 참조가 0건인 이유가 바로 이것이다.
 
 ### 1.1 현재 우리가 쓰고 있는 FileIO 확인
 
