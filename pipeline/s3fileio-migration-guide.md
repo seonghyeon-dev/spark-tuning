@@ -277,6 +277,102 @@ public CloseableIterator<FileInfo> entries(ManifestFileBean manifest) {
 
 즉 **"avro 파일이니까 같은 경로로 읽는다"가 아니다.** 포맷이 같을 뿐, 읽는 주체와 스토리지 접근 경로가 다르다. `expire_snapshots`가 manifest를 대량으로 읽으면서도 `hadoopConf` 참조가 0건인 이유가 바로 이것이다.
 
+#### Q6. `spark.eventLog.dir`의 스킴을 `s3a://`에서 `s3://`로 바꾸면 S3A를 뺄 수 있나
+
+**안 된다. 여기에는 개념 혼동이 하나 있다.**
+
+##### `s3.*`(Iceberg 프로퍼티)와 `s3://`(URI 스킴)은 전혀 다른 것이다
+
+| | 정체 | 읽는 주체 |
+|---|---|---|
+| `s3.endpoint`, `s3.path-style-access` … | **Iceberg 카탈로그 프로퍼티** | `S3FileIO` |
+| `s3://`, `s3a://` | **URI 스킴** | Hadoop `FileSystem`이 `fs.<scheme>.impl`로 구현체를 찾음 |
+
+이름이 비슷할 뿐 **아무 관계가 없다.** URI 스킴을 바꾼다고 해서 Spark가 `S3FileIO`를 쓰게 되지는 않는다.
+
+##### Spark의 eventLog는 `FileIO`라는 개념 자체를 모른다
+
+`spark.eventLog.dir`을 처리하는 것은 Spark 코어이고, Spark 코어는 **Hadoop `FileSystem`만 안다.** Iceberg 라이브러리를 사용하지 않으므로 `S3FileIO`가 존재한다는 사실조차 모른다. 스킴을 무엇으로 바꾸든 Hadoop `FileSystem` 계층에서 해결된다.
+
+##### 그리고 Hadoop 3.x에는 `s3://` 구현체가 없다 ✅ 소스 검증
+
+`core-default.xml`(Hadoop 3.3.4)에는 `fs.s3a.impl`만 정의되어 있고 **`fs.s3.impl`은 존재하지 않는다.**
+
+```xml
+<property>
+  <name>fs.s3a.impl</name>
+  <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+</property>
+```
+
+구형 `s3://`(S3 block filesystem)와 `s3n://`은 **Hadoop 3.0에서 제거**됐다(`core-default.xml`에 관련 클래스 참조 **0건**). 따라서 `spark.eventLog.dir=s3://...`로 바꾸면 `No FileSystem for scheme "s3"`로 실패한다.
+
+억지로 `fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem`을 설정하면 동작은 하지만 **결국 S3A로 되돌아오고 `fs.s3a.*` 설정을 그대로 읽는다.** 이름만 바뀌고 얻는 것이 없다.
+
+##### S3A를 완전히 제거할 수 있나 — 없다
+
+| 의존 지점 | 제거 가능? |
+|-----------|-----------|
+| `spark.eventLog.dir` | 이론상 가능 — 로컬/PVC로 옮기면 된다. 다만 History 중앙 수집을 잃는다 |
+| **원천 avro read** | **불가능** |
+
+`spark.read.format("avro").load("s3a://...")`는 **Spark DataSource**이고, Spark DataSource는 Hadoop `FileSystem`만 사용한다. **Iceberg의 `S3FileIO`를 Spark DataSource에 끼워 넣는 방법은 없다** — 서로 다른 프로젝트의 서로 다른 인터페이스다.
+
+> **원천 데이터를 Spark로 S3에서 읽는 한 S3A는 남는다.** Spark 4.1(Hadoop 3.4.2)로 올라가도 마찬가지다. SDK만 v2로 통일될 뿐 구조는 그대로다.
+
+##### "설정이 2벌"이 아니라 "클라이언트가 2개"다
+
+한 JVM 안에서 S3에 말을 거는 라이브러리가 둘이고, 둘은 **설정을 공유하지 않는다.** 같은 서버에서 도는 애플리케이션 두 개가 같은 DB를 쓰더라도 각자 커넥션 설정을 갖는 것과 같다.
+
+##### 실질적으로 줄이는 방법 — 자격증명은 한 곳으로 통합된다
+
+중복의 실체는 **자격증명 2벌**인데, 이것은 없앨 수 있다 (섹션 1.0 말미).
+
+**현재**
+
+```properties
+# S3A
+spark.hadoop.fs.s3a.endpoint=minio:9000
+spark.hadoop.fs.s3a.connection.ssl.enabled=false
+spark.hadoop.fs.s3a.path.style.access=true
+spark.hadoop.fs.s3a.access.key=<KEY>                    # ← 자격증명 ①
+spark.hadoop.fs.s3a.secret.key=<SECRET>                 # ←
+spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+
+# Iceberg
+spark.sql.catalog.<카탈로그>.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+spark.sql.catalog.<카탈로그>.s3.endpoint=http://minio:9000
+spark.sql.catalog.<카탈로그>.s3.path-style-access=true
+spark.sql.catalog.<카탈로그>.s3.access-key-id=<KEY>      # ← 자격증명 ②
+spark.sql.catalog.<카탈로그>.s3.secret-access-key=<SECRET>
+spark.sql.catalog.<카탈로그>.client.region=us-east-1
+```
+
+**통합 후**
+
+```yaml
+# K8s Secret → 환경변수 (driver/executor 양쪽) — 자격증명은 여기 한 곳뿐
+env:
+  - name: AWS_ACCESS_KEY_ID     { secretKeyRef: ... }
+  - name: AWS_SECRET_ACCESS_KEY { secretKeyRef: ... }
+  - name: AWS_REGION            value: us-east-1
+```
+
+```properties
+# S3A — fs.s3a.aws.credentials.provider를 "제거"하면 기본 체인이 환경변수를 읽는다
+spark.hadoop.fs.s3a.endpoint=http://minio:9000
+spark.hadoop.fs.s3a.path.style.access=true
+
+# Iceberg — 자격증명/region 미지정 시 SDK v2 기본 체인이 환경변수를 읽는다
+spark.sql.catalog.<카탈로그>.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+spark.sql.catalog.<카탈로그>.s3.endpoint=http://minio:9000
+spark.sql.catalog.<카탈로그>.s3.path-style-access=true
+```
+
+**자격증명은 한 곳(K8s Secret)으로 통합되고, 남는 중복은 endpoint 1줄뿐이다.** `connection.ssl.enabled`는 endpoint에 `http://`를 명시하면 불필요하고(섹션 5.1.1), `client.region`도 `AWS_REGION`으로 대체된다.
+
+⚠️ 이 정리도 **동작을 바꾸는 변경**이므로 A/B 측정이 끝난 뒤 별건으로 적용한다.
+
 ### 1.1 현재 우리가 쓰고 있는 FileIO 확인
 
 `spark.sql.catalog.<카탈로그>.io-impl`을 명시하지 않으면 HMS 카탈로그는 **`HadoopFileIO`로 고정**된다. ✅ 소스 검증
