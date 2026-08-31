@@ -127,7 +127,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 
 ## 작업 6: FileIO 전환 (S3AFileSystem → S3FileIO) — 전환 완료, 후속 작업 대기
 
-- **산출물**: `pipeline/s3fileio-migration-guide.md`
+- **산출물**: `pipeline/s3fileio-migration-guide.md` (상세), `pipeline/s3fileio-migration-report.md` (보고용 요약 — Grafana 패널 이미지 첨부 필요)
 - **상태**: **운영환경 전환 완료·효과 검증 완료(2026-08-27)**. append/expire/orphan/rewrite manifests/Compaction 전부 정상. MinIO checksum 문제 없음
 - **실측 결과** (가이드 §6.5): `deleteObject` **481 → 17.4 req/s(−96.4%)**, `listObjectV2` **680 → 281 req/s(−58.7%)** (peak 기준). expire snapshots **duration 13.5분 → 3.8분(−72%)**, **dcu 0.2002 → 0.0550(−72.5%)**, DataFlint alert 18 → 6
   - **개선은 Spark stage가 아니라 driver 삭제 구간에서 났다** — `input`이 오히려 +18%인데 duration이 −72%. shuffle 지표는 같은 자릿수 유지. 예측한 `Job duration − stage 합계 = 삭제 시간` 구조와 일치
@@ -210,7 +210,9 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 │   ├── spark-query-metrics-guide.md    # Spark 쿼리 메트릭 가이드
 │   └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
 └── pipeline/
-    ├── s3fileio-migration-guide.md      # FileIO 전환 가이드 (S3A → S3FileIO)
+    ├── s3fileio-migration-guide.md      # FileIO 전환 가이드 (S3A → S3FileIO, 상세)
+    ├── s3fileio-migration-report.md     # FileIO 전환 결과 (보고용 요약)
+    ├── images/                          # 보고용 Grafana 캡처
     ├── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
     ├── reprocess-flow.md               # 재처리 DAG 처리 흐름 (보고용 요약)
     ├── compaction-executor-sizing-design.md  # Compaction executor 동적 산정 설계
