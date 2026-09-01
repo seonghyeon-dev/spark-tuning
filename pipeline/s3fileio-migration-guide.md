@@ -1904,6 +1904,27 @@ executor 4개 × 4코어 = 16코어인데 90%가 놀고 있다. 전환 전에는
 
 ### 검증에 사용한 소스 (버전 고정)
 
+아래 표의 `위치` 열은 다음 base URL에 이어 붙이면 원본으로 연결된다. 태그 고정이므로 줄 번호가 바뀌지 않는다.
+
+| 프로젝트 | base URL |
+|----------|----------|
+| Iceberg 1.10.1 | `https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/` |
+| Iceberg 1.11.0 | `https://github.com/apache/iceberg/blob/apache-iceberg-1.11.0/` |
+| Hadoop 3.3.4 | `https://github.com/apache/hadoop/blob/rel/release-3.3.4/` |
+| Hadoop 3.4.1 | `https://github.com/apache/hadoop/blob/rel/release-3.4.1/` |
+| Spark 3.5.8 | `https://github.com/apache/spark/blob/v3.5.8/` |
+
+주요 근거의 직접 링크:
+
+- [`HadoopFileIO.deleteFiles()` — 가짜 bulk delete](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/core/src/main/java/org/apache/iceberg/hadoop/HadoopFileIO.java#L176-L194)
+- [`S3FileIO.deleteFiles()` — 실제 `DeleteObjects` 일괄 삭제](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIO.java#L230-L300)
+- [`ExpireSnapshotsSparkAction` — bulk 분기와 driver 삭제](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/actions/ExpireSnapshotsSparkAction.java#L223-L272)
+- [`S3URI` — scheme 무검증 (s3a 호환의 근거)](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/aws/src/main/java/org/apache/iceberg/aws/s3/S3URI.java#L60-L91)
+- [`HiveCatalog` — `io-impl` 미설정 시 `HadoopFileIO` 고정](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/hive-metastore/src/main/java/org/apache/iceberg/hive/HiveCatalog.java#L119-L123)
+- [`S3AFileSystem.delete()` — 파일 1개 삭제의 요청 3개](https://github.com/apache/hadoop/blob/rel/release-3.3.4/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java#L3162-L3212)
+- [`SparkContext` — eventLog 초기화 (S3A 필수의 근거)](https://github.com/apache/spark/blob/v3.5.8/core/src/main/scala/org/apache/spark/SparkContext.scala#L627-L633)
+
+
 | 파일 | 위치 | 확인 내용 |
 |------|------|-----------|
 | `ExpireSnapshotsSparkAction.java` | `iceberg 1.10.1` / `spark/v4.0/.../actions/` | :222-228 driver 삭제, :257-272 bulk 분기 |

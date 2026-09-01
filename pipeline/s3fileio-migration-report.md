@@ -30,6 +30,10 @@
 
 **관측된 `listObject` 대량 발생의 정체가 ③이다.** 삭제와는 무관한, 디렉터리 시맨틱 유지용 요청이다. ④ 때문에 삭제 작업이 객체를 새로 만들기까지 한다.
 
+> **원본 코드** (Hadoop 3.3.4)
+> - [`S3AFileSystem.delete()` — ①②③ 호출 흐름](https://github.com/apache/hadoop/blob/rel/release-3.3.4/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java#L3162-L3181)
+> - [`createFakeDirectoryIfNecessary()` — ③ LIST와 ④ 마커 생성](https://github.com/apache/hadoop/blob/rel/release-3.3.4/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java#L3203-L3212)
+
 ### 2.2 기존 구성에서는 일괄 삭제가 동작하지 않았다
 
 Iceberg는 삭제 대상의 **전체 경로 목록을 이미 확보한 상태**로 일괄 삭제를 호출한다. 그런데 기존 `HadoopFileIO`의 일괄 삭제 구현이 내부적으로는 **파일을 하나씩 지우는 반복문**이다.
@@ -42,6 +46,11 @@ Tasks.foreach(pathsToDelete)
 ```
 
 결과적으로 MinIO에 **일괄 삭제 요청(`DeleteObjects`)이 한 건도 가지 않았고**, 파일 수만큼의 단건 요청이 발생했다.
+
+> **원본 코드** (Iceberg 1.10.1)
+> - [`HadoopFileIO.deleteFiles()` — 일괄 삭제 인터페이스의 실제 구현](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/core/src/main/java/org/apache/iceberg/hadoop/HadoopFileIO.java#L176-L194)
+> - [`HadoopFileIO.deleteFile()` — 결국 호출되는 단건 삭제](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/core/src/main/java/org/apache/iceberg/hadoop/HadoopFileIO.java#L100-L109)
+> - [`S3FileIO.deleteFiles()` — 전환 후 사용되는 `DeleteObjects` 일괄 삭제](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIO.java#L230-L300)
 
 ---
 
