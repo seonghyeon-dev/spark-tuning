@@ -62,26 +62,46 @@ Iceberg가 스토리지에 접근하는 구현체(`FileIO`)를 교체했다.
 |---|---|---|
 | 구현체 | `HadoopFileIO` (기본값) | `S3FileIO` |
 | 접근 경로 | Iceberg → Hadoop FileSystem → S3A → AWS SDK v1 | Iceberg → AWS SDK v2 |
-| 파일 삭제 | 파일당 단건 요청 3개 | **여러 파일을 한 요청으로 일괄 삭제** |
+| 파일 삭제 | 파일당 단건 요청 3개 | **최대 1,000개를 한 요청으로 일괄 삭제** |
 
 전환으로 두 가지가 함께 개선된다.
 
 | 개선 | 대상 | 내용 |
 |------|------|------|
-| **일괄 삭제(bulk delete) 적용** | `deleteObject` | 파일 250개를 `DeleteObjects` 요청 1건으로 묶어 전송 |
+| **일괄 삭제(bulk delete) 적용** | `deleteObject` | 여러 파일을 `DeleteObjects` 요청 1건으로 묶어 전송 (묶는 단위는 `s3.delete.batch-size`) |
 | **디렉터리 흉내 제거** | `listObject` | `S3FileIO`는 디렉터리 개념을 쓰지 않아 부모 확인 LIST가 발생하지 않는다 |
 
-### 적용 내용
+### 적용 설정
 
 ```properties
+# ── FileIO 구현체 (전환의 본체) ───────────────────────────────
 spark.sql.catalog.<카탈로그>.io-impl=org.apache.iceberg.aws.s3.S3FileIO
-spark.sql.catalog.<카탈로그>.s3.endpoint=http://<minio>:9000
+
+# ── MinIO 접속 정보 ──────────────────────────────────────────
+spark.sql.catalog.<카탈로그>.s3.endpoint=http://<minio-service>:9000
 spark.sql.catalog.<카탈로그>.s3.path-style-access=true
+spark.sql.catalog.<카탈로그>.s3.access-key-id=<ACCESS_KEY>
+spark.sql.catalog.<카탈로그>.s3.secret-access-key=<SECRET_KEY>
 spark.sql.catalog.<카탈로그>.client.region=us-east-1
+
+# ── 일괄 삭제 동작 ───────────────────────────────────────────
+spark.sql.catalog.<카탈로그>.s3.delete.batch-size=1000
+spark.sql.catalog.<카탈로그>.s3.delete.num-threads=8
 ```
+
+| 설정 | 값 | 역할 |
+|------|----|------|
+| `io-impl` | `S3FileIO` | 전환의 본체. 미설정 시 `HadoopFileIO`가 기본값이다 |
+| `s3.endpoint` | `http://...` | MinIO 주소. **스킴을 포함**해 적으면 S3A의 `connection.ssl.enabled`에 해당하는 설정이 불필요하다 |
+| `s3.path-style-access` | `true` | MinIO는 virtual-host 방식을 쓰지 않는다. **기본값이 `false`라 반드시 명시** |
+| `s3.access-key-id`<br>`s3.secret-access-key` | MinIO 자격증명 | **`S3FileIO`는 `fs.s3a.*`를 읽지 않으므로 별도 지정이 필요하다** |
+| `client.region` | `us-east-1` | AWS SDK v2는 region이 없으면 클라이언트 생성 자체가 실패한다. MinIO는 값을 사용하지 않는다 |
+| **`s3.delete.batch-size`** | **1000** | **한 요청에 묶을 파일 수. 이번 개선폭을 직접 결정하는 값이다.** 기본값 250, 최대 1000 |
+| `s3.delete.num-threads` | 8 | 일괄 삭제 요청의 동시 전송 수. 기본값은 driver 코어 수 |
 
 - 이미지에 `iceberg-aws-bundle-1.10.1.jar` 추가 (AWS SDK v2 제공)
 - **기존 `fs.s3a.*` 설정은 유지** — 원천 avro 읽기와 Spark 이벤트 로그가 계속 사용한다
+- 자격증명을 Spark 설정에 직접 기입하면 Spark UI의 Environment 탭에 노출된다. K8s Secret → 환경변수 방식으로의 전환은 §6 참조
 
 ---
 
