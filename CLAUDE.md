@@ -96,7 +96,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **전제**: Iceberg snapshot 보존 3일 > 재처리 조회 범위 2일 유지 필수. maintenance 스케줄 재배치와 Compaction DAG 변경(tables params + mapped task)은 재처리 DAG 배포 전 적용
 - **후속 과제**: daily 계열 maintenance를 DAG 1개의 순차 task로 통합 (시계 기반 간격은 duration이 늘면 조용히 깨짐)
 
-## 작업 5: Compaction 튜닝 (hourly) — 설정 확정, MAX_EXECUTORS만 미확정
+## 작업 5: Compaction 튜닝 (hourly) — 설정 확정, executor 자동 조절(DA+ratio) 채택
 
 - **산출물**: `tuning/compaction-tuning-guide.md` (상세), `tuning/compaction-tuning-report.md` (회의 보고용 요약)
 - **상태**: 9회 측정으로 설정 확정. 초/GB **3.24 → 2.41(−26%)**, dcu/GB **0.00416 → 0.00219(−47%)**, idle cores 58%→17%. DAG 전체 10~12분 → 약 6분
@@ -220,11 +220,11 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
     ├── images/                          # 보고용 Grafana 캡처
     ├── reprocessing-dag-design.md      # 재처리 DAG 설계 가이드
     ├── reprocess-flow.md               # 재처리 DAG 처리 흐름 (보고용 요약)
-    ├── compaction-executor-sizing-design.md  # Compaction executor 동적 산정 설계
+    ├── compaction-executor-sizing-design.md  # Compaction executor 자원 할당 설계 (DA+ratio)
     ├── dags/
     │   └── iceberg_reprocess.py        # 재처리 DAG 정의 (신규 파일은 이것 하나)
     └── examples/
         ├── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
         ├── compaction_dag_example.py          # Compaction DAG 변경(tables 필터 = mapped task) 예시
-        └── compaction_executor_sizing_example.py  # Compaction num-executors 동적 산정 예시
+        └── compaction_executor_sizing_example.py  # Compaction 사전 산정 예시 (보류안)
 ```
