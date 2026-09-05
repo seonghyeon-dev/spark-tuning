@@ -502,6 +502,8 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 
 ## 6. 동적 리소스 산정
 
+> **자원 할당 방식은 `pipeline/compaction-executor-sizing-design.md`에서 확정했다.** 후보 3개(정적 유지 / Dynamic Allocation / 사전 산정) 중 **Dynamic Allocation + `executorAllocationRatio=0.13`을 채택**했으며 7회 실측으로 검증했다(39GB→12대, 82GB→24대). 이 섹션의 계수 `C=0.32`는 그 ratio 값을 도출하는 근거로 쓰인다. 사전 산정(Trino 조회) 방식은 보류 상태다.
+
 ### 6.1 배경과 동적화 대상 축소
 
 당초 목표는 데이터 증가에 맞춰 driver/executor의 cpu·memory·개수를 모두 동적으로 산정하는 것이다. **테스트 결과 동적화가 필요한 값은 `num-executors` 하나다.**
@@ -673,7 +675,15 @@ num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 - 도입 시점: 테이블당 **55~60GB** 도달 시 (창 여유가 2~3분으로 줄어드는 구간)
 - 그때까지는 `com_num_executor`를 12로 고정한다. 산정값도 12~14로 정적값과 거의 같다
 
-상세 판단과 대안 비교는 **`pipeline/compaction-executor-sizing-design.md`**를 참조한다.
+**실제 채택안은 Dynamic Allocation이다.** 위 `C=0.32`는 DA의 `executorAllocationRatio` 값을 도출하는 데 쓰인다.
+
+```
+desired = (데이터GB × 9 ÷ 4) × ratio = 데이터GB × 2.25 × ratio
+목표    = 데이터GB × 0.32
+→ ratio = 0.32 ÷ 2.25 = 0.142   (실측 검증값 0.13)
+```
+
+양변에서 `데이터GB`가 소거되므로 **ratio는 테이블 크기와 무관하다.** 실측에서 같은 0.13으로 39GB → 12대, 82GB → 24대가 나왔다. 상세는 **`pipeline/compaction-executor-sizing-design.md`** §4~5를 참조한다.
 
 ### 6.5 구현
 

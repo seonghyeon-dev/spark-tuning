@@ -4,14 +4,22 @@
    반영한다. `compaction_dag_example.py`가 만든 `compaction_specs` task의
    `instances` 값 한 줄을 계산값으로 바꾸는 것이 전부다.
 
-⚠ **도입 시점: 데이터가 테이블당 55~60GB에 도달할 때.** 현재(최대 42.3GB)는
-   `com_num_executor`를 12로 고정하는 것으로 충분하다. 정적 12개는 테이블당
-   74.7GB까지 실행 창에 들어가므로 여유가 1.77배 남아 있다.
-   판단 근거는 `pipeline/compaction-executor-sizing-design.md` §3.
+⚠ **이 파일은 설계 3안 중 C안(사전 산정)의 스켈레톤이며, 도입 우선순위가 가장 낮다.**
+   `pipeline/compaction-executor-sizing-design.md` §6의 권고는 다음 순서다.
+     A안 정적 12 유지 (현재)
+       → 55~60GB 도달 시 B안 Spark Dynamic Allocation 먼저 시도 (설정 4줄)
+         → B안이 실행 창을 못 지키면 그때 C안(이 파일)
+
+   B를 먼저 두는 이유는 구현 비용 차이다. B는 Spark 설정 4줄이고 롤백이 한 줄인데,
+   C는 Trino 연결·fallback·정상 범위 검증에 외부 의존성이 하나 늘어난다.
+   목적(데이터 증가 흡수)이 같으므로 싼 것부터 시도한다.
+
+   C가 필요해지는 경우: B의 executor 확보 지연(10~20초)이 90초 job에서 11~22%라,
+   실행 창 여유가 없을 때는 처음부터 맞는 수로 시작하는 C가 유리하다.
 
 설계 문서
-  `pipeline/compaction-executor-sizing-design.md` — 산정 위치·조회 경로 대안 비교,
-  실패 모드, 적용 순서. 이 파일은 그 설계의 구현 스켈레톤이다.
+  `pipeline/compaction-executor-sizing-design.md` — 3안 비교, 산정 위치·조회 경로
+  대안 비교, 실패 모드, 검증 계획. 이 파일은 그 설계 C안의 구현 스켈레톤이다.
 
 왜 필요한가
   정적 executor 수는 데이터가 늘면 duration이 비례해 늘고, hourly Compaction의

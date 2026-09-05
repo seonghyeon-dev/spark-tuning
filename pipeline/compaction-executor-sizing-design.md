@@ -1,233 +1,310 @@
-# Compaction executor 동적 산정 설계
+# Compaction executor 자원 할당 설계
 
 | 항목 | 내용 |
 |------|------|
 | 대상 | hourly Compaction DAG |
-| 목적 | 데이터 증가 시 실행 창 제약을 넘지 않도록 `num-executors`를 데이터 양에 따라 산정 |
-| 전제 | 튜닝 결과 확정 (`tuning/compaction-tuning-guide.md`), 계수 C=0.32 |
-| 결론 | **현재 도입 불필요.** 데이터 1.8배 시점까지 정적 12개로 충분 (섹션 3) |
+| 목적 | 데이터 증가·시간대별 편차에 맞춰 executor 수를 자동 조절 |
+| 전제 | 튜닝 결과 확정 (`tuning/compaction-tuning-guide.md`) |
+| 결론 | **Spark Dynamic Allocation + `executorAllocationRatio` 채택.** 7회 실측 검증 완료 (섹션 5) |
 
 ---
 
-## 1. 배경
+## 1. 배경 및 판단 기준
 
 hourly Compaction은 매시 `:45`에 시작해 정각까지 종료해야 한다. 시작 분 M은 `M ≤ 60 − duration − 여유`로 정해지며 현재 `60 − 12 − 3 = 45`다 (`reprocessing-dag-design.md` §6.2).
 
-정적 executor 수에서는 데이터가 늘면 duration이 비례해 늘고, 이 제약이 조용히 깨진다. 동적 산정은 증가분을 executor 수로 흡수해 duration을 일정하게 유지한다.
+정적 executor 수에서는 데이터가 늘면 duration이 비례해 늘고 이 제약이 깨진다. 그때마다 사람이 대수를 고쳐야 한다.
 
----
+**판단 기준** (순서대로 적용)
 
-## 2. 산정 대상
-
-당초 driver/executor의 cpu·memory·개수를 모두 동적화하려 했으나 **`num-executors` 하나로 축소된다.**
-
-| 설정 | 판정 | 이유 |
+| 순위 | 기준 | 조건 |
 |------|------|------|
-| `num-executors` | 동적 | 데이터 양에 비례하는 유일한 값 |
-| `executor cpu` / `memory` | 고정 | task 하나의 처리 단위가 512MB로 고정. 데이터가 늘면 task 수만 늘고 크기는 그대로 |
-| `driver cpu` / `memory` | 고정 | file group 수(4개)에 비례하나 변동 폭이 작음 |
-| `max-concurrent-file-group-rewrites` | 고정(크게) | group 수보다 크면 남는 값은 미사용. 동적화가 무의미 |
-| `max-file-group-size-bytes` | 고정(크게) | 분할하지 않는 것이 목표 |
-
-근거는 `tuning/compaction-tuning-guide.md` §6.1.
+| 1 | 실행 창 | DAG 전체(테이블 4개 순차)가 12분 이내 |
+| 2 | disk spill | 0 유지 |
+| 3 | dcu | 낮을수록 좋음 |
+| 4 | 구현·운영 비용 | 신규 의존성과 실패 모드의 수 |
 
 ---
 
-## 3. 도입 시점 판단
+## 2. 후보
 
-**정적 12개와 동적 산정의 스케줄 한계를 비교하면 현재는 도입 이득이 없다.**
+| 안 | 방식 | 조절 주체 |
+|----|------|----------|
+| A | 정적 유지 (`num-executors` 고정) | 없음 |
+| **B** | **Dynamic Allocation + ratio** | **Spark이 실행 중 자동** |
+| C | 사전 산정 (Airflow가 데이터 양 조회) | Airflow가 시작 전 |
 
-고정 core에서는 duration이 데이터에 비례하고 초/GB는 일정하다. core가 데이터에 비례하면 duration이 일정하고 초/GB가 감소한다.
+---
 
-| 데이터 (테이블당) | 정적 12개 DAG 전체 | 동적 산정 DAG 전체 |
-|------------------|------------------|------------------|
-| 42.3GB (현재 최대) | 6.8분 | 6.0분 |
-| 60GB | 9.6분 | 6.0분 |
-| **74.7GB** | **12.0분 (창 초과)** | 6.0분 |
-| 100GB | 16.1분 | 6.0분 (상한 도달) |
-| 100GB 초과 | — | 정적과 동일 기울기 |
+## 3. A안: 정적 유지 — 한계
 
-- 정적 12개의 창 초과 지점: **테이블당 74.7GB**
-- 현재 최대 실측 42.3GB → **여유 1.77배**
-- 동적 산정은 `MAX_EXECUTORS`(잠정 32) 도달 지점인 100GB까지 duration을 유지
+고정 core에서는 duration이 데이터에 비례한다.
 
-**판단**
+| 데이터 (테이블당) | DAG 전체 | 실행 창 |
+|------------------|---------|--------|
+| 42.3GB (현재 최대) | 6.8분 | 통과 |
+| 60GB | 9.6분 | 통과 |
+| **74.7GB** | **12.0분** | **초과** |
 
-| 시점 | 조치 |
+여유는 1.77배지만, 시간대별 편차에 대응하지 못하고 증가 시 수동 변경이 필요하다.
+
+---
+
+## 4. B안: Dynamic Allocation + executorAllocationRatio (채택)
+
+### 4.1 Kubernetes 전제조건
+
+K8S에는 external shuffle service가 없다. Spark 3.0부터 `shuffleTracking.enabled` 기본값이 **true**이므로 별도 설정 없이 동작한다.
+
+| 설정 | 기본값 |
+|------|--------|
+| `spark.dynamicAllocation.enabled` | false |
+| `spark.dynamicAllocation.minExecutors` | 0 |
+| `spark.dynamicAllocation.maxExecutors` | 무한대 |
+| `spark.dynamicAllocation.initialExecutors` | `minExecutors` 값 |
+| `spark.dynamicAllocation.executorIdleTimeout` | 60초 |
+| `spark.dynamicAllocation.schedulerBacklogTimeout` | 1초 |
+| `spark.dynamicAllocation.executorAllocationRatio` | 1.0 |
+| `spark.dynamicAllocation.shuffleTracking.enabled` | **true** (3.0.0부터) |
+| `spark.dynamicAllocation.shuffleTracking.timeout` | 무한대 |
+
+### 4.2 반납은 일어나지 않는다 (실측 확인)
+
+공식 문서가 직접 설명한다.
+
+> *"under most circumstances, this condition is **mutually exclusive** with the request condition, in that **an executor should not be idle if there are still pending tasks** to be scheduled."*
+
+**밀린 일감이 있으면 노는 executor가 없으므로 제거 조건이 성립하지 않는다.** Compaction은 일감이 725~1,450개 계속 밀려 있어 반납이 발생할 상황 자체가 없다.
+
+**실측**: `minExecutors=4`로 낮춰 실행해도 12대에서 내려가지 않았다.
+
+> `shuffleTracking.timeout` 무한대는 "영원히 반납 안 함"이 아니라 **shuffle 데이터가 GC로 정리되면 그때 반납 가능**하다는 뜻이다. 다만 그 전에 job이 끝난다.
+
+### 4.3 확보는 동작한다 (실측 확인)
+
+데이터가 늘면 일감이 늘고 DA가 executor를 추가한다.
+
+```
+schedulerBacklogTimeout 1초 후 요청 시작
+이후 1초마다 요청 수가 배로 증가 (1, 2, 4, 8, ...)  → 12대 추가 요청까지 4초
+pod 생성/등록 5~15초
+합계 10~20초
+```
+
+**실측**: 2시간 범위(82GB)로 실행 시 12대 → **24대**로 증가한다.
+
+### 4.4 `executorAllocationRatio`로 요청량을 조절한다
+
+**그냥 켜면 안 되는 이유** — DA는 기본적으로 밀린 일감을 전부 동시에 처리할 만큼 요청한다.
+
+```
+82GB → 순간 일감 약 738개 → 738 ÷ 4(executor당 slot) = 185대 요청
+```
+
+`executorAllocationRatio`가 이 값을 비율로 줄인다. 공식 문서에 명시된 용도다.
+
+> *"with small tasks this setting can waste a lot of resources... This setting allows to **set a ratio that will be used to reduce the number of executors** w.r.t. full parallelism."*
+
+**계산**
+
+```
+desired = (순간 일감 ÷ executor당 slot) × ratio
+        = (데이터GB × 9 ÷ 4) × ratio
+        = 데이터GB × 2.25 × ratio
+```
+
+`순간 일감 ≈ 데이터GB × 9`는 실측 역산값이다 (전체 일감의 약 절반이 동시에 큐에 존재).
+
+**목표 대수**(`데이터GB × 0.32`, `compaction-tuning-guide.md` §4.4)와 같게 놓으면:
+
+```
+ratio = 0.32 ÷ 2.25 = 0.142  →  실측 검증값 0.13
+```
+
+### 4.5 ratio는 테이블 크기와 무관하다
+
+위 식의 양변에 `데이터GB`가 들어가 소거된다. **비율이므로 데이터가 커지면 대수도 비례해 커진다.**
+
+| 데이터 | 순간 일감 | 최대 병렬 | × 0.13 | 실측 |
+|--------|----------|----------|--------|------|
+| 39GB | 약 351개 | 88대 | 11.4대 | **12대** |
+| 82GB | 약 738개 | 185대 | 24.0대 | **24대** |
+
+데이터 2.1배에 대수도 2배다.
+
+**단 ratio는 파일 크기에 의존한다.** 일감 수가 파일 크기로 정해지기 때문이다 (섹션 9).
+
+| 파일 개수 (총 37GB) | 파일 크기 | 읽기 일감 | 대수 |
+|-------------------|----------|----------|------|
+| 703개 (현재) | 53.9MB | 352 | 12.6 |
+| 28개 (1/25) | 1,353MB | 308 | 11.2 |
+| 17,575개 (25배) | 2.2MB | 550 | 19.1 |
+
+파일이 커지는 방향은 영향이 작다(현재 2개를 묶어 108MB로 처리 중이라 이미 목표 128MB에 근접). **작아지는 방향은 영향이 크다** — 파일 여는 비용 하한 4MB가 지배해 일감이 급증한다.
+
+### 4.6 `maxExecutors`는 예약이 아니라 천장이다
+
+**실측으로 확인했다.**
+
+| 회차 | 데이터 | max 설정 | 실제 사용 |
+|------|-------|---------|----------|
+| 1시간 | 39GB | 24 | **12대** |
+| 2시간 | 82GB | 24 | 24대 |
+| 2시간 | 82GB | **36** | **24대** |
+
+max를 36으로 올려도 24대에서 멈췄다. **실제 사용량은 ratio가 정하고 max는 상한일 뿐이므로, 넉넉히 두어도 자원을 미리 점유하지 않는다.**
+
+> K8S에 자리가 없어 pod이 안 뜨면 DA는 **있는 대수로 계속 진행**한다. 정적 설정보다 degradation이 완만하다.
+
+### 4.7 설정
+
+```
+spark.dynamicAllocation.enabled=true
+spark.dynamicAllocation.executorAllocationRatio=0.13        ← 전 테이블 공통
+spark.dynamicAllocation.initialExecutors=<테이블별 평소 대수>  ← 기존 com_num_executor
+spark.dynamicAllocation.minExecutors=<initialExecutors와 동일>
+spark.dynamicAllocation.maxExecutors=<K8S 여유 범위>
+```
+
+**`initialExecutors`를 반드시 지정한다.** 기본값이 `minExecutors`(0)이므로, 생략하면 0대에서 시작해 warm-up에만 20~40초를 쓴다.
+
+---
+
+## 5. 실측 결과
+
+측정 대상: 2026-08-12 ~ 08-13. `output`이 실제 데이터 크기다.
+
+| 회차 | 설정 | 데이터 | 대수 | 초/GB | dcu/GB | idle | memory | spill |
+|------|------|--------|------|-------|--------|------|--------|-------|
+| 정적 12 (기준) | — | 37.30GB | 12 | 2.413 | 0.00219 | 16.7% | 90.3% | 0 |
+| 19~20 | ratio 0.066 | 40.02GB | 12 | 2.549 | 0.00240 | 24.6% | 84.6% | 0 |
+| 21~22 | ratio 0.066 | 39.28GB | 12 | 2.444 | 0.00221 | 18.0% | 94.1% | 0 |
+| 22~23 | ratio 0.13 | 39.79GB | 12 | 2.413 | 0.00221 | 16.4% | 92.5% | 0 |
+| 23~00 | ratio 0.13 | 38.45GB | 12 | 2.653 | 0.00249 | 21.9% | 91.1% | 0 |
+| 00~01 | ratio 0.13 | 39.38GB | 12 | 2.438 | 0.00226 | 17.8% | 87.6% | 0 |
+| **01~03** | ratio 0.13, max 24 | **82.13GB** | **24** | 1.388 | 0.00238 | 24.4% | 91.6% | 0 |
+| **03~05** | ratio 0.13, **max 36** | **82.51GB** | **24** | 1.309 | 0.00225 | 19.3% | 97.6% | 0 |
+
+**판정**
+
+| 항목 | 결과 |
 |------|------|
-| 현재 | `com_num_executor`를 12로 고정. 동적 산정 미도입 |
-| 테이블당 55~60GB 도달 | 도입. 창 여유가 2~3분으로 줄어드는 구간 |
-| 테이블당 100GB 접근 | 동적 산정으로도 부족. 파티션 재설계 또는 K8S 슬롯 확대 |
+| 1시간 데이터에서 정적 12와 동등한가 | ✅ 초/GB +3.7%, dcu/GB +5.9% (노이즈 기준선 15% 이내) |
+| 데이터가 늘면 대수가 늘어나는가 | ✅ 39GB 12대 → 82GB 24대 |
+| max가 아니라 ratio가 대수를 정하는가 | ✅ max 36에서도 24대 |
+| spill 0을 유지하는가 | ✅ 7회 전부 0 |
 
-데이터 증가 추이를 모니터링해 55GB 도달 전에 도입하면 된다. 현재 도입하면 산정값이 12~14개로 정적값과 거의 같아 Trino 연결 구현 공수만 발생한다.
+**ratio 0.066 → 0.13 교정 근거**: 0.066에서 driver 로그의 `desired total`이 5~6으로 찍혔다. 역산하면 순간 일감 303~364개이며, 이는 **전체 일감(725개)이 아니라 그 순간 큐에 있는 수**다. 처음 계산에서 전체 일감을 썼던 것이 원인이며, 0.13으로 교정 후 요청 로그가 사라졌다(= 12대로 충분하다고 계산).
 
-**미측정 이득** — 데이터가 적은 시간대(새벽 등)의 리소스 절감. 예컨대 20GB 시간대는 산정값이 7개로 정적 12개보다 작다. 시간대별 데이터 양 편차를 측정하면 이 이득이 도입 시점을 앞당길 수 있다. 현재 측정 구간(07~15시)은 36~42GB로 편차가 작다.
-
----
-
-## 4. 산정 위치
-
-`compaction_dag_example.py`가 만드는 `compaction_specs` task 내부에서 산정한다.
-
-**검토한 대안**
-
-| 안 | 방식 | 판정 |
-|----|------|------|
-| **A** | `compaction_specs` 내부에서 테이블별 조회 | **채택** |
-| B | 조회 전용 task 분리 → XCom 병합 | 미채택 |
-| C | mapped task 실행 직전에 테이블별 조회 | 미채택 |
-
-**A 채택 근거**
-
-- `compaction_specs`가 이미 params를 읽고 테이블을 loop한다. task 추가가 불필요하다
-- 테이블별 `try/except`로 감싸면 **한 테이블의 조회 실패가 다른 테이블에 전파되지 않는다.** B의 장점인 실패 격리가 A에서도 성립한다
-- 산정값은 XCom을 거치므로 원시 타입이어야 한다. 기존 구조가 `"instances": str(...)`로 문자열을 담고 `.map()`에서 `DriverAndExecutor`를 만들므로 변경이 한 줄이다
-
-**B 미채택** — task를 분리하면 `compaction_specs`가 XCom 2개를 병합해야 한다. mapped task 구조상 `expand_kwargs`에 넘길 list[dict]를 한 곳에서 만드는 것이 단순하다. 재시도 단위 분리 이득은 fallback이 있어 실질적이지 않다.
-
-**C 미채택** — operator 인자는 `expand_kwargs` 시점에 정해져야 하므로, 실행 직전 조회를 하려면 operator를 감싸는 task가 추가로 필요하다. 대상이 이미 닫힌 과거 1시간치라 조회 시점을 늦춰 얻는 정확도 이득이 작다 (섹션 6).
+**2시간 실행의 한계**: 입력이 이미 compaction된 데이터(505MB 파일)라 실제 데이터 증가 상황과 파일 구성이 다르다. 실제 증가 시에도 desired는 25대로 계산되어 **대수 결정 동작은 동일**하나, 소요시간은 더 걸린다.
 
 ---
 
-## 5. 입력 조회 경로
+## 6. C안: 사전 산정 (보류)
 
-Trino JDBC로 Iceberg `.partitions` 메타데이터를 조회한다.
+Airflow가 Trino로 `.partitions`를 조회해 데이터 양을 파악하고 executor 수를 결정하는 방식이다. 구현 스켈레톤은 `pipeline/examples/compaction_executor_sizing_example.py`에 있다.
 
-**검토한 대안**
+**B안이 같은 목적을 달성하므로 보류한다.**
 
-| 경로 | 판정 | 이유 |
-|------|------|------|
-| **Trino JDBC** | **채택** | Airflow provider 존재. pod 기동 없음 |
-| Spark job | 미채택 | pod 기동 20~30초. 산정 목적에 과함 |
-| HMS 직접 조회 | 미채택 | manifest를 직접 파싱해야 함. 구현 비용 큼 |
-| append DAG이 크기 기록 | 미채택 | DAG 간 결합 증가. avro → Parquet 크기 변환 계수 필요 |
-| 직전 회차 값 캐싱 | 미채택 | 실측 크기를 Spark pod에서 Airflow로 되돌리는 배관이 조회보다 복잡 |
+| | B안 | C안 |
+|---|-----|-----|
+| 구현 | Spark 설정 4줄 | Trino 연결 + fallback + 검증 |
+| 외부 의존성 | 없음 | Trino |
+| 신규 실패 모드 | 없음 | 5종 |
+| 롤백 | 설정 1줄 | 코드 되돌리기 |
+| 대수 결정 시점 | 실행 중 (10~20초 지연) | 시작 전 (지연 없음) |
 
-**`.files`가 아니라 `.partitions`를 쓴다**
+**C안이 필요해지는 경우**: B안의 확보 지연 10~20초가 실행 창을 압박할 때. 현재 DAG 전체가 12분 창에 6~7분이므로 해당하지 않는다.
 
-| 조회 | 반환 행 수 (보관 30일 가정) | 행 하나 크기 |
-|------|------------------------|------------|
-| `.files` (필터 없음) | 약 54,000 | 컬럼 19개 통계 전부 포함 |
-| `.files` (파티션 필터) | 약 75 | 동일 |
-| `.partitions` (파티션 필터) | 4 | 집계값만 |
-
-**부하 특성** — 비용은 행 수가 아니라 manifest 수가 지배한다. append 5분 주기로 288 commit/일이 발생하고 `rewrite_manifests` 3일 주기 사이에 수백~1,000개가 누적된다. 파티션 필터로 manifest pruning이 걸리면 비용이 거의 늘지 않는다. 걸리지 않는 최악의 경우 30~90MB 읽기로 수 초다.
-
-`hour(ts)` 파티션은 시간순이고 `rewrite_manifests`가 파티션 기준으로 정리하므로 pruning에 유리하다. **다만 metadata table에서 실제로 걸리는지는 미확인이다** (섹션 12).
+C안 상세(산정 위치 대안 비교, 조회 경로 대안 비교, 실패 모드)는 이 문서의 이전 개정판과 예시 파일 주석에 남아 있다.
 
 ---
 
-## 6. 조회 시점과 정확도
+## 7. 권고
 
-`compaction_specs`는 DAG run 시작 시 1회 실행되고, Spark job은 테이블 순차 실행이므로 마지막 테이블은 약 5분 뒤에 시작한다. 그 사이에도 append는 5분 주기로 커밋한다.
-
-**정확도 영향은 무시할 수 있다.**
-
-- 대상은 직전 1시간치로 이미 닫힌 구간이다
-- 그 구간에 추가로 들어오는 것은 지연 적재분뿐이며 GB 단위 미만이다
-- 산정식이 `ceil(크기 × 0.32)`이므로 executor 1개가 바뀌려면 3.1GB 변동이 필요하다
-
----
-
-## 7. 실패 모드와 대응
-
-조회는 외부 의존성이므로 **어떤 실패에도 Compaction 자체는 실행되어야 한다.** 기존 `com_num_executor` 상수를 지우지 않고 fallback으로 유지하는 이유다.
-
-| 실패 모드 | 증상 | 대응 |
-|----------|------|------|
-| Trino 장애 / 연결 실패 | 예외 발생 | 정적값 fallback + warning 로그 |
-| 파티션 조건 불일치 | 조회 성공, 크기 0 | 정상 범위 검사로 차단 후 fallback |
-| 조회 결과 이상값 | 비정상적으로 큰 값 | 정상 범위(0.1~500GB) 검사 후 fallback |
-| 산정값이 상한 초과 | clamp 발생 | 상한 적용 + warning 로그 (섹션 8) |
-| Trino 응답 지연 | DAG 시작 지연 | 조회 timeout 설정 필요 (미정) |
-
-**크기 0 검사가 필요한 이유** — 조회가 성공했는데 파티션 조건이 틀려 0이 반환되면 executor가 `MIN_EXECUTORS`로 떨어져 Job이 한없이 느려진다. 예외가 나지 않으므로 fallback 경로를 타지 않는다.
-
----
-
-## 8. 상한의 의미
-
-`MAX_EXECUTORS`는 성능 상한이자 K8S 자원 상한이다.
-
-- append 벤치마크에서 32개 이상은 오히려 느려진다 (shuffle 통신, pod 스케줄링 경합, S3 부하 — `tuning/spark-tuning-guide.md` §2.2.3)
-- append가 batch당 약 10 executor를 5분 주기로 상시 점유하므로 그만큼을 남겨야 한다
-- **K8S에 여유가 없으면 executor를 늘려도 pod Pending으로 duration이 오히려 늘어난다.** 동적 산정이 목적을 달성하지 못하는 구간이다
-
-**상한에 걸리는 것은 조치 신호다.** 데이터가 설계 범위를 넘었다는 뜻이며 파티션 재설계나 슬롯 확대를 검토해야 한다. 조용히 clamp하지 않고 warning 로그를 남긴다.
-
-값은 K8S namespace quota 확인 후 확정한다 (잠정 32).
-
----
-
-## 9. 재처리 DAG과의 상호작용
-
-재처리 DAG이 Compaction DAG을 trigger할 때 `start_time`/`end_time`이 여러 시간에 걸친다 (`reprocessing-dag-design.md` §6.3).
-
-**조회는 단일 시간이 아니라 범위여야 한다.** 단일 시간으로 조회하면 여러 시간 범위에서 크기를 과소 산정해 executor가 부족해진다.
-
-```
-WHERE partition.ts_hour >= <from>
-  AND partition.ts_hour <  <until>
-```
-
-**파티션 값 변환은 naive datetime으로 계산한다.** `ts`가 `timestamp_ntz`이므로 timezone을 붙여 `timestamp()`를 쓰면 Iceberg 저장값과 어긋나 엉뚱한 시간대를 조회한다.
-
-```
-hour = int((dt − 1970-01-01).total_seconds() // 3600)
-```
-
-검증: `2026-08-11 13:00` → `496237`. Spark UI 출력 `PartitionData{ts_hour=496237, col_a=D}`와 일치한다.
-
----
-
-## 10. daily와의 분리
-
-**`C=0.32`을 daily에 그대로 쓸 수 없다.**
-
-- 계수는 hourly 측정값이다
-- daily는 `rewrite-all` 낭비 의심이 남아 있다 — hourly가 정리한 뒤라 할 일이 거의 없어야 하는데 888GB에 30~60분이 걸리고 소요시간이 데이터 양에 비례한다 (`tuning/compaction-tuning-guide.md` §8.1)
-- 그 확인이 끝나면 처리량 특성이 달라지므로 계수를 새로 측정해야 한다
-
-산정 코드는 공유하되 계수와 상한은 hourly/daily를 분리한다.
-
----
-
-## 11. 적용 순서
-
-| 순서 | 항목 | 상태 |
-|------|------|------|
-| 1 | Compaction DAG의 `tables` params + mapped task 전환 | 재처리 DAG 배포 전 적용 예정 (`reprocessing-dag-design.md` §6.1) |
-| 2 | `com_num_executor`를 12로 변경 | 즉시 적용 가능 |
-| 3 | K8S quota 확인 → `MAX_EXECUTORS` 확정 | 대기 |
-| 4 | Trino `$partitions` 컬럼·타입 확인, manifest pruning 측정 | 대기 |
-| 5 | 동적 산정 도입 | **데이터 55~60GB 도달 시** (섹션 3) |
-
-**1번이 선행 조건이다.** 동적 산정은 `compaction_specs` 안에 들어가므로 mapped task 전환이 먼저 필요하다.
-
-2번만으로 튜닝 결과의 리소스 절감(dcu −47%)을 확보한다. 5번은 데이터 증가 대응이다.
-
----
-
-## 12. 도입 전 확인 항목
-
-| 항목 | 확인 방법 |
-|------|----------|
-| Trino `$partitions`의 `partition.ts_hour` 타입 | `SELECT * FROM "<schema>.<table>$partitions" LIMIT 5` |
-| manifest pruning 동작 여부 | 전체 조회와 파티션 필터 조회의 Physical input 비교 |
-| 조회 소요시간 | 실측. 수 초를 넘으면 DAG 시작 지연을 고려해 timeout 설정 |
-| Trino connection id, Iceberg schema 이름 | 기존 설정 확인 |
-| 시간대별 데이터 양 편차 | 새벽 시간대 크기 측정. 편차가 크면 도입 시점을 앞당길 근거가 된다 |
-
-Spark SQL로 조회할 경우 컬럼명이 `total_size` 대신 `total_data_file_size_in_bytes`다.
-
----
-
-## 13. 구현
-
-| 파일 | 내용 |
+| 항목 | 조치 |
 |------|------|
-| `pipeline/examples/compaction_executor_sizing_example.py` | 구현 스켈레톤. `to_partition_hour()`, `query_size_bytes()`, `num_executors_for()`와 `compaction_specs` 연결 지점 |
-| `pipeline/examples/compaction_dag_example.py` | 선행 조건인 mapped task 전환 예시 |
-| `tuning/compaction-tuning-guide.md` §6 | 계수 근거, 측정값 |
+| **hourly Compaction** | **B안 적용** (섹션 4.7 설정) |
+| `initialExecutors` / `minExecutors` | 테이블별 기존 `com_num_executor` 값 사용 |
+| `executorAllocationRatio` | 전 테이블 **0.13** |
+| `maxExecutors` | K8S 여유 범위. 넉넉히 두어도 무해 |
+| C안 (사전 산정) | 보류. 예시 파일은 유지 |
 
-배포용 파일이 아니며 기존 hourly Compaction DAG에 반영한다. 신규 구현이 필요한 부분은 Trino 연결부뿐이고 `TODO(연결)`로 표시되어 있다.
+---
+
+## 8. 테이블별 적용
+
+**설정을 두 종류로 나눠 본다.**
+
+| 설정 | 성격 | 테이블별 |
+|------|------|---------|
+| `executorAllocationRatio` | **비율(%)** | ❌ 공통 |
+| `initialExecutors` / `minExecutors` | **개수(대)** | ✅ 테이블별 |
+| `maxExecutors` | 개수(대) | 공통 가능 |
+
+**ratio가 공통인 이유**: 데이터가 작으면 Spark이 요청하려는 대수도 작아지므로, 같은 비율을 곱해도 알아서 작은 값이 나온다.
+
+**`initialExecutors`가 테이블별인 이유**: 절대 개수이므로 10GB 테이블에 12를 넣으면 4배 과다이고, 반납이 안 되므로 그대로 유지된다. **기존 `com_num_executor` 상수를 그대로 쓰면 되며 새로 튜닝할 필요가 없다.**
+
+**역할 분담**
+
+| 설정 | 하는 일 |
+|------|--------|
+| `initialExecutors` / `minExecutors` | 평소 데이터량에서 쓸 대수를 바닥으로 깐다 |
+| `ratio` | 평소보다 많은 시간대에 얼마나 더 부를지 정한다 |
+
+**다른 테이블 확인 항목** (테이블당 1회 실행)
+
+| 확인 | 기준 |
+|------|------|
+| 수렴 대수 | `데이터GB × 0.32`와 유사한가 |
+| `dcu/GB` | 0.0022 근처인가 |
+| `spill` | 0인가 |
+
+어긋난다면 원인은 대개 **파일 크기 차이**다 (섹션 4.5).
+
+---
+
+## 9. 재검증 조건
+
+```
+1. append Job의 shuffle 설정 변경 또는 입력 파일 크기 변화
+   → 일감 수가 달라져 ratio 0.13이 조용히 어긋난다.
+     에러가 나지 않고 대수만 틀어지므로 알아채기 어렵다.
+     이것이 정적 설정 대비 이 방식의 유일한 실질적 단점이다.
+
+2. executor cores 변경 (현재 4)
+   → desired 계산의 분모가 바뀐다.
+
+3. target-file-size-bytes 변경 (현재 512MB)
+   → 쓰기 일감 수가 바뀐다.
+
+4. Iceberg 또는 Spark 버전 업그레이드
+   → shuffleTracking 기본값과 DA 계산식 재확인.
+
+5. hourly duration이 15분 초과 (DAG 전체)
+   → reprocessing-dag-design.md §6.2의 M 재계산.
+```
+
+---
+
+## 10. 미확인 항목
+
+| 항목 | 내용 |
+|------|------|
+| `maxExecutors` 확정값 | K8S namespace quota 확인. **실제 사용량은 ratio가 통제하므로 긴급하지 않다** |
+| ratio 0.066에서의 요청 로그 | 12대가 이미 떠 있는데 `desired total 5~6`을 "새로 요청"한 이유가 로그만으로는 설명되지 않는다. 현재 결론에는 영향 없음 |
+| 메모리 97.62% | 7회 중 최고값이며 DataFlint가 `executor.memory` 19.2g를 권고한다. **spill이 0인 동안은 조치하지 않는다** — Spark의 정렬은 가용 메모리를 최대한 쓰다가 부족하면 디스크로 넘기므로, 90%대는 한계 임박이 아니라 정상 동작이다. 감시 기준은 `spill ≠ 0` |
+| 다른 hourly 테이블 3개 | 섹션 8의 확인 항목 |
+
+---
+
+## 11. daily와의 분리
+
+daily Compaction에 이 설계를 그대로 적용할 수 없다.
+
+- ratio 0.13은 hourly의 파일 구성·계수(C=0.32) 기준이다
+- daily는 30~60분 job이라 `executorIdleTimeout` 60초가 전체의 2~3%에 불과해 **반납이 실제로 일어날 수 있다.** 반납이 되면 판단 근거가 달라진다
+- daily는 `rewrite-all` 낭비 의심이 남아 있다 (`compaction-tuning-guide.md` §8.1)
+
+daily 튜닝 후 별도로 판단한다.

@@ -112,12 +112,17 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **`sort` 전략은 데이터를 2번 읽는다** (정렬 범위 샘플링 + 실제 쓰기). DataFlint `input = output × 2.0`이 정상값
   - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번 사례의 원인은 후자다. alert는 전자만 제안한다
   - **`memory usage` 84~94%는 `spill to disk 0b`와 짝으로 읽는다** — 낭비 없이 맞게 쓰는 중이라는 뜻이며 줄이면 spill이 시작된다
-- **동적 산정 (`num-executors`) — 설계 완료, 도입 보류**: 설계 `pipeline/compaction-executor-sizing-design.md`, 구현 스켈레톤 `pipeline/examples/compaction_executor_sizing_example.py`
-  - **지금 도입할 필요 없다.** 고정 core는 duration이 데이터에 비례하므로 정적 12로 테이블당 **74.7GB까지 창(12분) 내 처리**. 현재 최대 42.3GB → **여유 1.77배**. 도입 시점은 **55~60GB 도달 시**. 즉시 할 일은 `com_num_executor`를 12로 바꾸는 것뿐
-  - 당초 6개 값을 동적화하려 했으나 **`num-executors` 하나로 좁혀졌다** (나머지는 데이터 양과 무관하거나 크게 고정이 우월)
-  - `num_executors = clamp(ceil(총 크기GB × 0.32), 4, MAX)`, **C=0.32 확정**. `MAX_EXECUTORS`만 미확정(K8S quota 필요, 잠정 32). **상한에 걸리면 조치 신호** — K8S에 여유가 없으면 executor를 늘려도 pod Pending으로 duration이 늘어 동적 산정이 무의미해진다
-  - 산정 위치는 `compaction_specs` 내부(테이블별 try/except로 실패 격리). 조회 전용 task 분리·mapped task 실행 직전 조회는 미채택 (설계 §4)
-  - **선행 조건: Compaction DAG의 mapped task 전환** (`compaction_dag_example.py`)
+- **executor 자원 할당 — Dynamic Allocation + ratio 채택 (7회 실측 검증)**: 설계 `pipeline/compaction-executor-sizing-design.md`, 보류된 C안 스켈레톤 `pipeline/examples/compaction_executor_sizing_example.py`
+  - **확정 설정**: `dynamicAllocation.enabled=true`, **`executorAllocationRatio=0.13`(전 테이블 공통)**, `initialExecutors`=`minExecutors`=테이블별 기존 `com_num_executor`, `maxExecutors`=K8S 여유
+  - **`initialExecutors` 기본값이 0이라 반드시 명시.** 생략하면 0대에서 시작해 warm-up 20~40초 낭비
+  - **ratio 도출**: `desired = 데이터GB × 2.25 × ratio`, 목표 `데이터GB × 0.32` → `ratio = 0.32/2.25 = 0.142`. **양변에서 데이터GB가 소거되므로 ratio는 테이블 크기와 무관 → 공통값 사용 가능**. 실측: 39GB→12대, 82GB→24대
+  - **`initial`/`min`은 테이블별이어야 한다** — 비율이 아니라 절대 개수라 크기에 비례. 기존 `com_num_executor`를 그대로 쓰면 되고 새 튜닝 불필요. 역할 분담: `initial/min`=평소 대수 바닥, `ratio`=많은 시간대에 얼마나 더 부를지
+  - **`maxExecutors`는 예약이 아니라 천장** — max 36으로 두고 실행해도 실제 24대(실측). 실사용량은 ratio가 정하므로 넉넉히 둬도 자원 선점 없음. **K8S quota 확정이 긴급하지 않은 이유**
+  - **반납은 일어나지 않는다.** 공식 문서: *"an executor should not be idle if there are still pending tasks"* — 일감이 725~1,450개 상시 대기라 제거 조건 자체가 성립 안 함. `minExecutors=4`로 낮춰도 12대 유지(실측). 즉 DA의 대표 기능(반납)은 안 쓰고 **요청량 조절만** 사용
+  - **유일한 실질적 약점: ratio가 파일 크기에 의존.** 일감 수가 파일 크기로 정해지므로 append 설정이 바뀌면 **에러 없이 조용히 어긋난다**. 재검증 조건 1순위
+  - **C안(Trino 사전 산정) 보류.** 같은 목적을 B안이 설정 4줄로 달성. `num_executors = clamp(ceil(총 크기GB × 0.32), 4, MAX)`, `.partitions` 범위 조회, naive datetime 변환(2026-08-11 13:00 → 496237), `com_num_executor` fallback 유지 — 필요 시 예시 파일 참조
+  - **daily는 판단이 다르다** — 30~60분 job이라 `executorIdleTimeout` 60초가 전체의 2~3%에 불과해 반납이 실제로 일어날 수 있다. ratio 0.13도 hourly 전용. daily 튜닝 후 별도 판단
+  - 미확인: `maxExecutors` 확정값, ratio 0.066에서의 요청 로그 해석, 메모리 97.62%(spill 0인 동안 조치 안 함), 다른 hourly 테이블 3개 검증
   - 입력 측정은 **`.files`가 아니라 `.partitions`** (파티션당 1행 집계, `.files`는 컬럼 19개 통계를 전부 끌고 옴). **범위 조회**여야 한다 — 재처리 DAG trigger 시 여러 시간에 걸친다
   - **파티션 값 변환은 naive datetime으로** — `ts`가 `timestamp_ntz`라 timezone을 붙이면 엉뚱한 시간대를 조회한다. `int((dt − 1970-01-01).total_seconds() // 3600)`, 2026-08-11 13:00 → 496237 (Spark UI 실측 일치)
   - 기존 `com_num_executor` 상수는 **fallback으로 유지** (조회 실패·0 반환·비정상 크기 전부). 지우면 Trino 장애가 곧 Compaction 실패가 된다
