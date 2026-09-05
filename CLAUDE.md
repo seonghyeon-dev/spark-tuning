@@ -1,11 +1,27 @@
 # Spark + Iceberg 파이프라인 가이드
 
+## Agents
+
+서브에이전트는 **별도 컨텍스트**에서 실행되고 결과 보고서만 반환한다. 문서가 8,000줄이 넘으므로 **여러 문서를 훑는 조사·검증은 에이전트에 위임**하는 것이 기본이다.
+
+| Agent | Purpose | 도구 |
+|-------|---------|------|
+| `verify-column-naming` | TABLE_A 컬럼 명명 규칙 위반과 폐기된 옛 표기(`col_c`/`col_d`/`par_b`/`sort_c`) 잔존을 검사 | 읽기 전용 |
+| `documentation-engineer` | 검증 문서 작성·개편, 상세 가이드에서 보고용 요약 파생 | 읽기·쓰기 |
+
+**사용 원칙:**
+
+1. **읽기는 병렬, 쓰기는 직렬.** 같은 문서를 여러 에이전트가 동시에 고치면 충돌한다. 수정 적용은 메인 세션에서 한다
+2. **에이전트는 이 대화의 맥락을 상속하지 않는다.** `CLAUDE.md`는 읽지만 세션에서 새로 정한 규칙은 모른다 → 호출 프롬프트에 직접 실을 것
+3. **실측값 판정과 미확인 항목 확정은 에이전트에 맡기지 않는다.** 에이전트는 사용자에게 되물을 수 없어 빈칸을 추정치로 채울 위험이 있다. 사실 수집은 에이전트, 판정은 메인 세션
+4. **보고서를 무검증으로 신뢰하지 않는다.** 예외 처리 0건, 위반 급증, 출처 없는 수치는 원문을 직접 확인할 신호다
+
 ## Skills
 
 | Skill | Purpose |
 |-------|---------|
-| `verify-implementation` | 프로젝트의 모든 verify 스킬을 순차 실행하여 통합 검증 보고서를 생성합니다 |
-| `manage-skills` | 세션 변경사항을 분석하고, 검증 스킬을 생성/업데이트하며, CLAUDE.md를 관리합니다 |
+| `verify-implementation` | 검증 에이전트를 병렬 실행하고 verify 스킬을 순차 실행하여 통합 검증 보고서를 생성합니다 |
+| `manage-skills` | 세션 변경사항을 분석하고, 검증 에이전트/스킬을 생성·업데이트하며, CLAUDE.md를 관리합니다 |
 
 ## Code Style Rules
 
@@ -248,6 +264,13 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 
 ```
 ├── CLAUDE.md
+├── .claude/
+│   ├── agents/
+│   │   ├── verify-column-naming.md    # 컬럼 명명 검증 (읽기 전용)
+│   │   └── documentation-engineer.md  # 문서 작성·개편
+│   └── skills/
+│       ├── verify-implementation/     # 통합 검증 (에이전트 병렬 + 스킬 순차)
+│       └── manage-skills/             # 검증 항목 유지보수
 ├── tuning/
 │   ├── spark-tuning-guide.md          # Spark 튜닝 가이드 (append Job)
 │   ├── compaction-tuning-guide.md     # Compaction 튜닝 가이드 (hourly, 상세)
