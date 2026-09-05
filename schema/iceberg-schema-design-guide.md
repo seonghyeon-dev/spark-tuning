@@ -66,7 +66,7 @@
 | 항목 | 설정 |
 |------|------|
 | 파티션 | `hour(ts)`, `par_a` |
-| Sort Order | `sort_a`, `col_b` ASC NULLS FIRST |
+| Sort Order | `sort_a`, `sort_b` ASC NULLS FIRST |
 | `write.distribution-mode` | `range` |
 
 **컬럼별 Cardinality 및 용도**
@@ -76,8 +76,8 @@
 | par_a | 파티션 키 | 4 | identity |
 | col_a | WHERE 필터 | 248 (par_a별 42~72) | B안에서 파티션 제거, Sort Order 미포함 |
 | sort_a | Sort Order 1순위 | 31,697 | WHERE 절 등가 조건 |
-| sort_b | WHERE 필터 | 25,820 | Sort Order 미포함 |
-| col_b | Sort Order 2순위 | 563,691 | WHERE 절 등가 조건 |
+| sort_b | Sort Order 2순위 | 25,820 | WHERE 절 등가 조건 |
+| col_b | WHERE 필터 | 563,691 | Sort Order 미포함 |
 
 ### 1.2 조회 패턴
 
@@ -107,10 +107,10 @@ UI에서 사용하는 Trino 쿼리를 분석한 결과 (UI 기능상 WHERE 절�
 | WHERE | par_a | **필수** | 등가 (`=`, `IN`) | 파티션 프루닝 유효 |
 | WHERE | col_a | **필수** | 등가 (`=`, `IN`) | B안에서 파티션 제거, Sort Order 미포함 |
 | WHERE | sort_a | **필수** | 등가 (`=`, `IN`) | Sort Order 1순위, Data Skipping |
-| WHERE | sort_b | **필수** | 등가 (`=`, `IN`) | Sort Order 미포함 |
-| WHERE | col_b | **필수** | 등가 (`=`, `IN`) | Sort Order 2순위, Data Skipping |
+| WHERE | sort_b | **필수** | 등가 (`=`, `IN`) | Sort Order 2순위, Data Skipping |
+| WHERE | col_b | **필수** | 등가 (`=`, `IN`) | Sort Order 미포함 |
 
-스키마 설계의 핵심 목표는 이러한 다차원 필터 조회에서 **불필요한 파일 읽기를 최소화**(Data Skipping)하는 것이다. 파티션 프루닝은 `hour(ts)` + `par_a`에서 작동하며, **sort_a, col_b의 Sort Order + Data Skipping이 추가 최적화 수단**이다.
+스키마 설계의 핵심 목표는 이러한 다차원 필터 조회에서 **불필요한 파일 읽기를 최소화**(Data Skipping)하는 것이다. 파티션 프루닝은 `hour(ts)` + `par_a`에서 작동하며, **sort_a, sort_b의 Sort Order + Data Skipping이 추가 최적화 수단**이다.
 
 ---
 
@@ -347,8 +347,8 @@ ALTER TABLE catalog.db.TABLE_A REPLACE PARTITION FIELD col_a WITH truncate(3, co
 -- Sort Order 변경 (기존 설정을 덮어쓴다)
 ALTER TABLE catalog.db.TABLE_A WRITE ORDERED BY sort_a ASC NULLS FIRST, sort_b ASC NULLS FIRST, col_b ASC NULLS FIRST;
 
--- B안 전환 시: col_a를 Sort Order에 추가
-ALTER TABLE catalog.db.TABLE_A WRITE ORDERED BY sort_a ASC NULLS FIRST, col_a ASC NULLS FIRST, sort_b ASC NULLS FIRST, col_b ASC NULLS FIRST;
+-- B안(확정) 전환 시: Sort Order 2개로 축소. col_a는 포함하지 않는다
+ALTER TABLE catalog.db.TABLE_A WRITE ORDERED BY sort_a ASC NULLS FIRST, sort_b ASC NULLS FIRST;
 ```
 
 > Sort Order 변경은 이후 쓰기/Compaction에만 적용된다. 기존 데이터의 물리적 정렬은 변경되지 않으며, Compaction 실행 시 새 Sort Order로 재정렬된다.
@@ -392,7 +392,7 @@ Bucket은 **identity 파티션의 대안**이다. 별도의 최적화 기능이 
 | 해당 컬럼이 등가 조건(`=`)으로만 조회되는가? | **Bucket 적합** | 범위 조회 → identity 또는 truncate |
 | `day × 파티션 키` 조합별 데이터가 384MB 미만으로 small file 문제가 있는가? | **Bucket으로 파티션 수 축소** | identity 유지 |
 
-**TABLE_A 판단**: par_a Cardinality 4 (identity 최적). col_a는 B안에서 파티션에서 제거되어 Sort Order 의존(Data Skipping)으로 처리. → **Bucket 불필요** ✅
+**TABLE_A 판단**: par_a Cardinality 4 (identity 최적). col_a는 B안에서 파티션에서 제거되며 Sort Order에도 포함되지 않아 Row-level Filter로 처리. → **Bucket 불필요** ✅
 
 ### 3.1 개념
 
@@ -568,25 +568,24 @@ TABLE_A는 다음 특성 때문에 `range` 모드가 적합하다:
 
 > **대안 검토**: 쓰기 레이턴시가 SLA에 민감하다면, `hash` + 시간당 Compaction 조합도 고려할 수 있다. 이 경우 쓰기는 빨라지지만 Compaction 전까지 Data Skipping 효과가 감소한다.
 
-### 4.4 TABLE_A 적용: sort_a, col_b + range 모드 근거 (B안)
+### 4.4 TABLE_A 적용: sort_a, sort_b + range 모드 근거
 
 | 설정 | 값 | 근거 |
 |------|-----|------|
 | `write.distribution-mode` | `range` | 다차원 필터 조회에서 Data Skipping 효과 극대화. 쓰기 비용(9.2GiB shuffle)은 24 executor로 44초에 처리 |
-| Sort Order | `sort_a, col_b ASC NULLS FIRST` | WHERE 절 필터 컬럼 중 Sort Order 대상 2개 선정 |
+| Sort Order | `sort_a, sort_b ASC NULLS FIRST` | WHERE 절 필터 컬럼 중 Sort Order 대상 2개 선정 |
 
 **Sort Order 컬럼 순서의 중요성**
 
 ```sql
-WRITE ORDERED BY sort_a, sort_b, col_b
+WRITE ORDERED BY sort_a, sort_b
 ```
 
 정렬은 **왼쪽 컬럼부터 우선 적용**된다. 따라서:
 - `sort_a` 단독 필터: ✅ Data Skipping 효과 높음
 - `sort_a + sort_b` 필터: ✅ 효과 높음
-- `sort_a + sort_b + col_b` 필터: ✅ 효과 높음
 - `sort_b` 단독 필터 (sort_a 없이): ⚠️ 효과 제한적
-- `col_b` 단독 필터: ⚠️ 효과 제한적
+- `col_a`, `col_b` 필터: Sort Order 미포함 — Row-level Filter로만 작동
 
 **Sort Order 컬럼 선택 기준**
 
@@ -623,7 +622,7 @@ Z-ordering은 Compaction 시 적용하는 **추가 최적화**이다. Sort Order
 | Compaction Job을 운영할 인프라/자원이 있는가? | 다음 질문으로 | Z-ordering 불가 (Compaction 필수) |
 | Sort Order 1순위 컬럼의 Data Skipping 비율이 이미 90% 이상인가? | 추가 효과 미미 → 불필요 | **Z-ordering 검토** |
 
-**TABLE_A 판단**: sort_a, col_b 2개 컬럼 체제에서 col_b 단독 필터 빈도가 아직 충분히 높지 않다. → **현재 Sort Order 유지, 단독 필터 빈도 추가 확인 후 결정**
+**TABLE_A 판단**: sort_a, sort_b 2개 컬럼 체제에서 sort_b 단독 필터 빈도가 아직 충분히 높지 않다. → **현재 Sort Order 유지, 단독 필터 빈도 추가 확인 후 결정**
 
 ### 5.1 개념 및 원리
 
@@ -697,7 +696,7 @@ TABLE_A의 조회 패턴이 **다차원 필터**(ts + sort_a + sort_b + col_b)�
 CALL catalog.system.rewrite_data_files(
   table => 'db.TABLE_A',
   strategy => 'sort',
-  sort_order => 'zorder(sort_a, sort_b, col_b)',
+  sort_order => 'zorder(sort_a, sort_b)',
   where => 'ts >= timestamp ''2026-03-15'' AND ts < timestamp ''2026-03-16'''
 );
 ```
@@ -731,16 +730,16 @@ CALL catalog.system.rewrite_data_files(
 **권장 전략**
 
 ```
-1단계 (현재): Sort Order (sort_a, col_b)으로 쓰기
+1단계 (현재): Sort Order (sort_a, sort_b)으로 쓰기
   → 기본 Data Skipping 확보
 
-2단계 (조회 로그 추가 확보 후): col_b 단독 필터 빈도 확인
+2단계 (조회 로그 추가 확보 후): sort_b 단독 필터 빈도 확인
   → sort_a 단독 필터가 70% 이상 → Sort Order 유지 (현재 최적)
-  → col_b 단독 필터가 30% 이상 → Compaction 시 Z-ordering 전환 검토
+  → sort_b 단독 필터가 30% 이상 → Compaction 시 Z-ordering 전환 검토
 
 3단계 (Z-ordering 적용 시): Compaction 대상 컬럼 선정
   → 파티션 키(par_a)는 데이터 조직화 목적이므로 Z-ordering 대상에서 제외
-  → Z-ordering 대상: sort_a, col_b
+  → Z-ordering 대상: sort_a, sort_b
 ```
 
 > **참고**: Z-ordering은 Compaction 프로시저에서 적용하므로, 운영 상세(주기, 대상 파티션 선정, 비용)는 Compaction 운영 가이드에서 다룬다.
@@ -891,7 +890,7 @@ SET TBLPROPERTIES (
 | 컬럼 | Bloom Filter | 이유 |
 |------|-------------|------|
 | `sort_a` | 검토 (2단계) | Sort Order 1순위이므로 min/max로 대부분 skip. 추가 효과 제한적일 수 있음 |
-| `col_b` | **검토 권장** | Sort Order 2순위. min/max 범위가 넓어 등가 필터 시 Bloom Filter 효과 최대 |
+| `sort_b` | **검토 권장** | Sort Order 2순위. min/max 범위가 넓어 등가 필터 시 Bloom Filter 효과 최대 |
 | `col_a` | 검토 (2단계) | Sort Order 미포함. Bloom Filter로 등가 필터 보완 가능 |
 | `par_a` | ❌ 불필요 | 파티션 키로 이미 프루닝됨 |
 
@@ -1025,13 +1024,13 @@ Spark는 읽기 시 `read.split.target-size`(128MB, Spark의 `maxPartitionBytes`
 | 항목 | 현황 |
 |------|------|
 | 파티션 프루닝 | B안: `hour(ts)` ✅, `par_a` ✅ (WHERE 절 항상 포함 확정) |
-| Sort Order | B안: `sort_a`, `col_b` |
+| Sort Order | 확정: `sort_a`, `sort_b` (파티션만 B안 채택, Sort Order는 별도 결정) |
 | 일일 파일 수 (Compaction 전) | 실측 **~23,789개/일** → ⚠️ 주의 구간 |
 | Compaction 실측 | 23,789 → **1,834개** (92% 감소), 평균 파일 크기 ~464MB |
 | Compaction 운영 | **필수**, 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일치) 단위 배치 |
 | col_a Cardinality | identity 248개 (par_a별 42~72), truncate(3) 적용 시 **135개로 감소** |
 
-핵심 설계 결정은 **파티션 구조와 col_a 처리 방식**(파티션 유지 vs Sort Order 이동)으로 귀결된다. 읽기 성능 테스트 결과 B안(hour+par_a, col_a Sort Order 이동)이 전 케이스 1위로 확정되었다.
+핵심 설계 결정은 **파티션 구조와 col_a 처리 방식**(파티션 유지 vs 파티션에서 제거)으로 귀결된다. 읽기 성능 테스트 결과 B안(hour+par_a, col_a 파티션 제거)이 전 케이스 1위로 확정되었다.
 
 ---
 
@@ -1060,14 +1059,16 @@ Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일
 
 **B안 (읽기 성능 최우수): hour(ts) + par_a — 파티션 구조 변경**
 
-A안/C안/E안이 col_a 트랜스폼에 집중하는 반면, B안은 **파티션 구조 자체를 변경**하는 접근이다. col_a를 파티션에서 제거하고 Sort Order로 이동하며, 시간 파티션을 `day` → `hour`로 세분화한다.
+A안/C안/E안이 col_a 트랜스폼에 집중하는 반면, B안은 **파티션 구조 자체를 변경**하는 접근이다. col_a를 파티션에서 제거하고(Sort Order에도 넣지 않아 Row-level Filter로 처리), 시간 파티션을 `day` → `hour`로 세분화한다.
 
 ```
 파티션: hour(ts), par_a
-Sort Order: sort_a, col_b ASC NULLS FIRST
+Sort Order: sort_a, col_b ASC NULLS FIRST   ← 읽기 성능 테스트 당시 구성
 distribution-mode: range
 파티션 조합: 24시간 × 4 par_a = 96개/일
 ```
+
+> ⚠️ **채택된 것은 B안의 파티션 구조이고, Sort Order는 별도로 결정됐다.** 위 `sort_a, col_b`는 테스트한 B안의 구성이며, 최종 확정은 **`sort_a`, `sort_b`**다 — Sort Order 조합 4개는 성능 차이가 없어 다른 기준으로 선택됐다 ([read-performance-test.md](read-performance-test.md) §5). 적용할 DDL은 §7.3을 따를 것.
 
 | 항목 | 내용 |
 |------|------|
@@ -1082,7 +1083,7 @@ distribution-mode: range
 - **파티션 Skew 해소** — A안의 하위 ~190개 파티션(0.001GB 이하) 구조적 Skew가 사라짐. hour × par_a 기준 파티션당 ~8.9GB로 균등 분포
 - **시간 단위 파티션 프루닝** — 시간값 조건 포함 시 day 대비 최대 1/24 추가 scan 축소. 일 단위 조건 시에는 24개 파티션의 매니페스트 엔트리를 읽지만, 이는 메타데이터 수준이므로 읽기 성능 영향 미미 (읽기 성능 테스트에서 B안 최우수 확인)
 - **연간 총 파티션 수 감소** — 90,520개/년(A안) → 35,040개/년 (61% 감소)
-- **Compaction 운영 부담 경감** — Compaction 부담 경감 — range 모드의 per-batch 글로벌 정렬로 Compaction 전에도 col_a Data Skipping이 유효
+- **Compaction 운영 부담 경감** — range 모드의 per-batch 글로벌 정렬로 Compaction 전에도 Sort Order 컬럼(`sort_a`, `sort_b`)의 Data Skipping이 유효
 
 **트레이드오프**
 
@@ -1104,7 +1105,7 @@ ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD par_a;
 ALTER TABLE catalog.db.TABLE_A
 WRITE ORDERED BY
     sort_a ASC NULLS FIRST,
-    col_b ASC NULLS FIRST;
+    sort_b ASC NULLS FIRST;
 
 -- 기존 데이터 재정리
 CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
@@ -1315,7 +1316,7 @@ CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');
 | 파티션 조합 수 | 248 | 96 (24×4) | 64 (4×16) | **4N** (N 조정 가능) | 135 |
 | Compaction 전 파일/일 | ~23,789 ⚠️ (실측) | 실측 필요 | 9,216 ⚠️ | **~1,792 ✅** (N=64 기준) | ~19,440 ⚠️ |
 | Compaction 후 파일/일 | 1,834 ✅ (실측) | 실측 필요 | ~1,300 ✅ | Compaction 전에도 최적 | ~1,500 ✅ |
-| 필터 컬럼 프루닝 방식 | col_a 파티션 + sort Data Skipping | col_a Data Skipping | col_a 파티션 + sort Data Skipping | **hash bucket 프루닝(1/N) + hash_val Data Skipping** | col_a 파티션 + sort Data Skipping |
+| 필터 컬럼 프루닝 방식 | col_a 파티션 + sort Data Skipping | col_a는 Row-level Filter (sort_a/sort_b Data Skipping) | col_a 파티션 + sort Data Skipping | **hash bucket 프루닝(1/N) + hash_val Data Skipping** | col_a 파티션 + sort Data Skipping |
 | 운영 복잡도 | 높음 (Compaction 필수) | 낮음 (Compaction 부담 최저) | 중간 (Compaction 필수) | **낮음 (Compaction 부담 최저)** | 높음 (Compaction 필수) |
 | Skew | 있음 | 없음 | 없음 | **없음** | 완화 |
 | 시간 프루닝 세밀도 | 일 단위 | 시간 단위 | 일 단위 | 일 단위 | 일 단위 |
@@ -1328,7 +1329,7 @@ B안 (읽기 성능 최우수): hour(ts) + par_a
   → 읽기 성능 테스트 4개 케이스 전부 1위 (A안 대비 5~31% 빠름)
   → 파일 균등성 최우수 (avg 497.9MB, 384MB 미만 2개)
   → Compaction 부담 최저 (96 파티션/일)
-  → Sort Order: sort_a, col_b
+  → Sort Order: 확정 `sort_a`, `sort_b` (테스트 당시 B안 구성은 `sort_a, col_b`)
 
 A안: identity 유지 + Compaction (1시간 + 1일)
   → Compaction 실측 검증 완료 (23,789 → 1,834개)
@@ -1349,7 +1350,7 @@ A안: identity 유지 + Compaction (1시간 + 1일)
 |----------|--------|-------------|----------|
 | 시간 파티션 | `hour`/`day`/`month` | `day(ts)` (A안/C~E안), `hour(ts)` (B안) | A안/C~E안: 일 단위 조회. B안: 시간 단위 프루닝 + 파티션당 크기 적정화(~8.9GB) |
 | par_a 파티션 | `identity`/`bucket` | `identity` | Cardinality 4, WHERE 항상 포함 → 프루닝 유효 |
-| col_a 파티션 | `identity`/`truncate`/`bucket`/Sort Order 이동/hash bucket | `identity` (A안), Sort Order 이동 (B안), hash bucket (D안) | A안/C안/E안: 파티션 키 유지. B안: Sort Order 이동. D안: hash_val 컬럼으로 bucket (7.1절 참조) |
+| col_a 파티션 | `identity`/`truncate`/`bucket`/파티션 제거/hash bucket | `identity` (A안), 파티션 제거 (B안), hash bucket (D안) | A안/C안/E안: 파티션 키 유지. B안: 파티션에서 제거하며 Sort Order에도 넣지 않음 → Row-level Filter. D안: hash_val 컬럼으로 bucket (7.1절 참조) |
 | Sort Order | 사용/미사용, 컬럼 선택 | A안/C안/E안: `sort_a, sort_b, col_b`. **B안: `sort_a, col_b`**. D안: `hash_val` | A안/C안/E안: WHERE 절 3개 필터 컬럼. B안: 2개. D안: hash_val 단일 정렬로 4개 컬럼 필터링 대체 |
 | Distribution Mode | `none`/`hash`/`range` | `range` | Sort Order 사용 시 range 필수 |
 | Z-ordering | 미적용/Compaction 시 적용 | 미적용 (2단계 검토) | sort_b, col_b 단독 필터 빈도 추가 확인 후 결정 |
@@ -1408,16 +1409,18 @@ TBLPROPERTIES (
 ALTER TABLE catalog.db.TABLE_A
 WRITE ORDERED BY
     sort_a ASC NULLS FIRST,
-    col_b ASC NULLS FIRST;
+    sort_b ASC NULLS FIRST;
 ```
 
-**ALTER TABLE — Bloom Filter 적용 (검토 후)**
+**ALTER TABLE — Bloom Filter 적용 (적용하지 않음)**
+
+> ⚠️ **읽기 성능 테스트에서 Bloom Filter 효과가 확인되지 않아 설정하지 않는다** ([read-performance-test.md](read-performance-test.md) §5). 아래 DDL은 형식 참고용이다.
 
 ```sql
--- Sort Order 2순위 컬럼에 Bloom Filter 적용 (검토 후)
+-- Sort Order 2순위 컬럼에 Bloom Filter 적용 (미적용)
 ALTER TABLE catalog.db.TABLE_A
 SET TBLPROPERTIES (
-    'write.parquet.bloom-filter-enabled.column.col_b' = 'true'
+    'write.parquet.bloom-filter-enabled.column.sort_b' = 'true'
 );
 ```
 
@@ -1434,7 +1437,7 @@ ALTER TABLE catalog.db.TABLE_A ADD PARTITION FIELD par_a;
 ALTER TABLE catalog.db.TABLE_A
 WRITE ORDERED BY
     sort_a ASC NULLS FIRST,
-    col_b ASC NULLS FIRST;
+    sort_b ASC NULLS FIRST;
 
 -- 기존 데이터 재정리
 CALL catalog.system.rewrite_data_files(table => 'db.TABLE_A');

@@ -66,6 +66,12 @@ Spark Job의 리소스 설정 (`driver-cores`, `driver-memory`, `executor-cores`
 ### 1.3 대상 Iceberg 테이블 스키마
 
 > **참고**: 테이블명과 컬럼명은 도메인 정보이므로 익명화된 이름을 사용한다.
+>
+> ⚠️ **이 절의 스키마는 확정 스키마가 아니라 벤치마크 당시(2026-03-16)의 A안 구성이다.** 아래 측정값은 전부 이 구성에서 얻은 것이므로 스키마 서술을 바꾸면 측정 조건이 어긋난다. 확정 스키마는 파티션 `hour(ts)`, `par_a` + Sort Order `sort_a`, `sort_b`이며 [iceberg-schema-design-guide.md](../schema/iceberg-schema-design-guide.md) §7.3이 기준이다.
+>
+> 컬럼 이름은 2026-09-05 통일 규칙(`par_*` 파티션 / `sort_*` Sort Order / `col_*` 역할 없음)으로 표기했다. 접두어는 **확정 스키마에서의 역할**을 뜻하므로, 아래 A안 구성에서는 `col_a`가 파티션으로, `col_b`가 Sort Order로 등장한다 — 이름이 틀린 것이 아니라 그 배치가 탈락한 것이다.
+>
+> **설정값 재검증 대기 중** — 확정 스키마에서 벤치마크를 다시 수행해야 한다.
 
 **테이블: TABLE_A**
 
