@@ -502,7 +502,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 
 ## 6. 동적 리소스 산정
 
-> **자원 할당 방식 선택은 `pipeline/compaction-executor-sizing-design.md`에서 다룬다.** 후보가 3개이며(정적 유지 / Spark Dynamic Allocation / 사전 산정), 권고는 **현재 정적 12 유지 → 증가 시 Dynamic Allocation 우선 시도 → 부족하면 사전 산정**이다. 이 섹션은 그중 사전 산정의 계수와 측정 방법을 다룬다.
+> **자원 할당 방식은 `pipeline/compaction-executor-sizing-design.md`에서 확정했다.** 후보 3개(정적 유지 / Dynamic Allocation / 사전 산정) 중 **Dynamic Allocation + `executorAllocationRatio=0.13`을 채택**했으며 7회 실측으로 검증했다(39GB→12대, 82GB→24대). 이 섹션의 계수 `C=0.32`는 그 ratio 값을 도출하는 근거로 쓰인다. 사전 산정(Trino 조회) 방식은 보류 상태다.
 
 ### 6.1 배경과 동적화 대상 축소
 
@@ -675,7 +675,15 @@ num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 - 도입 시점: 테이블당 **55~60GB** 도달 시 (창 여유가 2~3분으로 줄어드는 구간)
 - 그때까지는 `com_num_executor`를 12로 고정한다. 산정값도 12~14로 정적값과 거의 같다
 
-**증가 시점에 무엇을 도입할지는 별도 판단이다.** Spark Dynamic Allocation은 설정 4줄로 같은 목적(데이터 증가 흡수)을 달성하고 롤백이 한 줄이므로 사전 산정보다 먼저 시도한다. 다만 DA는 `shuffleTracking` 때문에 executor 반납이 되지 않아 유휴 회수 효과는 없고, 확보(scale-up)에 10~20초가 걸린다. 상세 비교는 **`pipeline/compaction-executor-sizing-design.md`** §4~6을 참조한다.
+**실제 채택안은 Dynamic Allocation이다.** 위 `C=0.32`는 DA의 `executorAllocationRatio` 값을 도출하는 데 쓰인다.
+
+```
+desired = (데이터GB × 9 ÷ 4) × ratio = 데이터GB × 2.25 × ratio
+목표    = 데이터GB × 0.32
+→ ratio = 0.32 ÷ 2.25 = 0.142   (실측 검증값 0.13)
+```
+
+양변에서 `데이터GB`가 소거되므로 **ratio는 테이블 크기와 무관하다.** 실측에서 같은 0.13으로 39GB → 12대, 82GB → 24대가 나왔다. 상세는 **`pipeline/compaction-executor-sizing-design.md`** §4~5를 참조한다.
 
 ### 6.5 구현
 
