@@ -32,6 +32,7 @@ argument-hint: "[선택사항: 특정 verify 스킬 이름]"
 | # | 에이전트 | 설명 | 검사 대상 |
 |---|----------|------|-----------|
 | 1 | `verify-column-naming` | TABLE_A 컬럼 명명 규칙 위반 및 폐기된 옛 표기 잔존 | `CLAUDE.md`, `tuning/*.md`, `schema/*.md`, `pipeline/**/*.md`, `pipeline/**/*.py` |
+| 2 | `verify-doc-consistency` | 확정값(설정값·cron·버전·실측 수치)의 `CLAUDE.md` ↔ 가이드 ↔ 보고용 요약 3자 대조, 목표/운영 버전 구분, 미확인 마커 동기화 | `CLAUDE.md`, `tuning/*.md`, `schema/*.md`, `pipeline/*.md`, `pipeline/**/*.py` |
 
 ### 검증 스킬 (순차 실행)
 
@@ -263,8 +264,7 @@ X개 수정 완료.
 2. **스킬의 자체적 예외** — 각 verify 스킬의 Exceptions 섹션에 정의된 패턴은 이슈로 보고하지 않음
 3. **verify-implementation 자체** — 실행 대상 스킬 목록에 자기 자신을 포함하지 않음
 4. **manage-skills** — `verify-`로 시작하지 않으므로 실행 대상에 포함되지 않음
-5. **`documentation-engineer` 에이전트** — 문서 작성용이며 검증 에이전트가 아니므로 실행 대상에 포함되지 않음
-6. **에이전트가 `판정불가`로 보고한 항목** — 이슈가 아니라 **호출자가 확인할 목록**이다. 자동 수정 대상에 넣지 않고 보고서에 별도로 나열한다
+5. **에이전트가 `판정불가`로 보고한 항목** — 이슈가 아니라 **호출자가 확인할 목록**이다. 자동 수정 대상에 넣지 않고 보고서에 별도로 나열한다
 
 ## Related Files
 
@@ -272,4 +272,5 @@ X개 수정 완료.
 |------|---------|
 | `.claude/skills/manage-skills/SKILL.md` | 검증 유지보수 (이 파일의 실행 대상 목록을 관리) |
 | `.claude/agents/verify-column-naming.md` | 컬럼 명명 검증 에이전트 (읽기 전용) |
+| `.claude/agents/verify-doc-consistency.md` | 문서 간 확정값 동기화 검증 에이전트 (읽기 전용) |
 | `CLAUDE.md` | 프로젝트 지침 |

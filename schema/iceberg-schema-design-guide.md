@@ -104,13 +104,13 @@ UI에서 사용하는 Trino 쿼리를 분석한 결과 (UI 기능상 WHERE 절�
 | 절 | 사용 컬럼 | 빈도 | 조건 유형 | 비고 |
 |----|----------|------|----------|------|
 | WHERE | ts | **필수** | `date(ts) = ...`, `date(ts) IN (...)`, 시간 범위 | 날짜 또는 시간값. `hour(ts)` 파티션으로 프루닝 |
-| WHERE | par_a | **필수** | 등가 (`=`, `IN`) | 파티션 프루닝 유효 |
+| WHERE | par_a | **필수** | 등가 (`=`, `IN`) | Partition Pruning 유효 |
 | WHERE | col_a | **필수** | 등가 (`=`, `IN`) | B안에서 파티션 제거, Sort Order 미포함 |
 | WHERE | sort_a | **필수** | 등가 (`=`, `IN`) | Sort Order 1순위, Data Skipping |
 | WHERE | sort_b | **필수** | 등가 (`=`, `IN`) | Sort Order 2순위, Data Skipping |
 | WHERE | col_b | **필수** | 등가 (`=`, `IN`) | Sort Order 미포함 |
 
-스키마 설계의 핵심 목표는 이러한 다차원 필터 조회에서 **불필요한 파일 읽기를 최소화**(Data Skipping)하는 것이다. 파티션 프루닝은 `hour(ts)` + `par_a`에서 작동하며, **sort_a, sort_b의 Sort Order + Data Skipping이 추가 최적화 수단**이다.
+스키마 설계의 핵심 목표는 이러한 다차원 필터 조회에서 **불필요한 파일 읽기를 최소화**(Data Skipping)하는 것이다. Partition Pruning은 `hour(ts)` + `par_a`에서 작동하며, **sort_a, sort_b의 Sort Order + Data Skipping이 추가 최적화 수단**이다.
 
 ---
 
@@ -127,7 +127,7 @@ Iceberg는 **Hidden Partitioning**을 사용한다. Hive 파티셔닝과의 핵�
 | 파티션 컬럼 | 별도 컬럼으로 스키마에 노출 | 원본 컬럼에 트랜스폼 적용, 스키마 변경 없음 |
 | 쿼리 작성 | 파티션 컬럼을 직접 지정해야 함 (`dt='2026-03-15'`) | 원본 컬럼으로 쿼리 (`ts >= '2026-03-15'`), Iceberg가 자동 변환 |
 | 파티션 변경 | 테이블 재생성 + 데이터 재적재 필요 | **Partition Evolution**: 메타데이터만 변경, 기존 데이터 유지 |
-| 사용자 실수 | 파티션 컬럼 누락 시 full scan | 자동 파티션 프루닝, 실수 방지 |
+| 사용자 실수 | 파티션 컬럼 누락 시 full scan | 자동 Partition Pruning, 실수 방지 |
 
 **핵심 장점**: 사용자는 `ts` 컬럼으로 쿼리하면 되고, Iceberg가 내부적으로 `hour(ts)` 파티션을 이용해 불필요한 파일을 건너뛴다.
 
@@ -135,7 +135,7 @@ Iceberg는 **Hidden Partitioning**을 사용한다. Hive 파티셔닝과의 핵�
 -- Hive: 사용자가 파티션 컬럼(dt)을 알고 직접 지정해야 함
 SELECT * FROM table WHERE dt = '2026-03-15';
 
--- Iceberg: 원본 컬럼(ts)으로 쿼리, 자동 파티션 프루닝
+-- Iceberg: 원본 컬럼(ts)으로 쿼리, 자동 Partition Pruning
 SELECT * FROM table WHERE ts >= '2026-03-15' AND ts < '2026-03-16';
 ```
 
@@ -210,7 +210,7 @@ TABLE_A 실측값:
 
 | 조건 | 파티션 효과 |
 |------|-----------|
-| WHERE 절에 파티션 컬럼 포함 | ✅ 파티션 프루닝으로 scan 범위 축소 |
+| WHERE 절에 파티션 컬럼 포함 | ✅ Partition Pruning으로 scan 범위 축소 |
 | WHERE 절에 파티션 컬럼 미포함 | ❌ 프루닝 불가, 전체 파티션 scan |
 
 **파티션 키는 WHERE 절에 가장 자주 등장하는 컬럼**이어야 한다. 다만 파티션은 프루닝 외에도 다음 역할을 수행한다:
@@ -232,8 +232,8 @@ TABLE_A 실측값:
 
 | 파티션 | 트랜스폼 | 근거 |
 |--------|---------|------|
-| `hour(ts)` | 시간 트랜스폼 | 모든 조회에 ts 조건 포함 → ✅ 파티션 프루닝 유효. par_a(4)와 조합하여 96개/일 파티션으로 파티션당 ~8.9GB 적정 |
-| `par_a` | identity | Cardinality 4. WHERE 절에 항상 포함되어 파티션 프루닝 유효. 매우 낮은 Cardinality로 identity 최적 |
+| `hour(ts)` | 시간 트랜스폼 | 모든 조회에 ts 조건 포함 → ✅ Partition Pruning 유효. par_a(4)와 조합하여 96개/일 파티션으로 파티션당 ~8.9GB 적정 |
+| `par_a` | identity | Cardinality 4. WHERE 절에 항상 포함되어 Partition Pruning 유효. 매우 낮은 Cardinality로 identity 최적 |
 
 > **col_a 파티션 제외 사유**: col_a는 초기 설계(A안)에서 identity 파티션이었으나, 전체 조합 248개로 구조적 Skew 발생 (하위 ~190개 파티션이 0.001GB 이하). B안에서는 col_a를 파티션에서 제거하여 Skew 문제를 해소했다. 읽기 성능 테스트 결과, B안이 A안(col_a identity 프루닝)보다 빨랐다 ([read-performance-test.md](read-performance-test.md) 참조).
 
@@ -455,11 +455,11 @@ Sort Order은 쓰기 비용(shuffle)을 지불하고 읽기 성능(Data Skipping
 
 | 질문 | 예 → | 아니오 → |
 |------|------|---------|
-| 파티션 프루닝만으로 충분한가? (파티션 조건으로 대상 파일이 충분히 줄어드는가) | Sort Order 불필요 | 다음 질문으로 |
-| 파티션 프루닝 후에도 파일 수가 많고, WHERE 절에 파티션 외 컬럼이 자주 사용되는가? | **Sort Order 필요** | Sort Order 불필요 |
+| Partition Pruning만으로 충분한가? (파티션 조건으로 대상 파일이 충분히 줄어드는가) | Sort Order 불필요 | 다음 질문으로 |
+| Partition Pruning 후에도 파일 수가 많고, WHERE 절에 파티션 외 컬럼이 자주 사용되는가? | **Sort Order 필요** | Sort Order 불필요 |
 | 쓰기 후 조회가 거의 없는가? (적재 전용, 조회는 다른 시스템에서) | Sort Order 불필요 | **Sort Order 필요** |
 
-**TABLE_A 판단**: 파티션 프루닝(`hour(ts)` + `par_a`) 후에도 `col_a`, `sort_a`, `sort_b`, `col_b`로 추가 필터링이 필요하며, 반복 조회가 발생한다. → **Sort Order 필요** ✅
+**TABLE_A 판단**: Partition Pruning(`hour(ts)` + `par_a`) 후에도 `col_a`, `sort_a`, `sort_b`, `col_b`로 추가 필터링이 필요하며, 반복 조회가 발생한다. → **Sort Order 필요** ✅
 
 > **Sort Order 미사용 시**: `write.distribution-mode`는 `hash`(파티션 격리만) 또는 `none`(shuffle 제거)으로 설정한다. 이 경우 shuffle 비용(9.2GiB)이 사라져 쓰기가 빨라지지만, 파티션 내 파일 간 데이터가 무작위 분포하여 Data Skipping이 사실상 불가능하다.
 
@@ -499,7 +499,7 @@ Sort Order과 `write.distribution-mode`는 함께 동작한다.
 | 모드 | 동작 | Shuffle | 적합한 경우 |
 |------|------|---------|-----------|
 | `none` | 재분배 없이 각 태스크가 받은 데이터를 그대로 씀 | 없음 | 정렬 불필요, 쓰기 성능 최우선 |
-| `hash` | 파티션 키 기준 해시 분배. 같은 파티션 데이터가 같은 태스크로 | 있음 (경량) | 파티션 프루닝만 필요, 정렬 불필요 |
+| `hash` | 파티션 키 기준 해시 분배. 같은 파티션 데이터가 같은 태스크로 | 있음 (경량) | Partition Pruning만 필요, 정렬 불필요 |
 | `range` | 파티션 키 + Sort Order 기준 범위 분배 + 정렬 | 있음 (무거움) | Data Skipping 극대화. 읽기 성능 중시 |
 
 **hash vs range의 핵심 차이: 글로벌 정렬 보장 여부**
@@ -943,8 +943,8 @@ Parquet 파일은 `Row Group → Column Chunk → Page` 계층 구조를 가진�
 | 속성 | 기본값 | 권장값 | 설명 |
 |------|--------|--------|------|
 | `write.metadata.previous-versions-max` | `100` | `100` | 유지할 이전 메타데이터 파일 수. 144커밋/일이면 ~17시간분 |
-| `commit.manifest-merge.enabled` | `true` | `true` | 매니페스트 파일 자동 병합. 비활성화 시 매니페스트 누적 |
-| `commit.manifest.target-size-bytes` | `8388608` (8MB) | 기본값 유지 | 매니페스트 파일 목표 크기 |
+| `commit.manifest-merge.enabled` | `true` | `true` | manifest 파일 자동 병합. 비활성화 시 manifest 누적 |
+| `commit.manifest.target-size-bytes` | `8388608` (8MB) | 기본값 유지 | manifest 파일 목표 크기 |
 
 **compression-codec 비교**
 
@@ -995,9 +995,9 @@ Spark는 읽기 시 `read.split.target-size`(128MB, Spark의 `maxPartitionBytes`
 
 **요인 4: Iceberg 메타데이터 오버헤드**
 
-매니페스트 파일에 모든 데이터 파일의 경로, 파티션 정보, 통계가 저장된다. 파일 수가 메타데이터 크기와 쿼리 플래닝 시간에 직접 영향:
+manifest 파일에 모든 데이터 파일의 경로, 파티션 정보, 통계가 저장된다. 파일 수가 메타데이터 크기와 쿼리 플래닝 시간에 직접 영향:
 
-| 파일 수 | 매니페스트 오버헤드 | 쿼리 플래닝 |
+| 파일 수 | manifest 오버헤드 | 쿼리 플래닝 |
 |--------|------------------|-----------|
 | ~1,000 | 낮음 | ~200ms |
 | ~10,000 | 중간 | 수 초 |
@@ -1023,11 +1023,11 @@ Spark는 읽기 시 `read.split.target-size`(128MB, Spark의 `maxPartitionBytes`
 
 | 항목 | 현황 |
 |------|------|
-| 파티션 프루닝 | B안: `hour(ts)` ✅, `par_a` ✅ (WHERE 절 항상 포함 확정) |
+| Partition Pruning | B안: `hour(ts)` ✅, `par_a` ✅ (WHERE 절 항상 포함 확정) |
 | Sort Order | 확정: `sort_a`, `sort_b` (파티션만 B안 채택, Sort Order는 별도 결정) |
 | 일일 파일 수 (Compaction 전) | 실측 **~23,789개/일** → ⚠️ 주의 구간 |
 | Compaction 실측 | 23,789 → **1,834개** (92% 감소), 평균 파일 크기 ~464MB |
-| Compaction 운영 | **필수**, 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일치) 단위 배치 |
+| Compaction 운영 | **필수**, 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35 0 * * *` → `0 1 * * *`, 전일치) 단위 배치 |
 | col_a Cardinality | identity 248개 (par_a별 42~72), truncate(3) 적용 시 **135개로 감소** |
 
 핵심 설계 결정은 **파티션 구조와 col_a 처리 방식**(파티션 유지 vs 파티션에서 제거)으로 귀결된다. 읽기 성능 테스트 결과 B안(hour+par_a, col_a 파티션 제거)이 전 케이스 1위로 확정되었다.
@@ -1040,17 +1040,17 @@ Spark는 읽기 시 `read.split.target-size`(128MB, Spark의 `maxPartitionBytes`
 파티션: day(ts), par_a, col_a (identity)
 Sort Order: sort_a, sort_b, col_b ASC NULLS FIRST
 distribution-mode: range
-Compaction: 1시간(`15 * * * *`, 직전 1시간치) + 1일(`35 0 * * *`, 전일치) 단위 배치
+Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35 0 * * *` → `0 1 * * *`, 전일치) 단위 배치
 ```
 
 | 항목 | 내용 |
 |------|------|
 | 프루닝 체인 | `day(ts)` → `par_a`(1/4) → `col_a`(1/248) → sort Data Skipping |
 | 일일 파일 수 | Compaction 전: ~23,789개 ⚠️ → **Compaction 후: ~1,834개** ✅ |
-| Compaction 부담 | 높음 — 1시간(`15 * * * *`) + 1일(`35 0 * * *`) 단위 필수 (실측 검증 완료) |
+| Compaction 부담 | 높음 — 1시간(`35 * * * *` → `45 * * * *`) + 1일(`35 0 * * *` → `0 1 * * *`) 단위 필수 (실측 검증 완료) |
 | 프루닝 정밀도 | **최대** — `WHERE col_a = 'x'` 시 정확히 1개 파티션만 scan |
 | Skew 영향 | 있음 — 하위 ~190개 파티션은 데이터 자체가 적어(0.001GB 이하) Compaction 후에도 소형 파일 유지. 구조적 Skew로 트랜스폼 변경(E안/C안)으로만 해소 가능 |
-| 장점 | col_a 파티션 프루닝 정밀도 최대. Compaction 실측 검증 완료 |
+| 장점 | col_a Partition Pruning 정밀도 최대. Compaction 실측 검증 완료 |
 | 단점 | Compaction 미운영 시 메타데이터 부하 급증. Compaction 전 쿼리 성능 저하 |
 
 > **참고**: 읽기 성능 비교 테스트 결과, B안이 전 케이스에서 A안보다 빨랐다 ([read-performance-test.md](read-performance-test.md) 참조). A안의 col_a identity 프루닝 정밀도(1/248)에도 불구하고, B안의 hour 파티션 + Data Skipping + 균등 파일 구조 조합이 더 효과적이었다.
@@ -1074,20 +1074,20 @@ distribution-mode: range
 |------|------|
 | 프루닝 체인 | `hour(ts)`(1/24) → `par_a`(1/4) → sort_a/col_b **Data Skipping** |
 | Compaction 부담 | **최저** — 일일 파티션 조합 수가 248개 → 96개로 감소. 실측 384MB 미만 파일 2개(min 153.5MB)로 small file 문제 실질적 해소 |
-| 프루닝 정밀도 | col_a는 파티션 프루닝 대상이 아님. 파일 내 Row-level Filter로 처리 |
+| 프루닝 정밀도 | col_a는 Partition Pruning 대상이 아님. 파일 내 Row-level Filter로 처리 |
 | Skew 영향 | **없음** — hour × par_a는 시간대별로 균등 분포. col_a의 구조적 Skew 문제 해소 |
 
 **다른 안 대비 핵심 변경점**
 
 - **Small file 문제 실질적 해소** — 일일 파티션 조합 수 248개 → 96개 (61% 감소). 실측 Compaction 후 384MB 미만 파일 2개(min 153.5MB)로, A안(384MB 미만 182개) 대비 구조적 Skew 문제가 해소된다
 - **파티션 Skew 해소** — A안의 하위 ~190개 파티션(0.001GB 이하) 구조적 Skew가 사라짐. hour × par_a 기준 파티션당 ~8.9GB로 균등 분포
-- **시간 단위 파티션 프루닝** — 시간값 조건 포함 시 day 대비 최대 1/24 추가 scan 축소. 일 단위 조건 시에는 24개 파티션의 매니페스트 엔트리를 읽지만, 이는 메타데이터 수준이므로 읽기 성능 영향 미미 (읽기 성능 테스트에서 B안 최우수 확인)
+- **시간 단위 Partition Pruning** — 시간값 조건 포함 시 day 대비 최대 1/24 추가 scan 축소. 일 단위 조건 시에는 24개 파티션의 manifest 엔트리를 읽지만, 이는 메타데이터 수준이므로 읽기 성능 영향 미미 (읽기 성능 테스트에서 B안 최우수 확인)
 - **연간 총 파티션 수 감소** — 90,520개/년(A안) → 35,040개/년 (61% 감소)
 - **Compaction 운영 부담 경감** — range 모드의 per-batch 글로벌 정렬로 Compaction 전에도 Sort Order 컬럼(`sort_a`, `sort_b`)의 Data Skipping이 유효
 
 **트레이드오프**
 
-- **col_a 필터 방식 변경** — 파티션 프루닝(A안) → 파티션 미포함(B안). 읽기 성능 테스트에서 B안이 A안보다 빠른 성능을 확인
+- **col_a 필터 방식 변경** — Partition Pruning(A안) → 파티션 미포함(B안). 읽기 성능 테스트에서 B안이 A안보다 빠른 성능을 확인
 - **시간 경계 배치 분산** — 10분 배치가 정시를 걸치는 경우(예: 12:55~13:05) 2개 시간 파티션에 쓰기 발생. 경계 시간의 파일 크기가 작아질 수 있음
 - **벤치마크 재검증 필요** — 파티션 구조와 shuffle 패턴이 변경되므로 기존 벤치마크(num-executors 24개, 44초)의 유효성 재확인 필요
 
@@ -1258,7 +1258,7 @@ Compaction: A안과 동일 (1시간 + 1일 단위 배치)
 | 장점 | A안 대비 파일 수 46% 감소, 프루닝 유효, **Skew 완화** |
 | 단점 | 같은 접두사를 공유하는 col_a 값들이 같은 파티션에 혼합 (A안 대비 ~1.84배 scan) |
 
-**truncate 파티션 프루닝 작동 원리**
+**truncate Partition Pruning 작동 원리**
 
 `truncate(3, col_a)`는 col_a 값의 앞 3자를 잘라 파티션 값으로 사용한다:
 

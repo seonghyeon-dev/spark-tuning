@@ -6,7 +6,7 @@
 |------|------|
 | 작성 목적 | hourly Compaction Job의 Iceberg 옵션 및 Spark 리소스 설정에 대한 근거 기반 가이드 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
-| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.2.2 |
+| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
 | 대상 범위 | **hourly Compaction만.** daily Compaction은 별도 (섹션 8.1) |
 | 최종 수정일 | 2026-08-13 |
 
@@ -209,7 +209,7 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 
 Iceberg 기본값은 5, 초기 설정은 2다. 2에서 7개 group을 처리하면 `2+2+2+1`로 **4회차**에 나뉜다 (섹션 4.1).
 
-**10을 쓰는 근거**: `max-file-group-size-bytes`를 100GB로 두면 group 수는 파티션 수(par_a distinct 값 수 = 4개)와 같아지므로, 기본값 5로도 1회차로 처리된다. 그럼에도 10을 쓰는 이유는 **높게 잡는 비용이 0**이라는 점이다 — group이 4개면 Iceberg는 4개만 실행한다. hourly 테이블 4개의 par_a 카디널리티가 다를 수 있고 값이 늘어날 수도 있으므로, 여유를 둔다.
+**10을 쓰는 근거**: `max-file-group-size-bytes`를 100GB로 두면 group 수는 파티션 수(par_a distinct 값 수 = 4개)와 같아지므로, 기본값 5로도 1회차로 처리된다. 그럼에도 10을 쓰는 이유는 **높게 잡는 비용이 0**이라는 점이다 — group이 4개면 Iceberg는 4개만 실행한다. hourly 테이블 4개의 par_a Cardinality가 다를 수 있고 값이 늘어날 수도 있으므로, 여유를 둔다.
 
 > 무한정 높이지는 않는다. group 수가 실제로 커지면 driver가 그만큼의 동시 Spark job을 관리해야 한다. 10은 현재 4개의 2.5배 수준이다.
 
@@ -789,7 +789,7 @@ daily 단계에서 최우선으로 확인할 항목이다.
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
-| 다른 hourly 테이블 3개 검증 | par_a 카디널리티가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)를 재확인해야 한다 | 중간 |
+| 다른 hourly 테이블 3개 검증 | par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)를 재확인해야 한다 | 중간 |
 
 **완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정).
 
@@ -804,7 +804,7 @@ daily 단계에서 최우선으로 확인할 항목이다.
 2. 파티션 또는 Sort Order 변경
    → shuffle 패턴과 file group 구성이 달라진다
 
-3. par_a 카디널리티 증가
+3. par_a Cardinality 증가
    → file group 수가 늘어 max-concurrent-file-group-rewrites 여유(현재 10 − 4)를 재확인해야 한다
 
 4. 최대 파티션 크기가 100GB에 근접

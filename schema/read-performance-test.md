@@ -51,7 +51,7 @@
 | **CPU Time** | 전체 Worker에서 사용한 누적 CPU 시간 ([EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)의 Fragment별 CPU time 합산) | 연산 작업량 지표. 스캔 데이터가 많으면 증가 |
 | **Scheduled Time** | 태스크가 프로세서에 스케줄된 총 시간. CPU 사용 + context switch 대기 포함 ([EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)의 scheduled time) | CPU Time / Scheduled Time = CPU 활용률 |
 | **Blocked Time** | Stage 간 데이터 전송 대기 시간 (Input/Output blocking 합산, 전체 스레드 누적) | Blocked >> CPU면 I/O 병목, Blocked << CPU면 연산 병목 |
-| **Physical Input Rows** | 스토리지에서 실제 읽은 행 수 ([EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)의 Physical input rows) | 파티션 프루닝·Data Skipping 효과 직접 반영. **핵심 비교 지표** |
+| **Physical Input Rows** | 스토리지에서 실제 읽은 행 수 ([EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)의 Physical input rows) | Partition Pruning·Data Skipping 효과 직접 반영. **핵심 비교 지표** |
 | **Physical Input Data** | 스토리지에서 전송된 바이트 수 (압축 상태) | 실제 I/O 양. 적을수록 프루닝이 잘 동작한 것 |
 | **Input Rows / Data** | Connector 최적화 후 처리된 논리적 행 수 / 크기 | Physical과 차이가 크면 압축·인코딩 효율이 높은 것 |
 | **Output Rows / Data** | 최종 결과 행 수 / 크기 | 모든 전략에서 동일해야 함 (같은 쿼리이므로) |
@@ -128,12 +128,12 @@ Fragment 2 [HASH]
 
 | 지표 | 설명 | 파티션 전략 비교 시 해석 |
 |------|------|----------------------|
-| **Physical input** | 스토리지에서 실제 읽은 바이트 수 | **핵심 지표**. 파티션 프루닝/Data Skipping이 잘 되면 감소 |
+| **Physical input** | 스토리지에서 실제 읽은 바이트 수 | **핵심 지표**. Partition Pruning/Data Skipping이 잘 되면 감소 |
 | **Filtered** | 스캔 후 필터로 제거된 행 비율 (%) | 높으면 불필요한 데이터를 많이 읽은 것. 프루닝이 잘 되면 낮아짐 |
 | **Input avg. / std.dev.** | 태스크당 평균 입력 행 수와 표준편차 | std.dev.가 높으면 데이터 Skew. 파티션 간 데이터 편차 확인 |
 | **CPU / Scheduled (%)** | 전체 쿼리 대비 이 연산자의 비용 비율 | 스캔이 차지하는 비율이 높으면 I/O 바운드 |
 
-> **비교 방법**: 동일 쿼리를 각 전략 테이블에서 실행한 뒤, ScanFilterProject의 `Physical input`과 `Filtered` 비율을 비교한다. Physical input이 적고 Filtered가 낮을수록 해당 전략의 파티션 프루닝/Data Skipping이 효과적이다. `Input std.dev.`가 높은 전략은 Skew 문제가 있음을 의미한다.
+> **비교 방법**: 동일 쿼리를 각 전략 테이블에서 실행한 뒤, ScanFilterProject의 `Physical input`과 `Filtered` 비율을 비교한다. Physical input이 적고 Filtered가 낮을수록 해당 전략의 Partition Pruning/Data Skipping이 효과적이다. `Input std.dev.`가 높은 전략은 Skew 문제가 있음을 의미한다.
 
 ---
 
@@ -284,7 +284,7 @@ B안 파티션(`hour(ts)`, `par_a`) 확정 후, 나머지 4개 컬럼(`sort_a`, 
 | B-3안 | col_a, sort_b | sort_a, col_b |
 | 비교군 | 없음 | 없음 |
 
-### 5.2 컬럼별 카디널리티
+### 5.2 컬럼별 Cardinality
 
 | 기준 | col_a | sort_b | sort_a | col_b |
 |------|-------|--------|--------|--------|
@@ -325,7 +325,7 @@ Sort Order가 없으면 파일별 min/max 범위가 넓어져 후보 파일이 �
 
 Bloom Filter는 쓰기/읽기 모두 정상 설정된 상태이다(`write.parquet.bloom-filter-enabled.column` 설정 완료, Trino 475 `parquet.use-bloom-filter = true` 기본 활성화).
 
-col_b는 Sort Order에 포함되지 않아 파일 내에서 정렬되지 않고 값이 뒤섞여 있다. 파일당 행 수(39,691)가 col_b 카디널리티(13,929)보다 크므로 각 파일에 col_b 대부분의 값이 포함된다. Bloom Filter가 "이 값이 이 Row Group에 없음"을 판단할 수 없어 건너뛸 Row Group이 없다.
+col_b는 Sort Order에 포함되지 않아 파일 내에서 정렬되지 않고 값이 뒤섞여 있다. 파일당 행 수(39,691)가 col_b Cardinality(13,929)보다 크므로 각 파일에 col_b 대부분의 값이 포함된다. Bloom Filter가 "이 값이 이 Row Group에 없음"을 판단할 수 없어 건너뛸 Row Group이 없다.
 
 ### 5.5 결론
 

@@ -6,7 +6,7 @@
 |------|------|
 | 작성 목적 | Spark Job의 리소스 및 성능 설정에 대한 근거 기반 가이드 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
-| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1, Airflow 3.1.7 |
+| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
 | 최종 수정일 | 2026-03-16 |
 
 ### 근거 수준 라벨
@@ -106,7 +106,7 @@ ALTER TABLE TABLE_A WRITE ORDERED BY
 
 > ⚠️ **변동 가능성**
 > 파티션 설정과 write ordering은 현재 확정된 값이 아니며, 다음 기준으로 최종 결정할 예정이다:
-> 1. **하루치 데이터 적재 후 컴팩션 결과**: 데이터 파일 크기 분포 확인
+> 1. **하루치 데이터 적재 후 Compaction 결과**: 데이터 파일 크기 분포 확인
 > 2. **실제 조회 패턴**: 조건절(WHERE)에 사용되는 컬럼 기준으로 파티션/정렬 최적화
 >
 > 파티션/정렬 변경 시 shuffle 패턴이 달라지므로 벤치마크 재검증이 필요하다.
@@ -259,7 +259,7 @@ num_executors = max(num_executors, 1)
 
 **AQE와의 관계**
 
-Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitions` 기능이 shuffle 후 작은 파티션들을 자동 병합하므로, 기본값 200을 유지하고 AQE가 조정하도록 두는 것이 권장된다.
+AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1 모두 해당). AQE의 `coalescePartitions` 기능이 shuffle 후 작은 파티션들을 자동 병합하므로, 기본값 200을 유지하고 AQE가 조정하도록 두는 것이 권장된다.
 
 **벤치마크 결과**
 
@@ -335,16 +335,16 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 | 항목 | 판단 |
 |------|------|
 | 성능 차이 | 23% 저하(44초→55초)는 10분 주기 배치에서 유의미 |
-| small file 문제 | Iceberg `rewrite_data_files` 컴팩션으로 해결 (시간당/일당 주기 운영 예정) |
-| 업계 관행 | Iceberg/Delta + 컴팩션 운영 환경에서는 쓰기 성능 우선(`true`)이 일반적 |
+| small file 문제 | Iceberg `rewrite_data_files` Compaction으로 해결 (시간당/일당 주기 운영 예정) |
+| 업계 관행 | Iceberg/Delta + Compaction 운영 환경에서는 쓰기 성능 우선(`true`)이 일반적 |
 
 > **참고: 일반적 관행**
 >
 > | 워크로드 유형 | 일반적 설정 | 이유 |
 > |-------------|-----------|------|
-> | 스트리밍/마이크로배치 append | `true` | 쓰기 성능 우선, 컴팩션으로 후처리 |
+> | 스트리밍/마이크로배치 append | `true` | 쓰기 성능 우선, Compaction으로 후처리 |
 > | 대규모 ETL (JOIN/집계) | `false` | 태스크 효율 우선, shuffle 최적화 |
-> | Iceberg/Delta + 컴팩션 운영 | `true` | 쓰기 레이턴시 우선, 읽기는 컴팩션이 보장 |
+> | Iceberg/Delta + Compaction 운영 | `true` | 쓰기 레이턴시 우선, 읽기는 Compaction이 보장 |
 
 **관련 AQE 설정**
 
@@ -370,7 +370,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 | `executor-memory` | `8g` | `1g` | 📘 일반적 관행 | 코어당 2GB |
 | `num-executors` | `ceil(총크기/128MB×1.5/cores)` | `2` | ✅ 벤치마크 검증 | 24개 최적 |
 | `shuffle.partitions` | `200` (기본값) | `200` | ✅ 벤치마크 검증 | AQE 자동 조정에 맡김 |
-| `parallelismFirst` | `true` (기본값) | `true` | ✅ 벤치마크 검증 | I/O 중심 워크로드에 적합. small file은 컴팩션으로 해결 |
+| `parallelismFirst` | `true` (기본값) | `true` | ✅ 벤치마크 검증 | I/O 중심 워크로드에 적합. small file은 Compaction으로 해결 |
 
 ### 4.2 벤치마크 테스트 환경
 
@@ -392,7 +392,7 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 |--------|------|------|
 | num-executors (16/24/32/60) | 24개에서 44초 최적 | `PARALLELISM_FACTOR=1.5` 확정 |
 | shuffle.partitions | 기본값(200) 최적 | 기본값 유지. AQE 자동 조정에 맡김 |
-| parallelismFirst (true vs false) | true(기본값)가 10초 빠름 | 기본값 유지. small file은 컴팩션으로 해결 |
+| parallelismFirst (true vs false) | true(기본값)가 10초 빠름 | 기본값 유지. small file은 Compaction으로 해결 |
 
 ### 4.4 K8S 클러스터 리소스 요구사항
 
@@ -440,13 +440,13 @@ Spark 4.1.1에서 AQE는 기본 활성화되어 있다. AQE의 `coalescePartitio
 
 | 용어 | 정의 |
 |------|------|
-| **AQE** | Adaptive Query Execution. Spark 4.1.1 기본 활성화. 런타임에 shuffle 파티션 병합, 조인 전략 변경 등을 자동 수행 |
+| **AQE** | Adaptive Query Execution. Spark 3.2부터 기본 활성화 (운영 3.5.8·목표 4.1.1 모두 해당). 런타임에 shuffle 파티션 병합, 조인 전략 변경 등을 자동 수행 |
 | **PARALLELISM_FACTOR** | num-executors 산정식의 여유 계수. Spark 옵션이 아닌 Airflow `get_jobs` task의 코드 상수 (현재 1.5) |
 | **coalescePartitions** | AQE의 기능. shuffle 후 작은 파티션들을 자동으로 병합하여 태스크 수를 줄임 |
 | **advisoryPartitionSizeInBytes** | AQE 파티션 병합 시 목표 크기 (기본 64MB). 이미 초과한 파티션은 분할 불가 |
 | **write.distribution-mode** | Iceberg 쓰기 전 데이터 재분배 방식. `range`는 파티션 키 + write ordering 기준 범위 분배 |
 | **memoryOverhead** | JVM 외부 메모리 (off-heap, 네이티브 라이브러리 등). K8S Pod 메모리 = executor-memory + memoryOverhead |
-| **컴팩션** | Iceberg `rewrite_data_files` 프로시저. small file을 병합하여 읽기 성능 최적화 |
+| **Compaction** | Iceberg `rewrite_data_files` 프로시저. small file을 병합하여 읽기 성능 최적화 |
 
 ---
 

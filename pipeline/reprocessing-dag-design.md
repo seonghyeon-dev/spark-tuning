@@ -6,7 +6,7 @@
 |------|------|
 | 작성 목적 | append DAG 조회 기간(최근 1일)에서 밀려난 WAIT_SCHEDULING 데이터와 FAILURE 데이터를 회수하는 재처리 DAG 설계 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
-| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 4.1.1, Iceberg 1.10.1(**카탈로그: HMS**), Airflow 3.2.2, Oracle DB |
+| 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1(**카탈로그: HMS**), Airflow 3.2.2, Oracle DB |
 | 시간대 기준 | **KST (Asia/Seoul)** — 모든 날짜/시간 계산에 적용 |
 | 최종 수정일 | 2026-07-27 |
 
@@ -166,7 +166,7 @@ HMS는 자기 RDB 트랜잭션 안에서 테이블 파라미터를 읽고·비�
 안다.** 둘 다 성공했다고 믿는 상황이 생기지 않는다.
 
 이 보장은 카탈로그 구현에 달려 있다. `HadoopCatalog`(파일시스템 기반)는 원자적 rename에
-의존하는데 **S3에는 원자적 rename이 없어 동시 커밋에서 스냅샷이 유실될 수 있다.**
+의존하는데 **S3에는 원자적 rename이 없어 동시 커밋에서 snapshot이 유실될 수 있다.**
 현재 구성(HMS)에서는 해당되지 않으나, 카탈로그를 바꾸면 이 전제가 깨진다 (섹션 9-9).
 
 **job 실행 시간은 위험도와 무관하다**
@@ -648,7 +648,7 @@ daily Compaction 외에는 전부 12분 이내라 한 시간 슬롯에 여유 �
 
 **hourly `:35` → `:45`**: 시작 분 M이 지연 도착 버퍼(대상 시간이 닫힌 뒤 M분 대기)와 정각 시작 daily 작업의 여유를 **동시에** 정하는데, 두 값이 같아 트레이드오프가 없다. 상한은 `M ≤ 60 − duration − 여유` = `60 − 12 − 3` = **45**. `:35`는 시간을 반으로 갈라 양쪽 다 35분으로 묶어 둔 자리라 어느 쪽으로도 최적이 아니다. hourly duration이 15분을 넘으면 이 식으로 재계산해야 한다.
 
-**daily Compaction에 2시간 슬롯**: 최악 60분인데 바로 뒤에 expire snapshots를 붙이면, expire가 Compaction이 읽는 중인 스냅샷을 만료시켜 파일이 지워질 수 있다. 01:00~03:00을 통째로 주면 60분을 넘겨도 안전하다.
+**daily Compaction에 2시간 슬롯**: 최악 60분인데 바로 뒤에 expire snapshots를 붙이면, expire가 Compaction이 읽는 중인 snapshot을 만료시켜 파일이 지워질 수 있다. 01:00~03:00을 통째로 주면 60분을 넘겨도 안전하다.
 
 **재처리 04:00**: expire snapshots가 03:00을 쓰면서 밀린 자리다. `wait_bound`가 자동으로 전날 04:00이 되어 회수 범위가 1시간 늘고, append 조회 하한(실행시각 − 24h = 전날 04:00)과는 여전히 맞물려 겹치지 않는다.
 
@@ -739,7 +739,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 | 7 | stat_desc 컬럼 | batch_id 용도 전환 공유. **WHERE 조건 사용 금지** (CLOB — 값 기록/읽기만) |
 | 7-1 | Oracle conn 목록 | append DAG의 conn_list와 동일 소스 사용. 조회·상태 UPDATE·좀비 탐지 모두 DB 2개 대상 |
 | 8 | 처리 상한 재검증 | 테이블당·DB당 row 1,000 / loop 10회는 러프 설정 — 운영 데이터로 재조정. 한 회차 최대 물량은 ≈22GB(Spark 약 2분)로 **추정**일 뿐이므로, 백로그가 크게 쌓인 날의 실제 크기·소요시간을 측정해 판단한다 (섹션 5.4) |
-| 9 | **Iceberg 카탈로그 = HMS** | append 동시 커밋의 원자성이 HMS의 compare-and-swap에 의존한다 (섹션 2.2). `HadoopCatalog`로 전환하면 S3에 원자적 rename이 없어 동시 커밋에서 스냅샷이 유실될 수 있다 |
+| 9 | **Iceberg 카탈로그 = HMS** | append 동시 커밋의 원자성이 HMS의 compare-and-swap에 의존한다 (섹션 2.2). `HadoopCatalog`로 전환하면 S3에 원자적 rename이 없어 동시 커밋에서 snapshot이 유실될 수 있다 |
 
 ---
 

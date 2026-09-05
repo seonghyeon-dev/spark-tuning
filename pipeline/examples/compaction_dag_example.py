@@ -35,7 +35,7 @@ TABLE_NAMES = [t.get_name() for t in IcebergTable]  # noqa: F821
 
 @dag(
     dag_id=...,                  # TODO(연결) 기존 dag_id 유지
-    schedule="0 2 * * *",        # daily: 00:35 → 02:00 (설계 6.2). hourly는 15 * * * * 유지
+    schedule="0 1 * * *",        # daily: 00:35 → 01:00 (설계 6.2). hourly는 :35 → :45
     params={
         "target_dt": Param(None, type=["null", "string"], format="date"),
         # default는 실제 값 — 정기 실행은 UI를 안 거치므로 이 값이 곧 전체 처리를 뜻한다.

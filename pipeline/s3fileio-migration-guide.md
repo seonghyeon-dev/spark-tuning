@@ -419,7 +419,7 @@ kubectl get secret minio-credentials -n <네임스페이스>
 kubectl exec <driver-pod> -- printenv | grep AWS_        # 값이 주입됐는지
 ```
 
-> ⚠️ **base64는 암호화가 아니다.** Secret YAML(`stringData` 포함)을 그대로 git에 올리면 평문 노출과 다름없다. 매니페스트를 버전관리한다면 SealedSecrets·External Secrets Operator·Vault 같은 도구를 쓰거나, Secret만 `kubectl create`로 별도 관리한다.
+> ⚠️ **base64는 암호화가 아니다.** Secret YAML(`stringData` 포함)을 그대로 git에 올리면 평문 노출과 다름없다. manifest를 버전관리한다면 SealedSecrets·External Secrets Operator·Vault 같은 도구를 쓰거나, Secret만 `kubectl create`로 별도 관리한다.
 
 ⚠️ 이 정리는 **동작을 바꾸는 변경**이므로 다른 변경과 같은 배포에 섞지 말고 단독으로 적용해 확인한다 (성능과는 무관하므로 측정을 기다릴 필요는 없다).
 

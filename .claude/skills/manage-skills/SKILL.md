@@ -33,6 +33,7 @@ argument-hint: "[선택사항: 특정 스킬 이름 또는 집중할 영역]"
 | 에이전트 | 설명 | 커버 파일 패턴 |
 |----------|------|---------------|
 | `verify-column-naming` | TABLE_A 컬럼 명명 규칙 위반 및 폐기된 옛 표기 잔존 | `CLAUDE.md`, `tuning/*.md`, `schema/*.md`, `pipeline/**/*.md`, `pipeline/**/*.py` |
+| `verify-doc-consistency` | 확정값(설정값·cron·버전·실측 수치)의 `CLAUDE.md` ↔ 가이드 ↔ 보고용 요약 3자 대조, 목표/운영 버전 구분, 미확인 마커 동기화 | `CLAUDE.md`, `tuning/*.md`, `schema/*.md`, `pipeline/*.md`, `pipeline/**/*.py` |
 
 ### 검증 스킬 (`.claude/skills/`)
 
@@ -43,12 +44,6 @@ argument-hint: "[선택사항: 특정 스킬 이름 또는 집중할 영역]"
 |------|------|---------------|
 | `verify-example` | 예시 검증 | `src/example/**/*.ts` |
 -->
-
-### 검증용이 아닌 에이전트
-
-| 에이전트 | 용도 |
-|----------|------|
-| `documentation-engineer` | 문서 작성·개편. 검증 대상이 아니며 `/verify-implementation` 실행 대상에도 포함되지 않음 |
 
 ## 워크플로우
 
@@ -382,7 +377,7 @@ ls <file-path> 2>/dev/null || echo "MISSING: <file-path>"
 | `.claude/skills/verify-implementation/SKILL.md` | 통합 검증 스킬 (이 스킬이 실행 대상 목록을 관리) |
 | `.claude/skills/manage-skills/SKILL.md` | 이 파일 자체 (등록된 검증 항목 목록을 관리) |
 | `.claude/agents/verify-column-naming.md` | 컬럼 명명 검증 에이전트 (읽기 전용) |
-| `.claude/agents/documentation-engineer.md` | 문서 작성 에이전트 (검증 대상 아님) |
+| `.claude/agents/verify-doc-consistency.md` | 문서 간 확정값 동기화 검증 에이전트 (읽기 전용) |
 | `CLAUDE.md` | 프로젝트 지침 (이 스킬이 Agents/Skills 섹션과 파일 구조를 관리) |
 
 ## 예외사항

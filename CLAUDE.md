@@ -7,7 +7,7 @@
 | Agent | Purpose | 도구 |
 |-------|---------|------|
 | `verify-column-naming` | TABLE_A 컬럼 명명 규칙 위반과 폐기된 옛 표기(`col_c`/`col_d`/`par_b`/`sort_c`) 잔존을 검사 | 읽기 전용 |
-| `documentation-engineer` | 검증 문서 작성·개편, 상세 가이드에서 보고용 요약 파생 | 읽기·쓰기 |
+| `verify-doc-consistency` | 확정값(설정값·cron·버전·실측 수치)이 `CLAUDE.md` ↔ 상세 가이드 ↔ 보고용 요약 사이에서 일치하는지, 목표/운영 버전 구분, 미확인 마커 동기화를 검사 | 읽기 전용 |
 
 **사용 원칙:**
 
@@ -34,7 +34,7 @@
 
 ### 기술 스택
 
-- Spark 4.1.1, Iceberg 1.10.1, Airflow 3.2.2
+- Spark 3.5.8 (운영, 임시 다운그레이드 상태 — 목표 4.1.1, 작업 6 §5.0.2), Iceberg 1.10.1, Airflow 3.2.2
 - Kubernetes 클러스터 (Spark Pod 실행 환경)
 - S3 (MinIO) 스토리지 — Iceberg 테이블 (카탈로그: **HMS**)
 - Trino — 조회 엔진 (DBeaver JDBC 드라이버로 실행)
@@ -103,7 +103,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **읽기 성능 테스트 결과** (`schema/read-performance-test.md`):
   - 섹션 1~4: Hive-raw, Hive-orc, A안, B안, C안 5개 전략 비교 완료. **B안이 4개 테스트 케이스 전부 1위** (A안 대비 5~31% 빠름)
   - 섹션 5: Sort Order/Bloom Filter 설정별 비교. 4개 조합 모두 동일 성능, Bloom Filter 효과 없음
-- **Sort Order**: **`sort_a`, `sort_b` 확정.** §5의 4개 조합(B/B-1/B-2/B-3안) 어느 것도 아니다 — 조합 간 성능 차이가 없었으므로 다른 기준으로 선택됐다. **§5의 조합 표기와 실제 확정값이 다르므로 `read-performance-test.md` 갱신 필요**
+- **Sort Order**: **`sort_a`, `sort_b` 확정.** §5의 4개 조합(B/B-1/B-2/B-3안) 어느 것도 아니다 — 조합 간 성능 차이가 없었으므로 다른 기준으로 선택됐다. §5 도입부에 이 취지의 경고 반영 완료 (`read-performance-test.md` §5)
 - **Bloom Filter**: 설정 불필요 (테스트 확인)
 
 ## 작업 3: Trino 쿼리 가이드 — 완료, 작업 8 결과 반영 완료
@@ -127,7 +127,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **핵심 설계**:
   - 재처리 DAG **1개** (1일 주기, 04:00 KST — `RUN_HOUR` 상수), 테이블별 TaskGroup 순차 실행 (Compaction DAG 패턴)
   - 조회 범위 경계로 경합 원천 차단: FAILED는 전날+그저께 전체, WAIT는 전날 04:00 이전만 (append 하한 = 실행시각-24h ≥ 전날 04:00이므로 절대 안 겹침). **`wait_bound`는 `RUN_HOUR`를 따라가야 한다** — 실행 시각만 옮기면 그 사이 구간을 아무도 안 본다. 잠금/선점/pool 불필요
-  - 상한: 테이블당 row 1,000 / 16GB (러프 설정, 재검증 필요). 초과 시 자기 자신 재trigger loop (상한 10회, `max_active_runs=1`로 순차)
+  - 상한: 테이블당 row 1,000 (러프 설정, 재검증 필요). **크기(GB) 상한은 두지 않는다** — 통제 수단이 둘이면 둘 사이가 어긋난다 (설계 "크기 기준 상한을 두지 않는 이유"). 초과 시 자기 자신 재trigger loop (상한 10회, `max_active_runs=1`로 순차)
   - 중복 적재 방지: snapshot summary에 batch_id 기록(영수증), FAILURE 재적재 전 `.snapshots` 확인 → 커밋된 건 SUCCESS 정정. batch_id는 `stat_desc` CLOB 재사용 — **WHERE 조건 사용 금지** (값 기록/읽기만). **상태 UPDATE는 batch_id를 준 호출에서만 stat_desc를 갱신** — 합쳐 두면 update_success/update_failure가 NULL로 지워 중복 방지가 무력화된다
   - Compaction: 기존 DAG trigger — daily `target_dt`, hourly `start_time`/`end_time` + 양쪽 `tables` multi-select params. **maintenance 스케줄 재배치** (설계 6.2): hourly Compaction `45 * * * *`(`M ≤ 60−duration−여유`), daily Compaction 01:00(2시간 슬롯), expire snapshots 03:00, 재처리 04:00, remove orphan files 05:00, rewrite manifests 06:00(3일마다) — 정각 시작으로 매시 `:45` hourly 창을 피한다. 실측 duration: hourly 10~12분, daily 30~60분, expire 6~12분, orphan 5~9분, manifests 2~3분. 기존 간격이 duration보다 짧아 실제로 겹쳤고 orphan이 hourly와 :35에서 충돌했다. **`remove_orphan_files`의 `older_than`은 스케줄로 못 막는다 — 기본 3일 확인 필수**. **`tables` params 선언만으로는 필터가 동작하지 않는다** — Enum loop + `chain()`을 mapped task(`partial`/`expand_kwargs`/`.map()`)로 전환해야 한다 (설계 6.1, `pipeline/examples/compaction_dag_example.py`)
   - 수동 실행: `tables`(multi-select) + `start_time`/`end_time` params (조회 범위 직접 정의, `end_time ≤ 전날 00:00`만 허용)
@@ -207,7 +207,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **⚠️ `availableProcessors()` 함정 (확인 완료)**: `driver cores=1`은 K8s **request**라 `coreLimit` 미설정 시 JVM이 노드 전체 코어를 본다. **Compaction은 `coreLimit=1`이 설정돼 있으나 expire snapshots는 미설정** — `iceberg.hadoop.delete-file-parallelism`(= `코어×4`)이 100+ 스레드가 되어 **MinIO 부하 급증의 원인 후보**다. `coreLimit=1` 적용 예정
 - **⚠️ 계측 순서**: `coreLimit=1`만 넣어도 삭제 스레드가 128→4로 줄어 MinIO 순간 RPS가 크게 바뀐다(총 요청 수는 동일, duration은 오히려 증가). **baseline 계측을 `coreLimit` 변경보다 먼저** 해야 전환 효과가 과소평가되지 않는다. `coreLimit=1` 이후에는 `s3.delete.num-threads` 기본값이 1이 되므로 명시가 더 중요해진다
 - **결정 사항**: `s3.staging-dir` 미명시(현상 유지), `s3.multipart.part-size-bytes` 미명시(기본 32MB로 테스트 후 판단), `coreLimit=1` 적용
-- **⚠️ 실제 운영 스택 = Spark 3.5.8 / Scala 2.12 / Hadoop 3.3.4 (§5.0.2)**: Spark 4에서 Scala 코드로 maintenance 함수 실행 시 오류가 나 **임시 다운그레이드** 상태이며 추후 Spark 4 복귀 예정. 즉 문서들의 "Spark 4.1.1"은 **목표 버전이지 현재 값이 아니다** — 구분 표기 필요. **전환 분석에는 영향 없음** — Iceberg `spark/v3.5`·`spark/v4.0` 모듈의 삭제 로직과 Hadoop 3.3.4·3.4.1의 S3A delete 경로, `fs.s3a.*` 기본값이 모두 동일함을 소스 대조로 확인. **⚠️ Iceberg 1.10.1은 Spark 4.1 미지원**(`spark/v4.0`까지만 존재) — 당시 오류의 원인 후보이며 Spark 4.0.x 재시도 검토 가치 있음
+- **⚠️ 실제 운영 스택 = Spark 3.5.8 / Scala 2.12 / Hadoop 3.3.4 (§5.0.2)**: Spark 4에서 Scala 코드로 maintenance 함수 실행 시 오류가 나 **임시 다운그레이드** 상태이며 추후 Spark 4 복귀 예정. 즉 문서들의 "Spark 4.1.1"은 **목표 버전이지 현재 값이 아니다** — 구분 표기 완료(2026-09-05, 공통 컨텍스트·가이드 환경 표 4곳). **전환 분석에는 영향 없음** — Iceberg `spark/v3.5`·`spark/v4.0` 모듈의 삭제 로직과 Hadoop 3.3.4·3.4.1의 S3A delete 경로, `fs.s3a.*` 기본값이 모두 동일함을 소스 대조로 확인. **⚠️ Iceberg 1.10.1은 Spark 4.1 미지원**(`spark/v4.0`까지만 존재) — 당시 오류의 원인 후보이며 Spark 4.0.x 재시도 검토 가치 있음
 - **jar 조치 (§5.0.3)**: `iceberg-spark-runtime`은 `iceberg-aws`를 포함하지만 **AWS SDK는 미포함**(`spark/v3.5/build.gradle:241`). `iceberg-aws-bundle-1.10.1.jar`(약 60MB, **Scala 접미사·Spark 버전 의존성 없음**)를 **추가**하면 되고, **기존 `aws-java-sdk-bundle`(v1)은 제거하지 말 것** — S3A가 쓴다. **v1(`com.amazonaws.*`)과 v2(`software.amazon.awssdk.*`)는 패키지가 달라 공존 가능**
 - **이미지 구성 (§5.0.4)**: 운영 이미지가 타 팀 소유라 파생 빌드 필요. **추가하는 것은 `iceberg-aws-bundle-1.10.1.jar` 하나뿐이어야 한다.** 베이스는 `apache/spark:*`가 아니라 **현재 운영 태그 그대로**(3.5.8, 타 팀 커스터마이징 보존). 공식 이미지는 `USER spark`로 끝나므로 `USER root` → 설치 → 복귀. **⚠️ 예전 테스트 Dockerfile의 Hadoop 3.3.4→3.4.1 교체는 절대 가져오지 말 것** — ①S3A가 SDK v1→v2로 바뀌어 원천 avro 읽기 경로까지 변경 → A/B 불가 ②MinIO checksum 리스크를 avro 읽기로 확산 ③shaded `hadoop-client-*`와 unshaded `hadoop-common` 클래스 중복. **`S3FileIO`는 Hadoop 버전과 무관하다 — 3.3.4 위에서 그대로 동작한다.** `ENV TZ`도 추가 금지 — **운영 Pod TZ는 UTC로 확인됐고 그 상태로 정상 동작 중**이다(`timestamp_ntz`/`hour(ts)` 영향)
 - **이미지 배포와 설정 전환은 분리**: jar 추가만으로는 아무 일도 안 일어난다(`io-impl` 미설정 시 여전히 `HadoopFileIO`). ①이미지 교체(무해) → 기존 Job 정상 확인 → ②maintenance Job에만 `io-impl` 설정. 각각 독립 롤백
@@ -218,7 +218,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **미확인**: 실제 삭제 파일 수(추정치 사용), Compaction/append의 읽기·쓰기 성능 영향(`dcu/GB` 비교 필요, 노이즈 기준선 ±15%), `fs.s3a.acl.default`의 MinIO 실제 효력
 - **남은 후속 작업** (전부 보류 상태, 서로 독립):
   1. **maintenance Job 리소스 축소** — `idle cores` 90%가 전환 후에도 그대로다. executor `instances` 4 → 2 검토 (§5.1.2). `coreLimit=1` 적용도 여기 포함
-  2. **자격증명 통합** — K8s Secret → 환경변수로 일원화, `fs.s3a.aws.credentials.provider` 제거 (§1.0.1 Q6). 절차와 매니페스트 예시까지 정리됨. 성능과 무관하므로 언제 해도 되나 **단독 배포로** 적용
+  2. **자격증명 통합** — K8s Secret → 환경변수로 일원화, `fs.s3a.aws.credentials.provider` 제거 (§1.0.1 Q6). 절차와 manifest 예시까지 정리됨. 성능과 무관하므로 언제 해도 되나 **단독 배포로** 적용
   3. **`fs.s3a.acl.default=PublicReadWrite` 제거 검토** — 보안 항목 (§5.1.1)
   4. **`remove_orphan_files`의 `prefix_listing => true`** — LIST 추가 감소 여지. 기존 S3A 디렉터리 마커 오탐 검증 필요 (§2.2, §4.8)
   5. **Compaction/append `dcu/GB` 비교** — 리소스 튜닝과 함께 진행
@@ -267,7 +267,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 ├── .claude/
 │   ├── agents/
 │   │   ├── verify-column-naming.md    # 컬럼 명명 검증 (읽기 전용)
-│   │   └── documentation-engineer.md  # 문서 작성·개편
+│   │   └── verify-doc-consistency.md  # 문서 간 확정값 동기화 검증 (읽기 전용)
 │   └── skills/
 │       ├── verify-implementation/     # 통합 검증 (에이전트 병렬 + 스킬 순차)
 │       └── manage-skills/             # 검증 항목 유지보수
