@@ -8,6 +8,10 @@
 - [4. 종합 분석](#4-종합-분석) — 결과 요약, 결론
 - [5. Sort Order / Bloom Filter 설정별 읽기 성능 비교](#5-sort-order--bloom-filter-설정별-읽기-성능-비교) — B안 기준 설정 조합 테스트
 
+> **⚠️ 컬럼 명명 (2026-09-05 통일)**: `par_*` = 파티션, `sort_*` = Sort Order, `col_*` = **최종 스키마에서 역할이 없는 컬럼**. 이 문서의 컬럼명은 통일된 이름으로 갱신했으므로, **2026-09-05 이전의 캡처·회의 자료와 이름이 다르다** (예전 `par_b`/`sort_c` → 현재 `col_a`/`col_b`).
+>
+> 그래서 **탈락한 A안·C안에서는 `col_a`가 파티션 컬럼으로 등장한다.** 이름이 잘못된 것이 아니라, 그 컬럼을 파티션으로 쓰려던 안이 탈락하고 최종 스키마에서 역할이 없어졌기 때문이다.
+
 ---
 
 ## 1. 테스트 설계
@@ -17,8 +21,8 @@
 | 항목 | Hive-raw (as-is) | Hive-orc (as-is) | A안 | B안 | C안 |
 |------|-----------------|-----------------|-----|-----|-----|
 | 포맷 | Hive (TextFile/CSV) | Hive (ORC) | Iceberg (Parquet) | Iceberg (Parquet) | Iceberg (Parquet) |
-| 파티션 | DT(날짜), sort_b | DT(날짜) | `day(ts)`, `par_a`, `par_b` | `hour(ts)`, `par_a` | `day(ts)`, `par_a`, `bucket(16, par_b)` |
-| Sort Order | — | — | `sort_a`, `sort_b`, `sort_c` | `sort_a`, `par_b`, `sort_b`, `sort_c` | `sort_a`, `sort_b`, `sort_c` |
+| 파티션 | DT(날짜), sort_b | DT(날짜) | `day(ts)`, `par_a`, `col_a` | `hour(ts)`, `par_a` | `day(ts)`, `par_a`, `bucket(16, col_a)` |
+| Sort Order | — | — | `sort_a`, `sort_b`, `col_b` | `sort_a`, `col_a`, `sort_b`, `col_b` | `sort_a`, `sort_b`, `col_b` |
 | distribution-mode | — | — | `range` | `range` | `range` |
 
 **공통 조건**
@@ -29,7 +33,7 @@
 **테스트 쿼리**: 2개 쿼리 × 2개 조건 = 4개 테스트 케이스
 
 - **ts 필터 기준**: A안과 C안은 `day(ts)` 파티션에 맞춰 day 단위, B안은 `hour(ts)` 파티션에 맞춰 hour 단위로 고정
-- **조건 A / 조건 B**: 서로 다른 데이터를 조회하기 위한 조건 변경 (par_a, par_b 등 필터값 변경)
+- **조건 A / 조건 B**: 서로 다른 데이터를 조회하기 위한 조건 변경 (par_a, col_a 등 필터값 변경)
 
 **Web UI 캡처 대상**: 각 쿼리 실행 후 Resource Utilization 탭을 각 테이블별로 캡처
 
@@ -143,7 +147,7 @@ Fragment 2 [HASH]
 |------|-----------------|-----------------|-----|-----|-----|
 | 스토리지 | HDFS (블록 128MB) | HDFS (블록 128MB) | S3 (MinIO) | S3 (MinIO) | S3 (MinIO) |
 | 파일 포맷 | TextFile (CSV) | ORC | Parquet | Parquet | Parquet |
-| 파티션 | DT(날짜), sort_b | DT(날짜) | day(ts), par_a, par_b | hour(ts), par_a | day(ts), par_a, bucket(16, par_b) |
+| 파티션 | DT(날짜), sort_b | DT(날짜) | day(ts), par_a, col_a | hour(ts), par_a | day(ts), par_a, bucket(16, col_a) |
 | 총 파티션 수 | 27,750 | 1 | 253 | 96 | 64 |
 | 총 파일 수 | 758,856 | 1,009 | 1,985 | 1,823 | 1,847 |
 | 총 크기 | 15.3TB | 4.9TB | 912.6GB | 912.7GB | 912.6GB |
@@ -158,9 +162,9 @@ Fragment 2 [HASH]
 >
 > - **Hive-raw**: TextFile(CSV), 압축 없음. sort_b 파티션(Cardinality 25,820)으로 파일이 극도로 세분화되어 1일 758,856개. 10일치 보관
 > - **Hive-orc**: ORC 압축으로 4.9TB. 수직분할 4개 테이블의 합산 데이터이므로 Iceberg(TABLE_A 1개)와 직접적인 크기 비교 불가. 파티션이 날짜 1개뿐이라 세부 필터 시 전체 스캔 필요. 3개월치 보관
-> - **A안**: 구조적 Skew 심각. 파일 1개 파티션 190개 중 182개가 384MB 미만 — 데이터가 적은 par_b 파티션이 원인이며, Compaction으로도 해결 불가
+> - **A안**: 구조적 Skew 심각. 파일 1개 파티션 190개 중 182개가 384MB 미만 — 데이터가 적은 col_a 파티션이 원인이며, Compaction으로도 해결 불가
 > - **B안**: avg 497.9MB로 목표에 근접하고 min 153.5MB로 전 전략 중 가장 균등. 384MB 미만 파일은 단 2개로 실질적 small file 문제 없음
-> - **C안**: bucket(16)으로 par_b Skew를 분산하지만, bucket 내 데이터 편차로 min 0.8MB 발생. 384MB 미만 파일이 18개로 A안(182개)보다 대폭 개선되었으나 B안(2개)보다는 많음
+> - **C안**: bucket(16)으로 col_a Skew를 분산하지만, bucket 내 데이터 편차로 min 0.8MB 발생. 384MB 미만 파일이 18개로 A안(182개)보다 대폭 개선되었으나 B안(2개)보다는 많음
 
 ---
 
@@ -250,12 +254,16 @@ C안:
 
 ## 5. Sort Order / Bloom Filter 설정별 읽기 성능 비교
 
-B안 파티션(`hour(ts)`, `par_a`) 확정 후, 나머지 4개 컬럼(`par_b`, `sort_b`, `sort_a`, `sort_c`)의 Sort Order / Bloom Filter 배치에 따른 읽기 성능 비교.
+B안 파티션(`hour(ts)`, `par_a`) 확정 후, 나머지 4개 컬럼(`sort_a`, `sort_b`, `col_a`, `col_b`)의 Sort Order / Bloom Filter 배치에 따른 읽기 성능 비교.
+
+> **⚠️ 최종 확정값은 아래 4개 조합 어디에도 없다.** 최종 Sort Order는 **`sort_a`, `sort_b`** 이며 `col_b`(구 `sort_c`)는 제외됐다.
+>
+> 모순이 아니다 — §5.4의 결론이 **"조합 간 성능 차이 없음"** 이었으므로, 성능으로는 우열이 가려지지 않았고 다른 기준으로 선택된 것이다. 이 절은 **"어떤 조합을 골라도 성능은 같다"는 근거**로 읽어야 하며, 확정값을 여기서 역산하면 안 된다. 변하지 않는 결론은 **Sort Order 자체는 필수**(미설정 시 40% 저하)라는 것이다.
 
 ### 5.1 테스트 개요
 
 - 파티션: `hour(ts)`, `par_a` (확정)
-- WHERE: 6개 컬럼 전부 등가 조건 (`ts`, `par_a`, `par_b`, `sort_b`, `sort_a`, `sort_c`)
+- WHERE: 6개 컬럼 전부 등가 조건 (`ts`, `par_a`, `col_a`, `sort_b`, `sort_a`, `col_b`)
 - 쿼리에 CROSS JOIN UNNEST 포함
 
 **테스트 대상 파티션 정보**
@@ -270,23 +278,23 @@ B안 파티션(`hour(ts)`, `par_a`) 확정 후, 나머지 4개 컬럼(`par_b`, `
 
 | 안 | Sort Order | Bloom Filter |
 |----|-----------|-------------|
-| B안 | sort_a, sort_c | 없음 |
-| B-1안 | sort_b, sort_c | 없음 |
-| B-2안 | par_b, sort_a | sort_c |
-| B-3안 | par_b, sort_b | sort_a, sort_c |
+| B안 | sort_a, col_b | 없음 |
+| B-1안 | sort_b, col_b | 없음 |
+| B-2안 | col_a, sort_a | col_b |
+| B-3안 | col_a, sort_b | sort_a, col_b |
 | 비교군 | 없음 | 없음 |
 
 ### 5.2 컬럼별 카디널리티
 
-| 기준 | par_b | sort_b | sort_a | sort_c |
+| 기준 | col_a | sort_b | sort_a | col_b |
 |------|-------|--------|--------|--------|
 | 하루 전체 | 164 | 27,667 | 34,252 | 613,615 |
 | hour(ts) | 71 | 1,418 | 1,418 | 31,335 |
 | hour+par_a | 35 | 623 | 623 | 13,929 |
-| hour+par_a+par_b | - | 253 | 253 | 6,009 |
+| hour+par_a+col_a | - | 253 | 253 | 6,009 |
 | hour+par_a+sort_b | 1 | - | 1 | 25 |
 | hour+par_a+sort_a | 1 | 1 | - | 25 |
-| hour+par_a+par_b+sort_b/sort_a | - | - | - | 25 |
+| hour+par_a+col_a+sort_b/sort_a | - | - | - | 25 |
 
 ### 5.3 테스트 결과
 
@@ -317,7 +325,7 @@ Sort Order가 없으면 파일별 min/max 범위가 넓어져 후보 파일이 �
 
 Bloom Filter는 쓰기/읽기 모두 정상 설정된 상태이다(`write.parquet.bloom-filter-enabled.column` 설정 완료, Trino 475 `parquet.use-bloom-filter = true` 기본 활성화).
 
-sort_c는 Sort Order에 포함되지 않아 파일 내에서 정렬되지 않고 값이 뒤섞여 있다. 파일당 행 수(39,691)가 sort_c 카디널리티(13,929)보다 크므로 각 파일에 sort_c 대부분의 값이 포함된다. Bloom Filter가 "이 값이 이 Row Group에 없음"을 판단할 수 없어 건너뛸 Row Group이 없다.
+col_b는 Sort Order에 포함되지 않아 파일 내에서 정렬되지 않고 값이 뒤섞여 있다. 파일당 행 수(39,691)가 col_b 카디널리티(13,929)보다 크므로 각 파일에 col_b 대부분의 값이 포함된다. Bloom Filter가 "이 값이 이 Row Group에 없음"을 판단할 수 없어 건너뛸 Row Group이 없다.
 
 ### 5.5 결론
 

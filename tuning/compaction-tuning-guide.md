@@ -45,8 +45,8 @@ append Job의 설정은 `tuning/spark-tuning-guide.md`에서 다룬다. 두 Job�
 
 | 항목 | 값 |
 |------|-----|
-| 파티션 | `hour(ts)`, `col_a` |
-| Sort Order | `col_b`, `col_c` (`WRITE ORDERED BY`) |
+| 파티션 | `hour(ts)`, `par_a` |
+| Sort Order | `sort_a`, `sort_b` (`WRITE ORDERED BY`) |
 | `write.distribution-mode` | `range` |
 | `write.target-file-size-bytes` | 512MB |
 | hourly 그룹 테이블 수 | 4개 (파티션·Sort 설정 동일) |
@@ -82,7 +82,7 @@ Compaction 시 **`sort` 전략**을 사용한다 (테이블 Sort Order 설정 �
 
 **파티션별 크기** (Iceberg `.files` 메타데이터 조회)
 
-| col_a | 크기 | 비중 |
+| par_a | 크기 | 비중 |
 |-------|------|------|
 | C | 21.4GB | 57% |
 | B | 12.0GB | 31% |
@@ -118,10 +118,10 @@ batch당 파일   = 703 ÷ 12 = 58.6개
 Compaction은 파일을 무작위로 합치지 않는다. **파티션별로 파일을 모아 file group을 만들고, group 단위로 처리한다.**
 
 ```
-(14시, col_a=A) 의 파일들  → file group
-(14시, col_a=B) 의 파일들  → file group
-(14시, col_a=C) 의 파일들  → file group
-(14시, col_a=D) 의 파일들  → file group
+(14시, par_a=A) 의 파일들  → file group
+(14시, par_a=B) 의 파일들  → file group
+(14시, par_a=C) 의 파일들  → file group
+(14시, par_a=D) 의 파일들  → file group
 ```
 
 `max-file-group-size-bytes`를 넘는 파티션은 **여러 group으로 분할**된다. `max-concurrent-file-group-rewrites`는 **동시에 처리할 group 수**를 정한다.
@@ -136,10 +136,10 @@ file group 수 = Σ(파티션별) ceil(파티션 크기 ÷ max-file-group-size-b
 
 | 파티션 | 크기 | `ceil(크기÷10GB)` | Spark UI 실측 |
 |--------|------|------------------|--------------|
-| col_a=C | 21.4GB | 3 | C (1/3), (2/3), (3/3) ✅ |
-| col_a=B | 12.0GB | 2 | B (1/2), (2/2) ✅ |
-| col_a=A | 2.8GB | 1 | A (1/1) ✅ |
-| col_a=D | 0.9GB | 1 | D (1/1) ✅ |
+| par_a=C | 21.4GB | 3 | C (1/3), (2/3), (3/3) ✅ |
+| par_a=B | 12.0GB | 2 | B (1/2), (2/2) ✅ |
+| par_a=A | 2.8GB | 1 | A (1/1) ✅ |
+| par_a=D | 0.9GB | 1 | D (1/1) ✅ |
 | | | **7** | **7/7** ✅ |
 
 ### 2.2 file group당 Spark Job 2개
@@ -199,7 +199,7 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 | `max-file-size-ratio` | 1.80 | 922MB 초과 파일도 대상 |
 | `delete-file-threshold` | 매우 큼 | delete file이 많으면 대상 |
 
-**유지 근거**: 입력 파일이 최대 72.3MB로 **703개 전부 384MB 미만**이므로, 조건을 보든 안 보든 처리 대상이 동일하다. 즉 `false`로 바꿔도 I/O 절감 효과가 없다. 반면 `false`는 `min-input-files=5`에 걸려 파일 수가 적은 파티션(col_a=D)이 조용히 건너뛰어질 위험만 추가한다.
+**유지 근거**: 입력 파일이 최대 72.3MB로 **703개 전부 384MB 미만**이므로, 조건을 보든 안 보든 처리 대상이 동일하다. 즉 `false`로 바꿔도 I/O 절감 효과가 없다. 반면 `false`는 `min-input-files=5`에 걸려 파일 수가 적은 파티션(par_a=D)이 조용히 건너뛰어질 위험만 추가한다.
 
 > **전제**: 이 판단은 "입력이 전부 small file"에 의존한다. append 설정이 바뀌어 큰 파일이 생기면 재검토가 필요하다.
 
@@ -209,7 +209,7 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 
 Iceberg 기본값은 5, 초기 설정은 2다. 2에서 7개 group을 처리하면 `2+2+2+1`로 **4회차**에 나뉜다 (섹션 4.1).
 
-**10을 쓰는 근거**: `max-file-group-size-bytes`를 100GB로 두면 group 수는 파티션 수(col_a distinct 값 수 = 4개)와 같아지므로, 기본값 5로도 1회차로 처리된다. 그럼에도 10을 쓰는 이유는 **높게 잡는 비용이 0**이라는 점이다 — group이 4개면 Iceberg는 4개만 실행한다. hourly 테이블 4개의 col_a 카디널리티가 다를 수 있고 값이 늘어날 수도 있으므로, 여유를 둔다.
+**10을 쓰는 근거**: `max-file-group-size-bytes`를 100GB로 두면 group 수는 파티션 수(par_a distinct 값 수 = 4개)와 같아지므로, 기본값 5로도 1회차로 처리된다. 그럼에도 10을 쓰는 이유는 **높게 잡는 비용이 0**이라는 점이다 — group이 4개면 Iceberg는 4개만 실행한다. hourly 테이블 4개의 par_a 카디널리티가 다를 수 있고 값이 늘어날 수도 있으므로, 여유를 둔다.
 
 > 무한정 높이지는 않는다. group 수가 실제로 커지면 driver가 그만큼의 동시 Spark job을 관리해야 한다. 10은 현재 4개의 2.5배 수준이다.
 
@@ -309,13 +309,13 @@ Iceberg의 shuffling rewriter가 이 값을 자체 계산으로 덮어쓴다. �
 
 | 회차 | file group | 파티션 | 입력 파일 | 크기 | 샘플링 job | 쓰기 job | 합계 |
 |------|-----------|--------|---------|------|-----------|---------|------|
-| **1회** | 1/7 | col_a=D | 27 | 1.4GB | 4s | 16s | 20s |
-| | 2/7 | col_a=A | 53 | 2.8GB | 6s | 19s | **25s** |
-| **2회** | 3/7 | col_a=B (1/2) | 180 | 9.5GB | 7s | 25s | **32s** |
-| | 4/7 | col_a=B (2/2) | 40 | 2.1GB | 3s | 23s | 26s |
-| **3회** | 5/7 | col_a=C (1/3) | 184 | 9.7GB | 7s | 26s | 33s |
-| | 6/7 | col_a=C (2/3) | 190 | 10.0GB | 9s | 26s | **35s** |
-| **4회** | 7/7 | col_a=C (3/3) | 29 | 1.5GB | 3s | 17s | **20s** |
+| **1회** | 1/7 | par_a=D | 27 | 1.4GB | 4s | 16s | 20s |
+| | 2/7 | par_a=A | 53 | 2.8GB | 6s | 19s | **25s** |
+| **2회** | 3/7 | par_a=B (1/2) | 180 | 9.5GB | 7s | 25s | **32s** |
+| | 4/7 | par_a=B (2/2) | 40 | 2.1GB | 3s | 23s | 26s |
+| **3회** | 5/7 | par_a=C (1/3) | 184 | 9.7GB | 7s | 26s | 33s |
+| | 6/7 | par_a=C (2/3) | 190 | 10.0GB | 9s | 26s | **35s** |
+| **4회** | 7/7 | par_a=C (3/3) | 29 | 1.5GB | 3s | 17s | **20s** |
 | | | | **703** ✅ | **37.0GB** | | | |
 
 각 회차는 느린 쪽이 끝날 때까지 대기하므로 `25 + 32 + 35 + 20` = **112초**이며, 실측 duration 2.0분(120초)과 일치한다. 차이 8초는 pod 기동과 커밋이다.
@@ -395,15 +395,15 @@ T4와 T5는 `max-file-group-size-bytes`만 다르지만 **둘 다 group 4개로 
 
 **`max-file-group-size-bytes`를 100GB로 유지하는 근거**
 
-속도 이득(−10%)은 노이즈와 구별되지 않는다. 유지 근거는 **정렬 구간**이다. group 4개면 파티션당 정렬 구간이 1개인데, 10GB 상한에서 col_a=C가 3분할되면 정렬 구간이 3개가 되어 파일 min/max 범위가 겹친다. `read-performance-test.md` §5.4의 "Sort Order 있으면 조회 40% 빠름"이라는 이득이 그만큼 깎인다. **속도 손해가 없으므로 유지가 이득이다.**
+속도 이득(−10%)은 노이즈와 구별되지 않는다. 유지 근거는 **정렬 구간**이다. group 4개면 파티션당 정렬 구간이 1개인데, 10GB 상한에서 par_a=C가 3분할되면 정렬 구간이 3개가 되어 파일 min/max 범위가 겹친다. `read-performance-test.md` §5.4의 "Sort Order 있으면 조회 40% 빠름"이라는 이득이 그만큼 깎인다. **속도 손해가 없으므로 유지가 이득이다.**
 
 **최종 (baseline → T6)**: 초/GB 3.24 → 2.41(**−26%**), dcu/GB 0.00416 → 0.00219(**−47%**). hourly Compaction DAG 전체(테이블 4개 순차)는 4 × 2.41 × 38GB ≈ **6.1분**으로, `:45`~`:57` 창(12분)에 절반의 여유로 들어간다.
 
-### 4.3 min_size가 384MB 미달인 원인: col_a=D 파티션 ✅
+### 4.3 min_size가 384MB 미달인 원인: par_a=D 파티션 ✅
 
 Compaction 출력의 `min_size`가 회차마다 288~415MB로 흔들리며, 절반 이상이 small file 기준(384MB)에 미달한다.
 
-**원인은 `col_a=D` 파티션이다.** group 수와 무관하다는 것이 증거다 — T5~T8은 group이 4개(분할 없음)인데도 335.5 / 311.5 / 374.4 / 377.4MB가 나왔다.
+**원인은 `par_a=D` 파티션이다.** group 수와 무관하다는 것이 증거다 — T5~T8은 group이 4개(분할 없음)인데도 335.5 / 311.5 / 374.4 / 377.4MB가 나왔다.
 
 `min_size × 2`를 보면 9회 전부 한 구간으로 모인다.
 
@@ -419,7 +419,7 @@ Compaction 출력의 `min_size`가 회차마다 288~415MB로 흔들리며, 절�
 | T7 | 374.4MB | 749MB | 4 |
 | T8 | 377.4MB | 755MB | 4 |
 
-**578~830MB 크기의 group 하나가 파일 2개로 갈린 결과다.** 그 group은 `col_a=D` 파티션이며, 측정값 0.9GB를 중심으로 시간대별로 578~830MB 사이에서 변동한다.
+**578~830MB 크기의 group 하나가 파일 2개로 갈린 결과다.** 그 group은 `par_a=D` 파티션이며, 측정값 0.9GB를 중심으로 시간대별로 578~830MB 사이에서 변동한다.
 
 출력 파일 수는 `ceil(group 크기 ÷ 512MB)`이므로(섹션 2.3):
 
@@ -429,7 +429,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 → D가 768MB 미만인 시간대는 반드시 small file이 나온다
 ```
 
-`col_a=A`(2.8GB)는 6개로 갈려 478MB씩이므로 원인이 될 수 없다. 10GB 상한이 만드는 자투리 group도 정상 크기다 — C의 자투리 1.4GB는 3개로 갈려 467MB, B의 자투리 2.0GB는 4개로 갈려 500MB다.
+`par_a=A`(2.8GB)는 6개로 갈려 478MB씩이므로 원인이 될 수 없다. 10GB 상한이 만드는 자투리 group도 정상 크기다 — C의 자투리 1.4GB는 3개로 갈려 467MB, B의 자투리 2.0GB는 4개로 갈려 500MB다.
 
 > **T4의 min 414.8MB는 설정 효과가 아니라 그 시간 D가 830MB인 결과다.** 초기 분석은 이를 `max-file-group-size-bytes` 변경의 성과로 해석했으나, group 4개인 T5~T8에서도 small file이 발생하므로 정정한다.
 
@@ -757,7 +757,7 @@ Airflow   : task duration (pod 기동 시간 역산용)
 
 | 항목 | 확인 위치 | 필요 이유 |
 |------|----------|----------|
-| **min_size / max_size / file_count** | Iceberg `.files` 메타데이터 | **Compaction 품질의 핵심 지표인데 DataFlint에 없다.** duration이 개선되어도 출력이 나빠지면 실패다. 단 `min_size < 384MB`는 col_a=D에서 상시 발생하므로 이상이 아니다 — **384MB 미만 파일이 3개 이상**일 때 조사한다 (섹션 4.3) |
+| **min_size / max_size / file_count** | Iceberg `.files` 메타데이터 | **Compaction 품질의 핵심 지표인데 DataFlint에 없다.** duration이 개선되어도 출력이 나빠지면 실패다. 단 `min_size < 384MB`는 par_a=D에서 상시 발생하므로 이상이 아니다 — **384MB 미만 파일이 3개 이상**일 때 조사한다 (섹션 4.3) |
 | file group 수와 구성 | Spark UI Jobs 탭 | 파티션이 몇 개로 분할됐는지 |
 | pod 기동 시간 | Airflow task duration − Spark 앱 duration | 1~2분짜리 job에서 기동이 20~30초면 비중이 크다 |
 
@@ -789,7 +789,7 @@ daily 단계에서 최우선으로 확인할 항목이다.
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
-| 다른 hourly 테이블 3개 검증 | col_a 카디널리티가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)를 재확인해야 한다 | 중간 |
+| 다른 hourly 테이블 3개 검증 | par_a 카디널리티가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)를 재확인해야 한다 | 중간 |
 
 **완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정).
 
@@ -804,7 +804,7 @@ daily 단계에서 최우선으로 확인할 항목이다.
 2. 파티션 또는 Sort Order 변경
    → shuffle 패턴과 file group 구성이 달라진다
 
-3. col_a 카디널리티 증가
+3. par_a 카디널리티 증가
    → file group 수가 늘어 max-concurrent-file-group-rewrites 여유(현재 10 − 4)를 재확인해야 한다
 
 4. 최대 파티션 크기가 100GB에 근접
@@ -818,7 +818,7 @@ daily 단계에서 최우선으로 확인할 항목이다.
      parallelismFirst의 "무효" 판정(섹션 3.2)이 뒤집힐 수 있다.
      file_count가 ceil(총 크기 ÷ 512MB) 수준을 유지하는지 확인한다
 
-7. col_a=D 파티션 비중 변화
+7. par_a=D 파티션 비중 변화
    → min_size가 D 크기 ÷ 2로 정해진다(섹션 4.3). D가 커지면 문제가
      사라지고, 512MB 미만으로 줄면 파일 1개가 되어 역시 사라진다
 ```

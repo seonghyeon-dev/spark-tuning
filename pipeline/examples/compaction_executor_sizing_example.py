@@ -86,7 +86,7 @@ def to_partition_hour(dt: datetime) -> int:
     붙여 `timestamp()`를 쓰면 Iceberg가 저장한 값과 어긋나 엉뚱한 시간대를 조회한다.
 
     검증: 2026-08-11 13:00 → 496237.
-      Spark UI가 출력한 `PartitionData{ts_hour=496237, col_a=D}`와 일치한다.
+      Spark UI가 출력한 `PartitionData{ts_hour=496237, par_a=D}`와 일치한다.
     """
     if dt.tzinfo is not None:
         raise ValueError(f"naive datetime이 필요하다 (timestamp_ntz): {dt!r}")

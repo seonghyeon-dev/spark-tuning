@@ -36,11 +36,30 @@
 
 - 컬럼 수: 19개 (timestamp_ntz, string, double, integer, array<integer>, array<double>, array<string>)
 - 파티션: `hour(ts)`, `par_a` (B안 — 읽기 성능 테스트 최우수)
-- Sort Order: 미확정 (테스트 결과 조합 간 성능 차이 없음 — 섹션 5 참조)
+- **Sort Order: `sort_a`, `sort_b` — 확정.** 읽기 성능 테스트의 4개 조합(B/B-1/B-2/B-3안) 어느 것도 아닌 조합으로 결정됐다 (조합 간 성능 차이가 없었으므로 — `read-performance-test.md` §5)
 - Bloom Filter: 효과 없음, 설정 불필요 (테스트 확인)
 - array 타입 컬럼 8개: `write.metadata.metrics.column.*` = `none`
 - `write.distribution-mode`: `range`
-- 조회 패턴: 클라이언트에서 6개 컬럼(ts, par_a, par_b, sort_b, sort_a, sort_c) **전부 WHERE에 항상 포함**. 성능 최적화 역할(Partition Pruning/Data Skipping/Row-level Filter)은 Sort Order 확정 후 결정
+- **명명 규칙 — 접두어가 역할이다**: `par_*` = 파티션, `sort_*` = Sort Order, `col_*` = **성능 최적화 역할 없음**
+
+| 컬럼 | 역할 | Pruning 단계 |
+|------|------|--------------|
+| `ts` | 파티션 `hour(ts)` | Partition Pruning |
+| `par_a` | 파티션 identity | Partition Pruning |
+| `sort_a` | **Sort Order 1순위**. `ts`의 문자열 사본 (`2026-08-19 16:21:12.466` → `'20260819162112466'`) | Data Skipping |
+| `sort_b` | **Sort Order 2순위** | Data Skipping |
+| `col_a` | 없음 | Row-level Filter |
+| `col_b` | 없음 | Row-level Filter |
+
+- 조회 패턴: 클라이언트에서 6개 컬럼(ts, par_a, sort_a, sort_b, col_a, col_b) **전부 WHERE에 항상 포함**
+- **⚠️ 2026-09-05에 전 문서 명명을 통일했다.** 그 이전 자료(회의 캡처·커밋 메시지·`tuning/` 옛 표기)는 이름이 다르다:
+
+| 예전 | 현재 |
+|------|------|
+| `col_a`/`col_b`/`col_c`/`col_d` (`tuning/` 계열) | `par_a`/`sort_a`/`sort_b`/`col_b` |
+| `par_b`/`sort_c` (`schema/` 계열) | `col_a`/`col_b` |
+
+  **`col_a`는 예전에 파티션 컬럼을 뜻했고 지금은 역할 없는 컬럼이다.** 예전 자료의 숫자를 이름 그대로 옮기면 다른 컬럼 이야기가 된다 — 예전 자료에서 `col_a`가 값 A/B/C/D로 등장하면 그것은 현재의 `par_a`다
 - par_a 분포 (실측, 2026-03-18 기준): B 43.4%, C 43.1%, A 12.4%, D 1.0% — 균등 분포 아님
 
 ### 워크플로우
@@ -61,22 +80,27 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **상태**: 7개 설정 확정, 벤치마크 검증 완료
 - **대기**: 파티션/Sort Order 최종 확정 후 벤치마크 재검증
 
-## 작업 2: Iceberg 스키마 설계 — B안 확정, Sort Order/Bloom Filter 테스트 완료
+## 작업 2: Iceberg 스키마 설계 — 스키마 확정 완료
 
 - **산출물**: `schema/iceberg-schema-design-guide.md`
-- **상태**: B안 확정 (`hour(ts)`, `par_a`), Sort Order/Bloom Filter 테스트 완료
+- **상태**: **스키마 확정.** 파티션 B안(`hour(ts)`, `par_a`) + **Sort Order `sort_a`, `sort_b`**
 - **읽기 성능 테스트 결과** (`schema/read-performance-test.md`):
   - 섹션 1~4: Hive-raw, Hive-orc, A안, B안, C안 5개 전략 비교 완료. **B안이 4개 테스트 케이스 전부 1위** (A안 대비 5~31% 빠름)
   - 섹션 5: Sort Order/Bloom Filter 설정별 비교. 4개 조합 모두 동일 성능, Bloom Filter 효과 없음
-- **Sort Order**: 미확정 (조합 간 성능 차이 없음)
+- **Sort Order**: **`sort_a`, `sort_b` 확정.** §5의 4개 조합(B/B-1/B-2/B-3안) 어느 것도 아니다 — 조합 간 성능 차이가 없었으므로 다른 기준으로 선택됐다. **§5의 조합 표기와 실제 확정값이 다르므로 `read-performance-test.md` 갱신 필요**
 - **Bloom Filter**: 설정 불필요 (테스트 확인)
 
-## 작업 3: Trino 쿼리 가이드 — 완료
+## 작업 3: Trino 쿼리 가이드 — 완료, 작업 8 결과 반영 완료
 
 - **산출물**: `schema/trino-query-guide.md`
-- **상태**: 완료
+- **상태**: 완료. **작업 8 검증 결과 반영 완료 (2026-09-05)** — 상세 내역은 `tuning/trino-iceberg-partition-pruning.md` §8.1
+  - **컬럼 역할 정정**: 가이드가 정렬 2순위와 일반 컬럼을 **뒤바꿔** 기술하고 있었다 (옛 이름 기준 `sort_c`를 Sort Order 2순위로, `sort_b`를 일반 컬럼으로) → 스키마 확정에 맞춰 교환하고 명명도 통일
+  - **`ts =` 등가**: "❌ 결과 없음" → **날짜 조회 목적 ❌ / 정확한 시각 지정 ✅(가장 빠름)** 로 분리
+  - **§6.2**: "모든 날짜의 **데이터**를 읽는다" → "전체 기간의 **파일 목록을 훑는다**". 비용이 `Physical input`이 아니라 `Planning`에 쌓인다는 점 명시 (배수는 미측정이라 쓰지 않음)
+  - **추가**: 파티션 필터 강제의 한계(§6.2.1), `ts` 함수별 지원 표(§6.5), Domain 표시 주의(§7)
 - **대상 독자**: Trino 쿼리 사용자 (Partition Pruning/Data Skipping 비전문가)
 - **핵심 내용**: ts 필터링 방법(date, date_trunc, 범위 조건), WHERE 필수 컬럼, 잘못된 쿼리 패턴
+- **근거 계층**: `tuning/trino-iceberg-partition-pruning.md` (작업 8) — 이 가이드가 "무엇을 쓰라"면, 그쪽은 "왜 그렇게 되는지와 그 경계"
 
 ## 작업 4: 재처리(Reprocessing) DAG 설계 — 설계 완료
 
@@ -100,14 +124,14 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 
 - **산출물**: `tuning/compaction-tuning-guide.md` (상세), `tuning/compaction-tuning-report.md` (회의 보고용 요약)
 - **상태**: 9회 측정으로 설정 확정. 초/GB **3.24 → 2.41(−26%)**, dcu/GB **0.00416 → 0.00219(−47%)**, idle cores 58%→17%. DAG 전체 10~12분 → 약 6분
-- **대상**: hourly 테이블 4개 (파티션 `hour(ts)`/`col_a`, sort `col_b`/`col_c`, `range` 모드 동일). rewrite 전략은 `sort` — 미적용 시 조회 40% 저하(`read-performance-test.md` §5.4)라 필수
+- **대상**: hourly 테이블 4개 (파티션 `hour(ts)`/`par_a`, sort `sort_a`/`sort_b`, `range` 모드 동일). rewrite 전략은 `sort` — 미적용 시 조회 40% 저하(`read-performance-test.md` §5.4)라 필수
 - **확정 설정**: `max-concurrent-file-group-rewrites` 2→**10**(−30%, 유일하게 명확한 개선), `max-file-group-size-bytes` 10GB→**기본값 100GB**, `num-executors` 16→**12**(dcu −13%), `driver cpu` 1→**2**, `advisory-partition-size` **삭제**, `parallelismFirst` **삭제 가능**. `rewrite-all=true`·`partial-progress=false`·executor 4core/16GB는 유지
 - **핵심 발견**:
   - **file group이 처리 단위다.** `file group 수 = Σ ceil(파티션 크기 ÷ max-file-group-size-bytes)`. 초기엔 7개를 2개씩 처리해 **4회차**로 나뉘고, 1·4회차가 데이터 15%에 시간 37%를 썼다 (`idle cores 58%`)
   - **`dcu`가 판정의 주 지표다.** `cores × duration`에 비례(9회 검증, ±5%)하고 `duration`(0.1분 반올림)보다 해상도가 좋다. **`duration`만 보면 executor 축소를 "느려졌다"로 오판한다**
   - **노이즈 기준선 15%.** T4·T5가 기능적으로 동일한 설정인데 1.88 vs 2.18(16%). 이보다 작은 차이는 판정 불가 — `driver cpu`, `max-file-group-size`의 속도 이득이 여기 묻혔다
   - **`num-executors`는 12가 하한.** 8에서 dcu가 +13% 반등(CPU 33% 감소 vs 시간 56% 증가). 16→12는 dcu −13%
-  - **min_size 300MB대는 정상이다** — 원인은 `col_a=D` 파티션(시간당 600~830MB)이 `ceil(÷512MB)`로 2개로 갈리는 것. **group 분할과 무관**(group 4개에서도 발생). 파일 75개 중 2개, 데이터 2.4%라 조치 안 함. 모니터링 기준은 `min_size<384MB`가 아니라 **`384MB 미만 파일 3개 이상`**
+  - **min_size 300MB대는 정상이다** — 원인은 `par_a=D` 파티션(시간당 600~830MB)이 `ceil(÷512MB)`로 2개로 갈리는 것. **group 분할과 무관**(group 4개에서도 발생). 파일 75개 중 2개, 데이터 2.4%라 조치 안 함. 모니터링 기준은 `min_size<384MB`가 아니라 **`384MB 미만 파일 3개 이상`**
   - **출력 파일 크기의 손잡이는 `target-file-size-bytes` 하나다.** `advisory-partition-size`와 `parallelismFirst` 모두 무효 확정 (Iceberg가 shuffle partition 수를 직접 정함)
   - **`sort` 전략은 데이터를 2번 읽는다** (정렬 범위 샘플링 + 실제 쓰기). DataFlint `input = output × 2.0`이 정상값
   - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번 사례의 원인은 후자다. alert는 전자만 제안한다
@@ -201,6 +225,25 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **jar 교체**: `iceberg-spark-runtime-4.1_2.13-1.11.0`(★교체) + `iceberg-aws-bundle-1.11.0`(★버전만). `aws-java-sdk-bundle`(v1)은 Spark 배포판의 SDK v2 bundle로 대체됨
 - **권장 순서**: ①현 스택에 `iceberg-aws-bundle-1.10.1` 추가 → Phase 1 측정 ②결과 확정 ③Scala 코드 API 참조 범위 조사 ④1.11.0 + Spark 4.1.1 업그레이드 ⑤Trino·벤치마크 회귀 검증
 
+## 작업 8: Trino Partition Pruning 검증 — 조사 완료, 가이드 반영 완료, 측정 2건 대기
+
+- **산출물**: `tuning/trino-iceberg-partition-pruning.md`
+- **환경**: **Trino 482** (`read-performance-test.md` §5의 Bloom Filter 측정은 475 기준 — 버전 구분 필요)
+- **위치**: 작업 3(`schema/trino-query-guide.md`, 사용자용 안내)의 **근거 계층**. 안내가 성립하지 않는 경계 조건을 밝히는 문서
+- **핵심 발견**:
+  - **일 → 시 단위에서 splits가 4,938 → 205로 정확히 24.1배 감소** — 하루의 시간 파티션 수 24와 일치. `hour(ts)` Pruning이 설계대로 동작한다는 직접 증거이며, `read-performance-test.md`의 "B안이 4개 케이스 전부 1위"라는 **결과에 메커니즘을 채워 넣는다**
+  - **`EXPLAIN`의 Domain 표시는 Pruning 여부의 지표가 아니다.** `ts = <시점>`은 표시가 없는데도 15 splits로 프루닝된다. 업스트림이 명시한 함정 — PR #24740(milestone 469)이 *"partition pruning done at the Iceberg metadata layer"*가 EXPLAIN에 pushdown이 안 보여도 일어난다는 테스트를 추가했다
+  - **⚠️ Issue #19266의 워크어라운드는 필요 없다 (조사 원본 정정).** "파티션 경계에 안 맞는 범위 조건은 Pruning 실패"라는 제보는 **EXPLAIN 표시를 오독한 것**이었고 PR #24740(469)으로 종결됐다. 우리는 482라 포함. 실측도 일치 — `ts >= 16:00 AND ts < 17:00`이 205 splits로 해당 시간 파티션 하나만 읽었다
+  - **`sort_a`는 `ts`의 문자열 사본이다** (`2026-08-19 16:21:12.466` → `'20260819162112466'`). 기존 프로젝트 문서 어디에도 없던 사실이며, **이것이 관측 전체를 설명한다** — Sort Order 1순위 + ts 사본 조합이라 `sort_a` 등가조건 하나가 밀리초 단위 시각 조건으로 작동해 파일 단위까지 걸러낸다. **다른 테이블에 일반화 금지**
+  - **운영 쿼리 패턴(6개 컬럼 전부 WHERE)에서는 `ts` 조건을 넣든 빼든 16.79MB / 15 splits로 동일하다.** `read-performance-test.md` §5.3에서 Sort Order 4개 조합이 전부 8.56k rows / 55.2MB였던 것과 **같은 현상** — 이미 파일 단위까지 좁혀져 그 위에서 뭘 바꾸든 차이가 안 나는 영역
+  - **그럼에도 `ts` 조건은 필요하다.** 차이는 데이터 I/O가 아니라 **manifest 단계**에 있다 — `ts`는 파티션 경계로 manifest를 통째 스킵하고, `sort_a`는 못 걸러 manifest 전수 조회가 된다. 3개월 × 24시간 × par_a 4종 ≈ **8,640 파티션**. **⚠️ 단 이 비용 차이는 아직 측정 안 됨 — `Planning:` 비교가 최우선 과제**
+  - **`date_trunc('week'|'quarter')`는 482에서 Pruning 안 된다** — PR #30197이 milestone **484**. day/month/year·`year()`·`date()`·범위 비교는 전부 동작. **일시적 제약이므로 우회 코드를 쿼리에 영구히 박지 말 것**
+  - **파티션 필터 강제(`iceberg.query-partition-filter-required`)는 `ts` 누락을 못 막는다** — 파티션 컬럼 **하나라도** 있으면 통과하므로 `par_a`만으로 3개월 전체 조회가 에러 없이 실행된다 (기준선 측정이 그 증거)
+  - **`read.split.target-size`(읽기, 기본 128MB)를 `write.target-file-size-bytes`(쓰기, 512MB)에 맞춰 올리지 말 것** — 파일 1개 = split 1개가 되어 병렬성 4~5배 하락. 두 값이 다른 것은 불일치가 아니라 설계
+- **`trino-query-guide.md` 반영 완료** — 상세는 작업 3 및 문서 §8.1
+- **컬럼 명명 통일 완료 (2026-09-05)**: 전 문서에 `par_*`/`sort_*`/`col_*` 규칙 적용. 변환표는 공통 컨텍스트의 대상 테이블 절과 작업 8 문서 §1.3
+- **미확인**: `Planning:` 시간 비교(§6.2 정정의 배수를 못 쓴 이유), `EXPLAIN ANALYZE VERBOSE`의 `skippedDataManifests`/`skippedDataFiles` 실제 노출 여부, `par_a` 분포가 `schema/` 문서(2026-03-18)와 순위가 다른 원인, splits÷4 환산(실측 대조 1건뿐), `iceberg.query-partition-filter-required` 실제 설정값
+
 ## 파일 구조
 
 ```
@@ -208,7 +251,8 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 ├── tuning/
 │   ├── spark-tuning-guide.md          # Spark 튜닝 가이드 (append Job)
 │   ├── compaction-tuning-guide.md     # Compaction 튜닝 가이드 (hourly, 상세)
-│   └── compaction-tuning-report.md    # Compaction 튜닝 결과 (보고용 요약)
+│   ├── compaction-tuning-report.md    # Compaction 튜닝 결과 (보고용 요약)
+│   └── trino-iceberg-partition-pruning.md  # Trino Partition Pruning 검증 (조회 경로 근거)
 ├── schema/
 │   ├── iceberg-schema-design-guide.md  # Iceberg 스키마 설계 가이드
 │   ├── read-performance-test.md        # 파티션 전략별 읽기 성능 비교 테스트

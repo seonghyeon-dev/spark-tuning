@@ -81,7 +81,7 @@ Spark Job의 리소스 설정 (`driver-cores`, `driver-memory`, `executor-cores`
 |--------|------|------|
 | `day(ts)` | timestamp_ntz | 일 단위 시간 파티션 (Iceberg hidden partition) |
 | `par_a` | string | 비즈니스 키 파티션 |
-| `par_b` | string | 비즈니스 키 파티션 |
+| `col_a` | string | 비즈니스 키 파티션 |
 
 **Write Ordering 설정 (3개, ALTER TABLE로 적용)**
 
@@ -89,7 +89,7 @@ Spark Job의 리소스 설정 (`driver-cores`, `driver-memory`, `executor-cores`
 ALTER TABLE TABLE_A WRITE ORDERED BY
   sort_a ASC NULLS FIRST,
   sort_b ASC NULLS FIRST,
-  sort_c ASC NULLS FIRST;
+  col_b ASC NULLS FIRST;
 ```
 
 **Shuffle과의 관계**

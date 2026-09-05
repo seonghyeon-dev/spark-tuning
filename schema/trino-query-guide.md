@@ -21,7 +21,7 @@
 
 이 가이드는 특정 테이블이 아닌 **Iceberg 테이블 전체**를 대상으로 한다. 주요 대상은 기존 Hive 테이블에서 수직분할된 4개 테이블(A, B, C, D)이며, 각 테이블의 일일 데이터 크기는 600GB~900GB이다.
 
-4개 테이블은 기준정보 컬럼(`ts`, `par_a`, `sort_a`, `sort_c` 등)과 쿼리 패턴이 동일하다. 차이는 array 타입 컬럼뿐이며, 이 컬럼들은 WHERE 절 필터링에 사용되지 않으므로 **이 가이드의 모든 내용이 4개 테이블에 동일하게 적용**된다.
+4개 테이블은 기준정보 컬럼(`ts`, `par_a`, `sort_a`, `sort_b` 등)과 쿼리 패턴이 동일하다. 차이는 array 타입 컬럼뿐이며, 이 컬럼들은 WHERE 절 필터링에 사용되지 않으므로 **이 가이드의 모든 내용이 4개 테이블에 동일하게 적용**된다.
 
 WHERE 조건을 어떻게 작성하느냐에 따라 읽기 성능이 크게 달라진다. 조건을 잘못 쓰면 **결과가 조회되지 않거나**, 불필요한 데이터를 전부 읽어 **쿼리가 수 배 느려진다.**
 
@@ -36,12 +36,19 @@ WHERE 조건을 어떻게 작성하느냐에 따라 읽기 성능이 크게 달�
 | ts | timestamp_ntz | Partition Pruning (hour 단위) | **필수** |
 | par_a | string | Partition Pruning (identity) | **필수** |
 | sort_a | string | Data Skipping (Sort Order 1순위) | **필수** |
-| sort_c | string | Data Skipping (Sort Order 2순위) | **필수** |
-| par_b | string | Row-level Filter | 선택 |
-| sort_b | string | Row-level Filter | 선택 |
+| sort_b | string | Data Skipping (Sort Order 2순위) | **필수** |
+| col_a | string | Row-level Filter | 선택 |
+| col_b | string | Row-level Filter | 선택 |
 
 - **WHERE 필수**: [Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)(파티션 단위 건너뛰기) 또는 Data Skipping(파일 단위 건너뛰기)에 해당하는 컬럼. 빠뜨리면 성능이 크게 저하된다
 - **선택**: 결과 필터링에 사용되지만, 파티션/파일 단위 최적화에는 영향 없음
+
+> **컬럼 이름의 접두어가 역할을 나타낸다.**
+> - `par_*` — 파티션 컬럼 (`par_a`). `ts`와 함께 Partition Pruning에 쓰인다
+> - `sort_*` — Sort Order 컬럼 (`sort_a`, `sort_b`). Data Skipping에 쓰인다
+> - `col_*` — **성능 최적화 역할이 없는 컬럼** (`col_a`, `col_b`). WHERE에 넣어도 파티션/파일 단위 건너뛰기는 일어나지 않는다
+>
+> ⚠️ **2026-09-05 이전 자료는 이름이 다르다.** 당시 `col_a`는 `par_b`, `col_b`는 `sort_c`였고, 지금의 `sort_b`는 `sort_c`라는 이름으로 **Sort Order 2순위**로 기술돼 있었다. 예전 캡처·회의 자료의 컬럼명을 그대로 옮기지 말 것.
 
 ### 2.2 3단계 필터링 원리
 
@@ -68,12 +75,12 @@ WHERE 조건을 어떻게 작성하느냐에 따라 읽기 성능이 크게 달�
   ── 나머지 파티션은 아예 읽지 않음
 
 2단계: Data Skipping (파일 단위)
-  ── 선택된 파티션 내에서 sort_a, sort_c 조건으로
+  ── 선택된 파티션 내에서 sort_a, sort_b 조건으로
      파일의 min/max 통계를 확인하여 불필요한 파일 건너뛰기
 
 3단계: Row-level Filter (행 단위)
   ── 읽은 파일 내에서 모든 WHERE 조건으로 행 단위 필터링
-  ── par_b, sort_b 등 나머지 조건은 이 단계에서 작동
+  ── col_a, col_b 등 나머지 조건은 이 단계에서 작동
 ```
 
 > **[Hidden Partitioning](https://iceberg.apache.org/docs/latest/partitioning/)**: Iceberg는 사용자가 원본 컬럼(`ts`, `par_a`)으로 WHERE 조건만 작성하면, 내부 파티션 구조(`hour(ts)`)를 자동으로 이용해 Partition Pruning을 수행한다. 파티션 구조를 알 필요 없이 원본 컬럼으로 쿼리하면 된다.
@@ -114,6 +121,19 @@ WHERE ts >= TIMESTAMP '2026-03-18 00:00:00'
 ```
 
 > **`=` 등가 비교만 문제**이다. `>=`, `<`, `BETWEEN` 등 **범위 비교에서는 ts 컬럼을 직접 사용해도 정상 작동**한다. 범위 비교는 마이크로초 정밀 매칭이 아니라 구간에 포함되는 모든 행을 반환하기 때문이다.
+
+**예외 — 정확한 시각을 알고 있다면 `ts =`가 가장 빠르다**
+
+지금까지의 설명은 **날짜/시간대를 조회할 의도로** `ts =`를 쓸 때의 이야기다. 조회하려는 행의 **정확한 시각을 마이크로초까지 알고 있다면** `ts =`는 문제가 아니라 **가장 강력한 조건**이다.
+
+```sql
+-- ✅ 정확한 시각을 알 때 (실측: 시간 조건 대비 스캔량 13.7배 감소)
+WHERE ts = TIMESTAMP '2026-08-19 16:21:12.466000'
+```
+
+시간 파티션 하나로 좁힌 뒤 **파일 단위로 한 번 더** 걸러내기 때문이다. 실측 근거는 [trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §2.2·§3.1 참조.
+
+> **정리**: `ts =`가 위험한 것은 **자정 리터럴(`DATE '...'`, 시간 없는 `TIMESTAMP '...'`)을 넣어 날짜를 조회하려 할 때**다. 실재하는 시각을 넣으면 정상 동작한다.
 
 ### 3.2 날짜 필터 — 등가 조건
 
@@ -210,7 +230,8 @@ IN 절의 각 시간에 해당하는 파티션만 스캔한다.
 | 시간 1시간 | `date_trunc('hour', ts) = TIMESTAMP '...'` | ✅ | **1개** 시간 파티션 |
 | 시간 범위 | `ts >= TIMESTAMP '...' AND ts < TIMESTAMP '...'` | ✅ | 해당 시간 파티션 |
 | 비연속 시간 | `date_trunc('hour', ts) IN (TIMESTAMP '...', ...)` | ✅ | 해당 시간 파티션 |
-| ts `=` 등가 | `ts = TIMESTAMP '...'` / `ts = DATE '...'` | ❌ | **결과 없음** (3.1절 참조) |
+| **정확한 시각** 지정 | `ts = TIMESTAMP '2026-08-19 16:21:12.466000'` | ✅ | **1개 파티션 + 파일 단위까지** — 가장 좁음 |
+| 날짜를 ts `=`로 조회 | `ts = TIMESTAMP '2026-03-18'` / `ts = DATE '2026-03-18'` | ❌ | **결과 없음** (3.1절 참조) |
 
 ---
 
@@ -222,15 +243,15 @@ IN 절의 각 시간에 해당하는 파티션만 스캔한다.
 |------|-----------|------------|--------------|
 | ts | Partition Pruning | 해당 시간/날짜의 파티션만 스캔. 날짜 조건 시 24개 시간 파티션, 시간 조건 시 1개 파티션만 읽음 | **전체 날짜 스캔** — 모든 시간 파티션의 데이터를 읽음 |
 | par_a | Partition Pruning | 해당 값의 파티션만 스캔. par_a는 4개 값(A/B/C/D)이나 **데이터 분포가 균등하지 않다** (실측: B 43.4%, C 43.1%, A 12.4%, D 1.0%). par_a = 'D' 조건 시 전체의 1%만 스캔하고, par_a = 'B' 조건 시 43.4%를 스캔 | par_a 조건 없으면 **4개 파티션 전체를 읽어** 스캔량이 크게 증가 |
-| sort_a | Data Skipping | 파일마다 저장된 sort_a의 min/max 통계를 WHERE 값과 비교하여, 조건에 해당하지 않는 파일을 읽지 않고 건너뜀. Sort Order **1순위**이므로 파일별 값 범위가 가장 잘 분리되어 있어 **건너뛰는 파일 수가 가장 많다** | **Data Skipping 무효화** — 파티션 내 모든 파일을 읽음. Sort Order 1순위를 빠뜨리면 2순위(sort_c)의 Data Skipping 효과도 크게 감소 |
-| sort_c | Data Skipping | sort_a로 1차 필터링된 파일들 중에서 sort_c의 min/max 통계로 **추가 파일을 건너뜀**. Sort Order **2순위**이므로 1순위(sort_a)만큼 파일 범위가 명확하게 분리되지는 않으나, 추가 건너뛰기 효과를 제공 | sort_c 단독 누락 시 영향은 sort_a 누락보다 작음. 1순위 sort_a의 Data Skipping은 유지됨 |
+| sort_a | Data Skipping | 파일마다 저장된 sort_a의 min/max 통계를 WHERE 값과 비교하여, 조건에 해당하지 않는 파일을 읽지 않고 건너뜀. Sort Order **1순위**이므로 파일별 값 범위가 가장 잘 분리되어 있어 **건너뛰는 파일 수가 가장 많다** | **Data Skipping 무효화** — 파티션 내 모든 파일을 읽음. Sort Order 1순위를 빠뜨리면 2순위(sort_b)의 Data Skipping 효과도 크게 감소 |
+| sort_b | Data Skipping | sort_a로 1차 필터링된 파일들 중에서 sort_b의 min/max 통계로 **추가 파일을 건너뜀**. Sort Order **2순위**이므로 1순위(sort_a)만큼 파일 범위가 명확하게 분리되지는 않으나, 추가 건너뛰기 효과를 제공 | sort_b 단독 누락 시 영향은 sort_a 누락보다 작음. 1순위 sort_a의 Data Skipping은 유지됨 |
 
 ### 4.2 선택 컬럼 (Row-level Filter)
 
 | 컬럼 | 최적화 단계 | 효과 |
 |------|-----------|------|
-| par_b | Row-level Filter | 파티션/Sort Order에 포함되지 않으므로 **파티션/파일 단위 건너뛰기는 발생하지 않는다**. 파일을 읽은 후 행 단위로 조건에 맞는 행만 반환 |
-| sort_b | Row-level Filter | 동일. Sort Order에 포함되지 않음 |
+| col_a | Row-level Filter | 파티션/Sort Order에 포함되지 않으므로 **파티션/파일 단위 건너뛰기는 발생하지 않는다**. 파일을 읽은 후 행 단위로 조건에 맞는 행만 반환 |
+| col_b | Row-level Filter | 동일. Sort Order에 포함되지 않음 |
 
 ---
 
@@ -244,7 +265,7 @@ FROM TABLE_A
 WHERE date(ts) = DATE '2026-03-11'
   AND par_a = 'A'
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 ```
 
 ### 5.2 기본 쿼리 — 시간 조건
@@ -257,7 +278,7 @@ FROM TABLE_A
 WHERE date_trunc('hour', ts) = TIMESTAMP '2026-03-11 10:00:00'
   AND par_a = 'A'
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 ```
 
 ### 5.3 기타 패턴
@@ -271,7 +292,7 @@ FROM TABLE_A
 WHERE date(ts) = DATE '2026-03-11'
   AND par_a IN ('A', 'B')
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 ```
 
 ### 5.4 SELECT 절 권장사항
@@ -300,10 +321,10 @@ Trino는 SELECT 절에 명시된 컬럼만 스토리지에서 읽는 [Projection
 
 ## 6. 잘못된 쿼리 패턴
 
-### 6.1 ts `=` 등가 비교 — 결과 없음
+### 6.1 날짜를 ts `=`로 조회 — 결과 없음
 
 ```sql
--- ❌ 결과 없음
+-- ❌ 결과 없음 (자정에 정확히 일치하는 행이 없음)
 WHERE ts = TIMESTAMP '2026-03-18'
 WHERE ts = DATE '2026-03-18'
 
@@ -312,23 +333,35 @@ WHERE date(ts) = DATE '2026-03-18'
 ```
 
 > 원인과 해결 방법은 [3.1절](#31-ts에-등가-비교를-직접-사용하면-안-되는-이유) 참조.
+>
+> **`ts =` 자체가 금지는 아니다.** 조회하려는 행의 정확한 시각을 알고 있다면 `ts = TIMESTAMP '2026-08-19 16:21:12.466000'`은 **가장 빠른 패턴**이다. 문제는 자정 리터럴로 **날짜를 조회하려 할 때** 생긴다.
 
-### 6.2 ts 조건 누락 — 전체 날짜 스캔
+### 6.2 ts 조건 누락 — 전체 기간 메타데이터 스캔
 
 ```sql
--- ❌ ts 조건 없음 → 모든 날짜 데이터를 읽음
+-- ❌ ts 조건 없음 → 보관 중인 전체 기간을 대상으로 실행됨
 WHERE par_a = 'A'
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 
 -- ✅ 올바른 패턴
 WHERE date(ts) = DATE '2026-03-11'
   AND par_a = 'A'
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 ```
 
-> ts는 `hour(ts)` Partition Pruning의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **존재하는 모든 날짜의 데이터를 읽는다.**
+> ts는 `hour(ts)` Partition Pruning의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **보관 중인 전체 기간(3개월)의 파일 목록을 처음부터 끝까지 훑는다.**
+>
+> **비용이 어디에 나타나는지 주의해서 볼 것.** sort_a/sort_b 조건이 촘촘하면 파일 단위로 걸러지므로 **최종적으로 읽는 데이터 양(Physical input)은 크게 늘지 않을 수 있다.** 대신 비용이 **쿼리 계획 수립 시간(Planning)** 에 쌓이며, 데이터가 누적될수록 커진다. 즉 `Physical input`만 보고 "ts 없어도 괜찮다"고 판단하면 안 된다.
+>
+> **sort_a/sort_b 조건이 없거나 범위가 넓은 쿼리에서는 읽는 데이터도 함께 급증한다** — 실측에서 ts 조건 하나를 빼자 264MB → 13.05GB가 됐다 ([trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §3.1).
+
+### 6.2.1 참고 — 파티션 조건이 아예 없으면 쿼리가 실패한다
+
+파티션 컬럼(`ts`, `par_a`) 조건이 **하나도 없으면** 쿼리가 에러로 거부된다 ([`iceberg.query-partition-filter-required`](https://trino.io/docs/current/connector/iceberg.html)).
+
+> ⚠️ **이 안전장치는 ts 누락을 막아주지 못한다.** 파티션 컬럼 중 **하나라도** 있으면 통과하므로, `par_a` 조건만 있고 ts가 없는 6.2의 쿼리는 **에러 없이 그대로 실행된다.** ts를 넣는 것은 여전히 사용자의 몫이다.
 
 ### 6.3 par_a 조건 누락 — 전체 파티션 스캔
 
@@ -336,21 +369,21 @@ WHERE date(ts) = DATE '2026-03-11'
 -- ❌ par_a 조건 없음 → 모든 par_a 파티션을 읽음
 WHERE date(ts) = DATE '2026-03-11'
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 
 -- ✅ 올바른 패턴
 WHERE date(ts) = DATE '2026-03-11'
   AND par_a = 'A'
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 ```
 
 > par_a는 identity Partition Pruning의 대상이다. 조건을 빠뜨리면 **4개 par_a 파티션(A/B/C/D)을 모두 읽는다.** 데이터 분포와 스캔량 영향은 [4.1절](#41-필수-컬럼-partition-pruning--data-skipping) 참조.
 
-### 6.4 sort_a/sort_c 조건 누락 — Data Skipping 무효화
+### 6.4 sort_a/sort_b 조건 누락 — Data Skipping 무효화
 
 ```sql
--- ❌ sort_a, sort_c 없음 → 파티션 내 모든 파일을 읽음
+-- ❌ sort_a, sort_b 없음 → 파티션 내 모든 파일을 읽음
 WHERE date(ts) = DATE '2026-03-11'
   AND par_a = 'A';
 
@@ -358,10 +391,10 @@ WHERE date(ts) = DATE '2026-03-11'
 WHERE date(ts) = DATE '2026-03-11'
   AND par_a = 'A'
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 ```
 
-> sort_a, sort_c는 Data Skipping의 대상이다. 데이터가 Sort Order(`sort_a`, `sort_c`)로 정렬되어 있어 파일마다 min/max 통계가 저장되어 있다. 이 조건이 없으면 Iceberg가 **파일의 min/max 통계를 활용할 수 없어 파티션 내 모든 파일을 읽는다.**
+> sort_a, sort_b는 Data Skipping의 대상이다. 데이터가 Sort Order(`sort_a`, `sort_b`)로 정렬되어 있어 파일마다 min/max 통계가 저장되어 있다. 이 조건이 없으면 Iceberg가 **파일의 min/max 통계를 활용할 수 없어 파티션 내 모든 파일을 읽는다.**
 
 ### 6.5 파티션 컬럼에 함수 적용 — Partition Pruning 무효화
 
@@ -377,6 +410,21 @@ WHERE par_a = 'A'
 >
 > 단, `ts` 컬럼의 `date()`, `date_trunc()`는 예외이다. Trino가 이 함수들을 **timestamp 범위 조건으로 자동 변환**하여 Partition Pruning이 정상 작동한다.
 
+**`ts`에 쓸 수 있는 함수 / 없는 함수**
+
+| 표현식 | Partition Pruning |
+|--------|-------------------|
+| `date(ts)`, `CAST(ts AS DATE)` | ✅ |
+| `date_trunc('hour' \| 'day' \| 'month' \| 'year', ts)` | ✅ |
+| `year(ts)` | ✅ |
+| `ts` 범위 비교 (`>=`, `<`, `BETWEEN`) | ✅ |
+| `date_trunc('week', ts)`, `date_trunc('quarter', ts)` | ❌ **현재 버전(482)에서만 안 됨** |
+| `format_datetime()`, `substr()`, `lower()`, 기타 함수 | ❌ |
+
+> **자동 변환은 함수마다 개별 구현되어 있다.** 위 목록에 없는 함수를 `ts`에 적용하면 Partition Pruning이 무효화되어 전체 스캔이 된다.
+>
+> `week`/`quarter`는 Trino **484**에서 지원되므로 버전 업그레이드 시 해소된다. 그때까지는 범위 조건(`ts >= ... AND ts < ...`)으로 대체한다. 근거는 [trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §2.3 참조.
+
 ---
 
 ## 7. 성능 확인 방법
@@ -390,7 +438,7 @@ FROM TABLE_A
 WHERE date(ts) = DATE '2026-03-11'
   AND par_a = 'A'
   AND sort_a = 'value1'
-  AND sort_c = 'value3';
+  AND sort_b = 'value3';
 ```
 
 **확인할 지표 2가지**
@@ -400,7 +448,9 @@ WHERE date(ts) = DATE '2026-03-11'
 | **Physical input** | 스토리지에서 실제 읽은 데이터 크기 | 적을수록 좋음 — Partition Pruning/Data Skipping이 잘 작동한 것 |
 | **Filtered** | 읽은 후 버린 행의 비율 (%) | 낮을수록 좋음 — 불필요한 데이터를 적게 읽은 것 |
 
-`Physical input`이 크고 `Filtered`가 높다면 WHERE 조건에서 필수 컬럼(ts, par_a, sort_a, sort_c)을 확인해야 한다.
+`Physical input`이 크고 `Filtered`가 높다면 WHERE 조건에서 필수 컬럼(ts, par_a, sort_a, sort_b)을 확인해야 한다.
+
+> ⚠️ **실행 계획에 조건이 안 보인다고 Pruning이 안 된 것은 아니다.** `EXPLAIN` 출력의 `:: [[...]]`(Domain) 표시는 Pruning 여부의 지표가 아니며, **표시가 없어도 Iceberg 메타데이터 계층에서 Pruning이 수행된다**(Trino가 공식적으로 확인한 사항). 판단은 위 두 지표(`Physical input`, `Filtered`)로 한다. 상세는 [trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §4 참조.
 
 > **상세 해석 방법**: [read-performance-test.md](read-performance-test.md)의 "EXPLAIN ANALYZE 결과 해석 가이드" 참조
 
@@ -411,7 +461,7 @@ WHERE date(ts) = DATE '2026-03-11'
 | 용어 | 설명 |
 |------|------|
 | **[Partition Pruning](https://iceberg.apache.org/docs/latest/partitioning/)** | 쿼리 조건과 무관한 파티션(데이터 그룹)을 읽지 않고 건너뛰는 최적화. WHERE 절의 파티션 컬럼 조건(`ts`, `par_a`)으로 작동한다 |
-| **Data Skipping** | 파일의 min/max 통계를 보고, 조건에 해당하지 않는 파일을 건너뛰는 최적화. Sort Order(`sort_a`, `sort_c`)로 데이터가 정렬되어 있을 때 효과가 높다 |
+| **Data Skipping** | 파일의 min/max 통계를 보고, 조건에 해당하지 않는 파일을 건너뛰는 최적화. Sort Order(`sort_a`, `sort_b`)로 데이터가 정렬되어 있을 때 효과가 높다 |
 | **Sort Order** | 데이터 파일을 쓸 때 지정된 컬럼 순서로 정렬하는 설정. 정렬된 파일은 min/max 범위가 좁아져 Data Skipping 효과가 높아진다 |
 | **[Hidden Partitioning](https://iceberg.apache.org/docs/latest/partitioning/)** | Iceberg의 파티셔닝 방식. 사용자는 원본 컬럼(`ts`)으로 쿼리하면 되고, 내부적으로 파티션(`hour(ts)`)을 이용해 Partition Pruning이 자동 수행된다 |
 | **timestamp_ntz** | 시간대(timezone) 정보가 없는 타임스탬프 타입. 저장된 값 그대로 비교된다 |
