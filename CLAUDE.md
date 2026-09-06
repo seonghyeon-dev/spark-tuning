@@ -264,6 +264,11 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 
 ```
 ├── CLAUDE.md
+├── README.md                          # 문서 사이트 홈 (MkDocs index)
+├── mkdocs.yml                         # MkDocs Material 설정 (docs_dir = 저장소 루트)
+├── requirements-docs.txt              # 문서 사이트 빌드 의존성
+├── assets/extra.css                   # 문서 사이트 스타일 보정 (한글 줄바꿈, 표 폭)
+├── .github/workflows/docs.yml         # main push 시 GitHub Pages 배포
 ├── .claude/
 │   ├── agents/
 │   │   ├── verify-column-naming.md    # 컬럼 명명 검증 (읽기 전용)

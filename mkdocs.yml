@@ -1,0 +1,119 @@
+site_name: Spark + Iceberg 파이프라인 가이드
+site_description: Spark / Iceberg / Trino 파이프라인의 튜닝·스키마 설계·운영 가이드
+site_url: https://seonghyeon-dev.github.io/spark-tuning/
+repo_url: https://github.com/seonghyeon-dev/spark-tuning
+repo_name: seonghyeon-dev/spark-tuning
+edit_uri: edit/main/
+
+# 문서가 저장소 루트(tuning/, schema/, pipeline/)에 그대로 있으므로
+# docs/ 로 옮기지 않고 mkdocs-same-dir 플러그인으로 루트를 docs_dir 로 쓴다.
+docs_dir: .
+site_dir: site
+
+exclude_docs: |
+  site/
+  mkdocs.yml
+  requirements-docs.txt
+
+# 문서 간 링크·페이지 내 앵커가 깨지면 빌드 로그에 경고로 남긴다
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+
+theme:
+  name: material
+  language: ko
+  font:
+    text: Noto Sans KR
+    code: JetBrains Mono
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: 다크 모드로 전환
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: 라이트 모드로 전환
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.instant
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - content.action.view
+
+extra_css:
+  - assets/extra.css
+
+plugins:
+  - same-dir
+  - search:
+      lang:
+        - ko
+        - en
+
+markdown_extensions:
+  - toc:
+      permalink: true
+      # 기본 slugify 는 한글을 제거해 문서 내부 목차 링크(#1-개요 등)가 깨진다.
+      # GitHub 와 같은 규칙으로 한글 앵커를 유지한다.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - tables
+  - attr_list
+  - md_in_html
+  - footnotes
+  - admonition
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - 홈: README.md
+  - 프로젝트 현황: CLAUDE.md
+  - 튜닝:
+      - Spark 튜닝 가이드 (append Job): tuning/spark-tuning-guide.md
+      - Compaction 튜닝 가이드 (hourly): tuning/compaction-tuning-guide.md
+      - Compaction 튜닝 결과 (보고용): tuning/compaction-tuning-report.md
+      - Trino Partition Pruning 검증: tuning/trino-iceberg-partition-pruning.md
+  - 스키마:
+      - Iceberg 스키마 설계 가이드: schema/iceberg-schema-design-guide.md
+      - 읽기 성능 비교 테스트: schema/read-performance-test.md
+      - Trino 쿼리 가이드 (사용자용): schema/trino-query-guide.md
+      - Spark 쿼리 메트릭 가이드: schema/spark-query-metrics-guide.md
+  - 파이프라인:
+      - FileIO 전환 가이드 (S3A → S3FileIO): pipeline/s3fileio-migration-guide.md
+      - FileIO 전환 결과 (보고용): pipeline/s3fileio-migration-report.md
+      - 재처리 DAG 설계: pipeline/reprocessing-dag-design.md
+      - 재처리 DAG 처리 흐름 (보고용): pipeline/reprocess-flow.md
+      - Compaction executor 자원 할당 설계: pipeline/compaction-executor-sizing-design.md

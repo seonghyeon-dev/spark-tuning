@@ -1,0 +1,54 @@
+name: 문서 사이트 배포 (GitHub Pages)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 배포는 한 번에 하나만 — 진행 중인 배포는 취소하지 않고 대기 중인 것만 건너뛴다
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: 의존성 설치
+        run: pip install -r requirements-docs.txt
+
+      # --strict 는 보류: s3fileio-migration-report.md 가 참조하는 Grafana 캡처
+      # (pipeline/images/minio-api-*.png) 가 아직 첨부 전이라 경고가 남는다.
+      # 이미지 첨부 후 --strict 로 올려 깨진 링크를 빌드 실패로 잡는다.
+      - name: 사이트 빌드
+        env:
+          DISABLE_MKDOCS_2_WARNING: "true"
+        run: mkdocs build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

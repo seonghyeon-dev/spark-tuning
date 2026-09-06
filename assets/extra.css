@@ -1,0 +1,26 @@
+/* 한글 문서: 단어 중간에서 줄이 끊기지 않도록 */
+.md-typeset {
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+/* 넓은 화면에서 본문 폭을 조금 더 쓴다 (표가 많은 문서) */
+@media screen and (min-width: 76.25em) {
+  .md-grid {
+    max-width: 78rem;
+  }
+}
+
+/* 표: 셀 안 코드가 줄바꿈되지 않도록, 표 전체는 가로 스크롤 */
+.md-typeset table:not([class]) {
+  font-size: 0.72rem;
+}
+.md-typeset table:not([class]) td code,
+.md-typeset table:not([class]) th code {
+  white-space: nowrap;
+}
+
+/* 인용블록 안의 표는 여백을 줄여 붙여 보이게 */
+.md-typeset blockquote table:not([class]) {
+  margin: 0.5em 0;
+}
