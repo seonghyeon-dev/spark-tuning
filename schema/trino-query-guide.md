@@ -351,11 +351,9 @@ WHERE date(ts) = DATE '2026-03-11'
   AND sort_b = 'value3';
 ```
 
-> ts는 `hour(ts)` Partition Pruning의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **보관 중인 전체 기간(3개월)의 파일 목록을 처음부터 끝까지 훑는다.**
+> ts는 `hour(ts)` Partition Pruning의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **보관 중인 전체 기간(3개월)의 파일 목록(manifest)을 처음부터 끝까지 훑는다.** 실측에서 ts 조건이 있으면 manifest 1~2개만 열고 나머지 27~29개를 건너뛰었지만, 없으면 29개를 전부 열었다.
 >
-> **비용이 어디에 나타나는지 주의해서 볼 것.** sort_a/sort_b 조건이 촘촘하면 파일 단위로 걸러지므로 **최종적으로 읽는 데이터 양(Physical input)은 크게 늘지 않을 수 있다.** 대신 비용이 **쿼리 계획 수립 시간(Planning)** 에 쌓이며, 데이터가 누적될수록 커진다. 즉 `Physical input`만 보고 "ts 없어도 괜찮다"고 판단하면 안 된다.
->
-> **sort_a/sort_b 조건이 없거나 범위가 넓은 쿼리에서는 읽는 데이터도 함께 급증한다** — 실측에서 ts 조건 하나를 빼자 264MB → 13.05GB가 됐다 ([trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §3.1).
+> **그래도 sort_a/sort_b 조건이 촘촘하면 최종적으로 읽는 파일과 데이터 양은 같다** — 실측 3개 파일 / 16.79MB로, ts 유무와 무관했다. 그러면 왜 ts를 넣는가. **sort 조건이 빠지거나 범위가 넓어지는 순간 ts가 전체 스캔을 막는 유일한 수단**이기 때문이다. 실측에서 sort 조건이 없는 쿼리에서 ts 조건 하나를 빼자 **파일 1,059개 / 264MB → 98,458개 / 13.65GB**가 됐다. ts와 sort_a는 서로의 안전장치이므로 **둘 다** 넣는다 ([trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §3.4, §7.1).
 
 ### 6.2.1 참고 — 파티션 조건이 아예 없으면 쿼리가 실패한다
 
@@ -449,6 +447,8 @@ WHERE date(ts) = DATE '2026-03-11'
 | **Filtered** | 읽은 후 버린 행의 비율 (%) | 낮을수록 좋음 — 불필요한 데이터를 적게 읽은 것 |
 
 `Physical input`이 크고 `Filtered`가 높다면 WHERE 조건에서 필수 컬럼(ts, par_a, sort_a, sort_b)을 확인해야 한다.
+
+> **파일 수를 직접 보려면 `EXPLAIN ANALYZE VERBOSE`를 쓴다.** 출력의 `dataFiles`가 실제 읽은 파일 수, `skippedDataManifests`가 ts 조건으로 건너뛴 파일 목록(manifest)의 수다. ts 조건을 넣었는데도 `skippedDataManifests`가 0이면 ts 조건이 Partition Pruning으로 작동하지 않은 것이다 (예: 지원되지 않는 함수 적용, 6.5절). `scanPlanningDuration` 같은 시간 지표는 서버 상황에 따라 변동이 커 비교에 쓰지 않는다. 상세는 [trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §5.1 참조.
 
 > ⚠️ **실행 계획에 조건이 안 보인다고 Pruning이 안 된 것은 아니다.** `EXPLAIN` 출력의 `:: [[...]]`(Domain) 표시는 Pruning 여부의 지표가 아니며, **표시가 없어도 Iceberg 메타데이터 계층에서 Pruning이 수행된다**(Trino가 공식적으로 확인한 사항). 판단은 위 두 지표(`Physical input`, `Filtered`)로 한다. 상세는 [trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §4 참조.
 

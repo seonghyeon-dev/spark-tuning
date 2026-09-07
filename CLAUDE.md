@@ -112,7 +112,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **상태**: 완료. **작업 8 검증 결과 반영 완료 (2026-09-05)** — 상세 내역은 `tuning/trino-iceberg-partition-pruning.md` §8.1
   - **컬럼 역할 정정**: 가이드가 정렬 2순위와 일반 컬럼을 **뒤바꿔** 기술하고 있었다 (옛 이름 기준 `sort_c`를 Sort Order 2순위로, `sort_b`를 일반 컬럼으로) → 스키마 확정에 맞춰 교환하고 명명도 통일
   - **`ts =` 등가**: "❌ 결과 없음" → **날짜 조회 목적 ❌ / 정확한 시각 지정 ✅(가장 빠름)** 로 분리
-  - **§6.2**: "모든 날짜의 **데이터**를 읽는다" → "전체 기간의 **파일 목록을 훑는다**". 비용이 `Physical input`이 아니라 `Planning`에 쌓인다는 점 명시 (배수는 미측정이라 쓰지 않음)
+  - **§6.2**: "모든 날짜의 **데이터**를 읽는다" → "전체 기간의 **파일 목록을 훑는다**". **2026-09-07 재정정**: "비용이 `Planning`에 쌓인다"는 서술은 **철회** — 실측으로 확인되지 않았고 판정 지표도 없다. 근거를 **"sort 조건이 빠질 때 `ts`가 유일한 안전장치"**(98,458 → 1,059 파일)로 교체. §7에 `EXPLAIN ANALYZE VERBOSE`의 `dataFiles`/`skippedDataManifests` 안내 추가
   - **추가**: 파티션 필터 강제의 한계(§6.2.1), `ts` 함수별 지원 표(§6.5), Domain 표시 주의(§7)
 - **대상 독자**: Trino 쿼리 사용자 (Partition Pruning/Data Skipping 비전문가)
 - **핵심 내용**: ts 필터링 방법(date, date_trunc, 범위 조건), WHERE 필수 컬럼, 잘못된 쿼리 패턴
@@ -241,7 +241,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **jar 교체**: `iceberg-spark-runtime-4.1_2.13-1.11.0`(★교체) + `iceberg-aws-bundle-1.11.0`(★버전만). `aws-java-sdk-bundle`(v1)은 Spark 배포판의 SDK v2 bundle로 대체됨
 - **권장 순서**: ①현 스택에 `iceberg-aws-bundle-1.10.1` 추가 → Phase 1 측정 ②결과 확정 ③Scala 코드 API 참조 범위 조사 ④1.11.0 + Spark 4.1.1 업그레이드 ⑤Trino·벤치마크 회귀 검증
 
-## 작업 8: Trino Partition Pruning 검증 — 조사 완료, 가이드 반영 완료, 측정 2건 대기
+## 작업 8: Trino Partition Pruning 검증 — 조사 완료, `EXPLAIN ANALYZE VERBOSE` 실측 완료(2026-09-07), 가이드 반영 완료
 
 - **산출물**: `tuning/trino-iceberg-partition-pruning.md`
 - **환경**: **Trino 482** (`read-performance-test.md` §5의 Bloom Filter 측정은 475 기준 — 버전 구분 필요)
@@ -252,13 +252,17 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **⚠️ Issue #19266의 워크어라운드는 필요 없다 (조사 원본 정정).** "파티션 경계에 안 맞는 범위 조건은 Pruning 실패"라는 제보는 **EXPLAIN 표시를 오독한 것**이었고 PR #24740(469)으로 종결됐다. 우리는 482라 포함. 실측도 일치 — `ts >= 16:00 AND ts < 17:00`이 205 splits로 해당 시간 파티션 하나만 읽었다
   - **`sort_a`는 `ts`의 문자열 사본이다** (`2026-08-19 16:21:12.466` → `'20260819162112466'`). 기존 프로젝트 문서 어디에도 없던 사실이며, **이것이 관측 전체를 설명한다** — Sort Order 1순위 + ts 사본 조합이라 `sort_a` 등가조건 하나가 밀리초 단위 시각 조건으로 작동해 파일 단위까지 걸러낸다. **다른 테이블에 일반화 금지**
   - **운영 쿼리 패턴(6개 컬럼 전부 WHERE)에서는 `ts` 조건을 넣든 빼든 16.79MB / 15 splits로 동일하다.** `read-performance-test.md` §5.3에서 Sort Order 4개 조합이 전부 8.56k rows / 55.2MB였던 것과 **같은 현상** — 이미 파일 단위까지 좁혀져 그 위에서 뭘 바꾸든 차이가 안 나는 영역
-  - **그럼에도 `ts` 조건은 필요하다.** 차이는 데이터 I/O가 아니라 **manifest 단계**에 있다 — `ts`는 파티션 경계로 manifest를 통째 스킵하고, `sort_a`는 못 걸러 manifest 전수 조회가 된다. 3개월 × 24시간 × par_a 4종 ≈ **8,640 파티션**. **⚠️ 단 이 비용 차이는 아직 측정 안 됨 — `Planning:` 비교가 최우선 과제**
+  - **manifest 단계 Pruning은 `ts` 전용이다 (`EXPLAIN ANALYZE VERBOSE` 실측, §3.4).** `ts` 조건이 있으면 manifest 29개 중 27~28개를 건너뛰고 1~2개만 열지만, `sort_a`만으로는 29개를 전부 연다. `par_a`도 identity 파티션 컬럼인데 0개 — 모든 manifest에 A~D가 다 들어 있어서다. 소스 근거: manifest 필터는 WHERE를 **파티션 스펙에 투영한 식**만 쓴다(`ManifestGroup.java:252-256`), 비파티션 컬럼 술어는 `alwaysTrue`가 된다
+  - **그럼에도 `ts` 조건은 필요하다 — 단 근거가 바뀌었다.** 기존 "manifest 전수 조회 비용이 Planning에 쌓인다"는 서술은 **철회**. 경로 차이(29개 vs 1~2개)는 실측됐으나 시간 비용으로는 확인되지 않았고, `scanPlanningDuration`은 split 생성 전체의 벽시계 시간이라(`SnapshotScan.java:136-141`, iterable close까지 측정) 판정 지표가 못 된다. **실제 이유는 sort 조건이 빠질 때의 안전장치** — sort 없는 쿼리에서 `ts` 하나가 **98,458 파일/13.65GB → 1,059 파일/264MB(93배)**를 가른다. `ts`와 `sort_a`는 서로의 안전장치이므로 "둘 다 넣으라"는 안내는 그대로
+  - **파일 단계 카운터는 파티션·통계를 분리하지 않는다** — 엔트리 필터가 `evaluator.eval(partition) && metricsEvaluator.eval(file)` 한 술어·한 카운터(`ManifestReader.java:240-251`)이고, **Trino 482는 `skippedDataFiles`를 노출조차 안 한다**. 분리하려면 통계로는 못 걸리는 술어(하루·한 시간 범위)를 대조군으로 두고 `dataFiles`를 비교한다. 그 방법으로 `date(ts)` 1,059 파일(파티션만) → `ts =` 3 파일(`ts` min/max 통계) 분해 확인
+  - **splits ÷ 4 환산 폐기.** splits/파일 비율이 2.94~5.0으로 불안정(미Compaction 구간 작은 파일, row group 경계). `dataFiles`를 직접 인용한다
+  - manifest 총수는 스냅샷마다 다르다(29~31, append가 늘리고 `rewrite_manifests`가 줄임). 조건 간 비교는 한 스냅샷 안에서 연속 측정, 엄밀히는 `FOR VERSION AS OF`로 고정
   - **`date_trunc('week'|'quarter')`는 482에서 Pruning 안 된다** — PR #30197이 milestone **484**. day/month/year·`year()`·`date()`·범위 비교는 전부 동작. **일시적 제약이므로 우회 코드를 쿼리에 영구히 박지 말 것**
   - **파티션 필터 강제(`iceberg.query-partition-filter-required`)는 `ts` 누락을 못 막는다** — 파티션 컬럼 **하나라도** 있으면 통과하므로 `par_a`만으로 3개월 전체 조회가 에러 없이 실행된다 (기준선 측정이 그 증거)
   - **`read.split.target-size`(읽기, 기본 128MB)를 `write.target-file-size-bytes`(쓰기, 512MB)에 맞춰 올리지 말 것** — 파일 1개 = split 1개가 되어 병렬성 4~5배 하락. 두 값이 다른 것은 불일치가 아니라 설계
 - **`trino-query-guide.md` 반영 완료** — 상세는 작업 3 및 문서 §8.1
 - **컬럼 명명 통일 완료 (2026-09-05)**: 전 문서에 `par_*`/`sort_*`/`col_*` 규칙 적용. 변환표는 공통 컨텍스트의 대상 테이블 절과 작업 8 문서 §1.3
-- **미확인**: `Planning:` 시간 비교(§6.2 정정의 배수를 못 쓴 이유), `EXPLAIN ANALYZE VERBOSE`의 `skippedDataManifests`/`skippedDataFiles` 실제 노출 여부, `par_a` 분포가 `schema/` 문서(2026-03-18)와 순위가 다른 원인, splits÷4 환산(실측 대조 1건뿐), `iceberg.query-partition-filter-required` 실제 설정값
+- **미확인**: `par_a` 분포가 `schema/` 문서(2026-03-18)와 순위가 다른 원인, `iceberg.query-partition-filter-required` 실제 설정값, `$partitions` 대조(`date(ts)` 1,059 파일 = 해당 날 파티션 `file_count` 합계인지 — `col_b` 통계 개입 배제용, 낮음), 규모 증가 시 manifest 전수 조회가 비용으로 드러나는지(판정 지표 부재로 보류)
 
 ## 파일 구조
 

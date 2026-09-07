@@ -8,7 +8,7 @@
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | **Trino 482**, Iceberg, S3(MinIO), Kubernetes |
 | 대상 범위 | hourly 테이블(파티션 `hour(ts)`, `par_a`)의 **조회 경로**. Compaction·append Job 설정은 `tuning/compaction-tuning-guide.md`, `tuning/spark-tuning-guide.md` |
-| 최종 수정일 | 2026-09-05 |
+| 최종 수정일 | 2026-09-07 |
 
 > **Trino 버전 주의**: `schema/read-performance-test.md` §5.4의 Bloom Filter 측정은 **Trino 475** 기준이다. 이 문서는 **482** 기준이며, 그 사이에 unwrap 룰이 추가된 항목이 있다 (섹션 2.3). 버전이 다른 측정을 나란히 비교할 때 주의한다.
 
@@ -24,10 +24,10 @@
 
 - [1. 개요](#1-개요) — 대상 테이블, 확정 스키마와 컬럼 명명, 파티션 필터 강제
 - [2. 술어가 Pruning으로 바뀌는 경로](#2-술어가-pruning으로-바뀌는-경로) — unwrap 룰, 함수별 지원 여부
-- [3. 실측 결과](#3-실측-결과) — ts 조건별 스캔량, sort 컬럼이 ts 효과를 가리는 현상
+- [3. 실측 결과](#3-실측-결과) — ts 조건별 스캔량, sort 컬럼이 ts 효과를 가리는 현상, manifest 단계와 파일 단계의 분리 실측
 - [4. Domain 표시로 Pruning을 판단하지 말 것](#4-domain-표시로-pruning을-판단하지-말-것) — 업스트림이 명시한 함정
-- [5. Pruning 검증 방법](#5-pruning-검증-방법) — VERBOSE, IO 플랜, 메타데이터 테이블
-- [6. splits와 파일 수](#6-splits와-파일-수) — `read.split.target-size`, 쓰기 설정과의 구분
+- [5. Pruning 검증 방법](#5-pruning-검증-방법) — VERBOSE 노출 메트릭과 그 의미(소스 근거), IO 플랜, 메타데이터 테이블
+- [6. splits와 파일 수](#6-splits와-파일-수) — splits 환산 폐기(`dataFiles` 직접 확인), `read.split.target-size`와 쓰기 설정의 구분
 - [7. 이 조사가 확인해 준 설계 판단](#7-이-조사가-확인해-준-설계-판단) — hour 파티션, Sort Order, par_a 분포
 - [8. 기존 문서 반영 사항](#8-기존-문서-반영-사항) — `trino-query-guide.md` 정정 내역, 남은 대상
 - [9. 미확정 및 후속 과제](#9-미확정-및-후속-과제)
@@ -45,7 +45,7 @@
 
 1. `WHERE` 좌측에 함수를 쓰면 Pruning이 깨지는가? → **함수마다 다르다** (섹션 2.3)
 2. `EXPLAIN`에 술어가 안 보이면 Pruning이 안 된 것인가? → **아니다** (섹션 4)
-3. 운영 쿼리 패턴(6개 컬럼 전부 등가 조건)에서 `ts` 조건은 실제로 얼마나 기여하는가? → **바이트 기준으로는 거의 기여하지 않는다. 그럼에도 필요하다** (섹션 3.2, 7.1)
+3. 운영 쿼리 패턴(6개 컬럼 전부 등가 조건)에서 `ts` 조건은 실제로 얼마나 기여하는가? → **읽는 파일·바이트에는 기여하지 않고 manifest 단계에서만 작동한다. 그럼에도 필요하다 — sort 조건이 빠질 때의 안전장치다** (섹션 3.2, 3.4, 7.1)
 
 ### 1.2 대상 테이블
 
@@ -226,6 +226,36 @@ Trino 소스 `CanonicalizeExpressionRewriter.rewriteFunctionCall`에 다음 주�
 
 > **파일 단계 Pruning의 효과는 물리 정렬 상태에 좌우된다.** 도착 순서대로 쓰이면 파일 min/max가 전 구간을 덮어 아무 파일도 걸러지지 않는다. Compaction의 `sort` 전략이 이 정렬 상태를 유지하는 장치이며, `tuning/compaction-tuning-guide.md` §1.2가 `binpack`을 기각한 이유가 여기에 닿는다.
 
+### 3.4 manifest 단계와 파일 단계의 분리 — `EXPLAIN ANALYZE VERBOSE` ✅
+
+섹션 3.1~3.3은 splits와 physical input으로 해석한 것이다. 같은 쿼리를 `EXPLAIN ANALYZE VERBOSE`로 돌려 Iceberg 스캔 카운터로 다시 확인했다 (2026-09-07). 메트릭의 정의와 소스 근거는 섹션 5.1.
+
+**1회차 — sort 컬럼 없음 (`par_a` + `col_b` + `ts` 조건)**
+
+| 조건 | `dataFiles` | `dataManifests` (연 것) | `skippedDataManifests` |
+|------|-------------|--------------------------|------------------------|
+| `date(ts) = D` | 1,059 | 2 | 29 |
+| `ts = <시점>` | 3 | 1 | 29 |
+
+**2회차 — 운영 패턴 기준, 같은 시점에 연속 측정**
+
+| # | 조건 | `dataFiles` | `dataManifests` | `skippedDataManifests` | physical input | splits |
+|---|------|-------------|-----------------|------------------------|----------------|--------|
+| 1 | `par_a` + `col_b` (`ts`·sort 없음) | **98,458** | 29 | **0** | 13.65 GB | 289,667 |
+| 2 | `par_a` + `sort_a` + `sort_b` (`ts` 없음) | 3 | 29 | **0** | 16.79 MB | 15 |
+| 3a | #2 + `date(ts)` | 3 | 2 | **27** | 16.79 MB | 15 |
+| 3b | #2 + `ts = <시점>` | 3 | 1 | **28** | 16.79 MB | 15 |
+
+**읽어낼 것**
+
+- **manifest 단계는 `ts`만 작동한다.** `par_a`도 identity 파티션 컬럼이지만 #1에서 manifest를 하나도 못 걸렀다 — append가 매 커밋마다 4개 값을 전부 쓰고 `rewrite_manifests`가 `ts_hour` 순으로 뭉치므로 모든 manifest에 A~D가 들어 있기 때문이다. `sort_a`(#2)는 파티션 컬럼이 아니라 구조적으로 못 거른다 (섹션 5.1). 따라서 #3a·#3b의 27/28은 **전부 `ts` 술어의 효과**다. 섹션 7.1 표의 "manifest 통째 스킵"이 여기서 실측됐다
+- **파일 단계에서 `ts`는 아무것도 더하지 않는다.** #2와 #3이 `dataFiles=3`으로 같다. 섹션 3.2의 "16.79MB / 15 splits 동일"이 Iceberg의 파일 카운터로 재확인된 것이다
+- **1회차가 파일 단계를 분해해 준다.** 하루 안의 파일은 `ts` min/max가 전부 그 날 안이라 통계로는 하나도 걸러지지 않는다. 따라서 `date(ts)`의 1,059는 **파티션만으로** 남은 파일 수다. 같은 하루에서 `ts = <시점>`이 3으로 줄어든 것이 **`ts` min/max 통계**(Sort Order가 만든 정렬)의 몫이다. 섹션 3.1의 "205 → 15는 파일 단계 효과"가 확인됐다. 이 대조군 기법은 섹션 5.1이 설명하듯 파일 단계 카운터가 파티션·통계를 분리해 주지 않기 때문에 필요하다
+- **`ts` 조건의 실질 가치는 #1에 있다.** sort 조건이 없는 쿼리에서 `ts` 하나가 98,458 파일 → 1,059 파일(**93배**)을 가른다. 섹션 7.1에서 결론으로 잇는다
+- `filtered 95.55%`는 세 번째 층(Row-level Filter, `col_*`)이다. 3개 파일에서 읽은 행의 95%가 버려진다. #2·#3에서 동일하므로 같은 파일을 읽었다는 교차 확인이 된다
+
+> **manifest 총수(연 것 + 건너뛴 것)는 회차마다 다르다** — 1회차 30~31, 2회차 29. append 커밋마다 manifest가 늘고 `rewrite_manifests`(3일 주기)가 줄이기 때문이다. 조건 간 비교는 **한 스냅샷 안에서 연속 측정**해야 하며, 엄밀히 하려면 `FOR VERSION AS OF <snapshot_id>`로 고정한다.
+
 ---
 
 ## 4. Domain 표시로 Pruning을 판단하지 말 것
@@ -251,9 +281,9 @@ Trino 소스 `CanonicalizeExpressionRewriter.rewriteFunctionCall`에 다음 주�
 
 ## 5. Pruning 검증 방법
 
-### 5.1 권장: `EXPLAIN ANALYZE VERBOSE` ⚠️ 미실행
+### 5.1 권장: `EXPLAIN ANALYZE VERBOSE` ✅ 실행 확인 완료
 
-Trino **476**부터 split 생성 과정의 상세 메트릭이 `EXPLAIN ANALYZE VERBOSE`에 표시된다 ([PR #25770](https://trino.io/docs/current/release/release-476.html)). Iceberg 스캔 리포트 데이터를 포함하며 **482에서 사용 가능**하다.
+Trino **476**부터 split 생성 과정의 상세 메트릭이 `EXPLAIN ANALYZE VERBOSE`에 표시된다 ([PR #25770](https://trino.io/docs/current/release/release-476.html)). Iceberg 스캔 리포트를 포함하며 **482에서 사용 가능한 것을 확인했다** (2026-09-07, 결과는 섹션 3.4).
 
 ```sql
 EXPLAIN ANALYZE VERBOSE
@@ -262,20 +292,31 @@ WHERE ts = date_parse('20260819162112466', '%Y%m%d%H%i%s%f')
   AND par_a = 'a' AND col_b = 'd';
 ```
 
-Iceberg ScanReport 기준 확인할 메트릭:
+**Trino 482가 노출하는 Iceberg 스캔 메트릭** 📘 — `IcebergSplitSource.getMetrics()`(Trino 482, `IcebergSplitSource.java:539-558`)가 Iceberg `ScanReport`에서 골라 내보내는 항목이다.
 
-| 메트릭 | 의미 |
-|--------|------|
-| `totalDataManifests` | 전체 manifest 수 |
-| `scannedDataManifests` | 실제로 연 manifest |
-| `skippedDataManifests` | **Partition Pruning으로 건너뛴 manifest** |
-| `resultDataFiles` | 최종 선택된 파일 |
-| `skippedDataFiles` | **파일 통계로 건너뛴 파일** |
-| `totalPlanningDuration` | 플래닝 소요 시간 |
+| 표시 이름 | Iceberg 원본 | 의미 | 판정 용도 |
+|-----------|--------------|------|-----------|
+| `dataFiles` | `resultDataFiles` | 파티션 값·파일 통계 필터를 **모두 통과해 최종 선택된 파일 수** | 파일 단계의 결과. **splits 환산이 필요 없어진다** (섹션 6.1) |
+| `dataManifests` | `scannedDataManifests` | 실제로 연 manifest 수 | |
+| `skippedDataManifests` | 같음 | **파티션 술어로 통째 건너뛴 manifest 수** | **Partition Pruning의 유일한 직접 지표** |
+| `dataFileSizeBytes` | `totalFileSizeInBytes` | 선택된 파일의 총 크기 | |
+| `deleteManifests`, `skippedDeleteManifests`, `equalityDeleteFiles`, `positionalDeleteFiles`, `deletionVectorFiles`, `deleteFileSizeBytes` | — | delete 파일 계열 | append 전용 테이블이라 0 |
+| `scanPlanningDuration` | `totalPlanningDuration` | — | **판정에 쓰지 않는다** (아래) |
 
-**파티션 단계와 파일 단계가 분리되어 나오므로 어디서 얼마나 걸러졌는지 정확히 확인 가능하다.** 섹션 3의 "205 → 15가 파일 단계 효과"라는 해석도 이것으로 직접 확인할 수 있다.
+**`skippedDataManifests`가 파티션 단계만 뜻하는 이유** 📘
 
-> ⚠️ Trino가 실제로 어느 메트릭까지 노출하는지, 표시 이름이 무엇인지는 **미확인이다. 직접 실행 필요** (섹션 9).
+- Iceberg가 manifest를 거를 때는 WHERE 전체를 **파티션 스펙에 투영한 식**만 쓴다 — `ManifestGroup.java:252-256`(1.10.1), `Projections.inclusive(spec).project(dataFilter)`. manifest list에는 컬럼 통계가 없고 파티션 필드의 lower/upper bound만 있기 때문이다. `sort_a`·`col_b`처럼 파티션과 무관한 컬럼의 술어는 투영하면 `alwaysTrue`가 되어 manifest를 하나도 못 거른다. 섹션 3.4 #2(29개 전부 열림)가 그 실측이다
+- `ts = X`는 `ts_hour = hour(X)`로, `date(ts) = D`는 범위로 되돌려진 뒤(섹션 2.1) `ts_hour` 범위로 투영된다
+- 단서: 삭제 엔트리만 남은 manifest도 같은 카운터로 센다 (`ManifestGroup.java:283`). 섹션 3.4 #1에서 `ts` 없이 0이었으므로 이 테이블에는 해당 없다
+
+**파일 단계는 분리되지 않는다** 📘
+
+- Iceberg의 엔트리 필터는 `evaluator.eval(partition) && metricsEvaluator.eval(file)` **한 술어·한 카운터**다 (`ManifestReader.java:240-251`). 파티션 값으로 떨어진 파일과 min/max 통계로 떨어진 파일이 같은 `skippedDataFiles`에 쌓인다
+- 게다가 **Trino 482는 `skippedDataFiles`를 노출하지 않는다.** 위 표에 없다
+- 그러므로 파일 단계를 가르려면 **통계로는 못 걸리고 파티션으로만 걸리는 술어**(하루·한 시간 범위)를 대조군으로 두고 `dataFiles`를 비교한다. 섹션 3.4 1회차가 그 방법이다
+- Trino는 enforced·unenforced·dynamic filter 술어를 전부 Iceberg `tableScan.filter()`에 넘긴다 (`IcebergSplitSource.java:275-283`). 따라서 `dataFiles`는 WHERE 전체가 반영된 값이며, 3 파일 × 약 5 splits = 15 splits와 정합한다
+
+> ⚠️ **`scanPlanningDuration`은 판정 지표로 쓰지 않는다.** 타이머가 `planFiles()` 진입에서 시작해 반환된 iterable이 **닫힐 때** 멈추므로(`SnapshotScan.java:136-141`), manifest 읽기 시간이 아니라 Trino가 split 생성을 끝내기까지의 벽시계 시간이다. 결과 파일 수와 서버 상황에 따라 같은 쿼리도 회차마다 크게 달라진다.
 
 ### 5.2 `EXPLAIN (TYPE IO, FORMAT JSON)`
 
@@ -307,20 +348,20 @@ FROM iceberg.<schema>."<table>$partitions" ORDER BY 1;
 
 ## 6. splits와 파일 수
 
-### 6.1 환산 관계 ⚠️
+### 6.1 splits ÷ 4 환산은 쓰지 않는다 — `dataFiles`를 직접 읽는다 ✅
 
-Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/configuration/) 기본값이 **128MB**("데이터 입력 split을 결합할 때의 목표 크기")이므로:
+Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/configuration/) 기본값이 **128MB**이므로 초기에는 `512MB 파일 ≈ split 4개 → splits ÷ 4 ≈ 파일 수`로 환산했다. `EXPLAIN ANALYZE VERBOSE`의 `dataFiles`와 대조하자 **비율이 일정하지 않았다.**
 
-```
-512MB 파일 ≈ split 4개   →   splits ÷ 4 ≈ 파일 수
-```
+| 조건 | splits | `dataFiles` | splits / 파일 |
+|------|--------|-------------|---------------|
+| 3개월 전체 (`par_a` + `col_b`) | 289,667 | 98,458 | **2.94** |
+| `date(ts)` 하루 (sort 없음) | 4,938 | 1,059 | **4.66** |
+| `ts = <시점>` | 15 | 3 | **5.0** |
 
-- 15 splits ≈ 파일 3~4개
-- 205 splits ≈ 파일 51개 ← **섹션 3.1에서 실측 대조 완료** ✅
+Compaction이 아직 안 된 최근 구간의 작은 파일(split 1개)과 row group 경계에 따른 split 분할이 섞이기 때문이다. `dataFiles`가 파일 수를 직접 주므로 **환산 자체가 필요 없다.** 파일 수를 말할 때는 `dataFiles`를 인용한다.
 
-관련 속성: `read.split.open-file-cost` 4MB, `read.split.planning-lookback` 10.
-
-> ⚠️ 환산식 자체는 128MB 기준의 계산이며 실측 대조점이 1건뿐이다. 파일 크기가 균일하지 않은 파티션에서는 어긋날 수 있다.
+- 205 splits ≈ 51 파일 대조(섹션 3.1)는 Compaction이 끝난 파티션에서만 성립한 것이다
+- 관련 속성: `read.split.open-file-cost` 4MB, `read.split.planning-lookback` 10
 
 ### 6.2 ⚠️ `read.split.target-size`를 512MB로 올리지 말 것
 
@@ -339,11 +380,12 @@ Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/config
 
 | 지표 | 의미 |
 |------|------|
-| `splits` | 작업 분배 단위. **파일 1개 = split 1개가 아니다** (6.1) |
 | `physical input` | S3에서 실제 내려받은 압축 바이트. row group skip이 반영됨 |
-| `Planning:` | 메타데이터 탐색 비용. **파티션 컬럼과 정렬 컬럼의 차이가 여기서만 드러난다** (섹션 7.1) |
+| `dataFiles` (VERBOSE) | 최종 선택된 파일 수. splits 대신 이것을 인용한다 (섹션 5.1, 6.1) |
+| `skippedDataManifests` (VERBOSE) | 파티션 술어로 건너뛴 manifest 수. **Partition Pruning 여부는 이것으로만 판정한다** (섹션 5.1) |
+| `splits` | 작업 분배 단위. **파일 1개 = split 1개가 아니고 비율도 일정하지 않다** (6.1) — 보조 지표 |
 
-세 개면 충분하다. CPU / 네트워크 / 워커 편중은 반복 측정 평균으로 상쇄된다.
+시간 지표(`Planning:`, `scanPlanningDuration`)는 서버 상황에 따라 변동이 커 Pruning 판정에 쓰지 않는다 (섹션 5.1). CPU / 네트워크 / 워커 편중은 반복 측정 평균으로 상쇄된다.
 
 **측정 시 주의**
 
@@ -360,18 +402,25 @@ Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/config
 
 `schema/read-performance-test.md`는 B안(`hour(ts)`, `par_a`)이 4개 테스트 케이스 전부 1위(A안 대비 5~31% 빠름)라는 **결과**를 기록했다. 이 조사는 그 **메커니즘**을 보여준다: 일 단위 → 시 단위에서 splits가 **4,938 → 205로 정확히 24.1배** 줄었다 (섹션 3.1). 하루의 시간 파티션 수 24와 일치하므로, `hour(ts)` Pruning이 설계대로 동작한다는 직접 증거다. ✅
 
-**그런데 섹션 3.2에서 `ts` 조건을 빼도 읽는 양이 같았다. 그러면 `hour(ts)` 파티션은 필요 없는가? 아니다.**
+**그런데 섹션 3.2·3.4에서 `ts` 조건을 빼도 읽는 파일이 같았다(3개). 그러면 `hour(ts)` 파티션은 필요 없는가? 아니다.**
 
-| 단계 | `ts` (파티션 컬럼) | `sort_a` (정렬 컬럼) |
-|------|---------------------|----------------------|
-| manifest list | 파티션 경계로 manifest를 **통째로 스킵** | 못 거름 → **manifest 전수 조회** |
-| manifest | 살아남은 것만 파일 통계 확인 | 모든 manifest의 파일 엔트리 대조 |
-| 최종 결과 | 동일 | 동일 |
-| 비용 | 낮음 | **플래닝 시간 / 메타데이터 I/O 높음** |
+| 단계 | `ts` (파티션 컬럼) | `sort_a` (정렬 컬럼) | 실측 (섹션 3.4) |
+|------|---------------------|----------------------|-----------------|
+| manifest list | 파티션 경계로 manifest를 **통째로 스킵** | 못 거름 → **manifest 전수 조회** | **1~2개 열림 vs 29개 전부 열림** ✅ |
+| manifest 엔트리 | 살아남은 manifest의 엔트리만 대조 | 모든 manifest의 엔트리(약 10만 건) 대조 | — |
+| 최종 파일 | 동일 | 동일 | **3 = 3** ✅ |
 
-즉 두 컬럼은 **읽는 데이터 양은 같게 만들지만, 거기 도달하는 메타데이터 비용이 다르다.** 3개월 × 24시간 × `par_a` 4종 ≈ **8,640 파티션**이므로 데이터가 쌓일수록 격차가 벌어진다.
+두 컬럼은 **읽는 데이터는 같게 만들지만 거기 도달하는 메타데이터 경로가 다르다.** 이 구조는 소스(섹션 5.1)와 실측(섹션 3.4) 양쪽으로 확인됐다. **다만 이 경로 차이가 시간 비용으로 드러나는지는 확인하지 못했고, 현재 규모(manifest 29개, 엔트리 약 10만 건)에서는 드러나지 않는다고 보는 것이 맞다.** `scanPlanningDuration`은 판정 지표가 아니어서(섹션 5.1) 배수를 제시할 수 없다. 따라서 이 문서와 `trino-query-guide.md` §6.2가 썼던 **"`ts` 없으면 비용이 Planning에 쌓인다"는 서술은 철회한다** (섹션 8.1 ③ 정정).
 
-> ⚠️ **이 비용 차이는 아직 측정되지 않았다.** `Planning:` 시간 비교가 섹션 9의 최우선 항목인 이유다. 측정 전까지 "`ts` 없이도 된다"고 결론 내리면 안 된다.
+**`ts` 조건이 필요한 실제 이유 — sort 조건이 빠질 때의 안전장치** ✅
+
+| 조건 | `dataFiles` | physical input |
+|------|-------------|----------------|
+| `par_a` + `col_b` (`ts`·sort 없음) | **98,458** | **13.65 GB** |
+| 위 + `date(ts)` | 1,059 | 264 MB |
+| `par_a` + `sort_a` + `sort_b` (`ts` 없음) | 3 | 16.79 MB |
+
+운영 패턴처럼 6개 컬럼이 다 있으면 `ts`와 `sort_a` 중 하나는 중복이다. 하지만 사용자가 `sort_a`를 빼거나 범위 조건으로 넓히는 순간 **`ts`가 전체 스캔(98,458 파일)을 막는 유일한 수단**이 된다 — 93배. 반대로 `ts`를 빼면 `sort_a`가 그 역할을 한다. **두 컬럼은 서로의 안전장치이며, "둘 다 넣으라"는 안내는 그대로다.** 바뀐 것은 근거 문장뿐이다 — "Planning 비용"에서 "누락 시 안전장치"로.
 
 파티션이 필요한 다른 이유도 그대로다 — 기간 범위 조회, 시간별 집계, **파티션 단위 재처리**(`pipeline/reprocessing-dag-design.md`), **만료 데이터 정리**, 그리고 **Compaction의 file group 단위 자체**(`compaction-tuning-guide.md` §2.1)가 파티션이다.
 
@@ -424,7 +473,9 @@ Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/config
 
 - "모든 날짜의 **데이터**를 읽는다" → "보관 중인 전체 기간(3개월)의 **파일 목록을 훑는다**"
 - **비용이 `Physical input`이 아니라 `Planning` 시간에 쌓인다**는 점을 명시 — `Physical input`만 보고 "ts 없어도 된다"고 판단하는 것을 막는다
-- 실측 숫자는 **확인된 것만** 인용했다 (sort 조건이 약할 때 264MB → 13.05GB). `Planning` 시간 자체는 미측정이므로 **배수를 쓰지 않았다** (섹션 9.1)
+- 실측 숫자는 **확인된 것만** 인용했다 (sort 조건이 약할 때 264MB → 13.05GB). `Planning` 시간 자체는 미측정이므로 **배수를 쓰지 않았다**
+
+> ⚠️ **2026-09-07 재정정**: "비용이 Planning에 쌓인다"는 서술은 섹션 3.4 실측 후 **철회**했다. manifest 전수 조회 자체는 실측됐으나(29개 vs 1~2개) 시간 비용으로는 확인되지 않았고, 판정에 쓸 지표도 없다 (섹션 5.1). §6.2의 근거를 **"sort 조건이 빠질 때 `ts`가 유일한 안전장치"**(섹션 7.1 — 98,458 → 1,059 파일)로 교체하고, "파일 목록을 훑는다"는 서술에는 실측치(manifest 29개 전부 vs 1~2개)를 붙였다.
 
 **④ 추가 (§6.2.1, §6.5, §7)**
 
@@ -433,6 +484,8 @@ Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/config
 | §6.2.1 | 파티션 필터 강제 설정과 **그 한계** — 파티션 컬럼 하나면 통과하므로 `ts` 누락을 못 막는다 | 섹션 1.4 |
 | §6.5 | `ts`에 쓸 수 있는/없는 함수 표. `date_trunc('week'\|'quarter')`는 **482에서만 안 됨**(484부터 지원) | 섹션 2.3 |
 | §7 | **Domain 표시로 Pruning을 판단하지 말 것** | 섹션 4 |
+
+**⑤ 2026-09-07 추가 (§7)** — `EXPLAIN ANALYZE VERBOSE`의 `dataFiles`(읽은 파일 수)와 `skippedDataManifests`(파티션으로 건너뛴 manifest 수) 안내. 시간 지표는 비교에 쓰지 말라는 주의 포함 (섹션 5.1).
 
 ### 8.2 남은 반영 대상
 
@@ -450,11 +503,12 @@ Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/config
 
 | 항목 | 내용 | 우선순위 |
 |------|------|---------|
-| `Planning:` 시간 비교 | `ts` 조건 있음 vs 없음(`sort_a`만). **섹션 7.1의 논리를 숫자로 확정하는 유일한 측정.** 현재 `trino-query-guide.md` §6.2는 "비용이 Planning에 쌓인다"고만 쓰고 **배수를 제시하지 못한 상태**다 | **높음** |
-| `EXPLAIN ANALYZE VERBOSE` 실행 | `skippedDataManifests` / `skippedDataFiles`로 파티션 단계와 파일 단계를 분리 확인 (섹션 5.1). 메트릭 노출 여부·표시 이름 미확인 | **높음** |
+| ~~`Planning:` 시간 비교~~ | **해소 (2026-09-07)** — 측정했으나 `scanPlanningDuration`은 판정 지표가 아니고(섹션 5.1) 서버 상황에 따른 변동이 커 배수를 제시할 수 없다. §6.2 근거를 "누락 시 안전장치"로 교체하는 것으로 종결 (섹션 7.1). 규모가 커진 뒤 manifest 전수 조회가 비용으로 드러나는지는 지표 부재로 **보류** | 낮음 |
+| ~~`EXPLAIN ANALYZE VERBOSE` 실행~~ | **해소 (2026-09-07)** — 482에서 동작. 노출 이름 확정, `skippedDataFiles` 미노출 확인 (섹션 5.1, 3.4) | — |
+| `$partitions` 대조 | 섹션 3.4 1회차의 `date(ts)` 1,059 파일이 해당 날 × `par_a` 파티션의 `file_count` 합계와 같은지 확인. 같으면 `col_b` 통계가 파일을 걸렀을 가능성이 배제되어 "1,059 = 파티션만의 결과"가 확정된다 | 낮음 |
 | 예전 자료 인용 시 이름 변환 | 2026-09-05 이전 회의 자료·캡처·커밋 메시지는 옛 이름이다. 특히 **`col_a`는 예전에 파티션 컬럼을 뜻했다** — 섹션 1.3의 변환표를 거치지 않고 숫자를 옮기면 다른 컬럼 이야기가 된다 | 중간 |
 | 파티션 필터 강제 설정값 확인 | `iceberg.query-partition-filter-required`가 실제로 `true`인지, 스키마 한정인지 (섹션 1.4) | 중간 |
-| splits ↔ 파일 수 검증 | 파일 수가 다른 파티션(51/25/4/1)에 같은 쿼리를 돌려 splits가 파일 수에 비례하는지 확인 (섹션 6.1) | 중간 |
+| ~~splits ↔ 파일 수 검증~~ | **해소 (2026-09-07)** — 비례하지 않음(2.94~5.0). 환산 폐기, `dataFiles` 직접 인용 (섹션 6.1) | — |
 | `$entries` 정렬 상태 확인 | `readable_metrics`로 `ts` 파일별 lower/upper bound가 겹치지 않는지 육안 확인. 섹션 3.3의 전제 | 중간 |
 | `par_a` 분포 불일치 | `schema/` 문서(2026-03-18)와 순위가 다른 원인 — 분포 변화인지 다른 테이블인지 (섹션 7.3) | 중간 |
 | 482 릴리즈 노트 확인 | 본 문서 근거의 상당수가 396~476 시점 자료다. unwrap 룰 / split 설정 변경 여부 | 낮음 |
@@ -477,8 +531,8 @@ Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/config
    → 물리 정렬이 깨져 파일 min/max가 전 구간을 덮는다 (섹션 3.3)
 
 4. write.target-file-size-bytes 변경
-   → splits ÷ 4 환산이 바뀐다 (섹션 6.1). read.split.target-size는
-     따라 올리지 말 것 (섹션 6.2)
+   → read.split.target-size는 따라 올리지 말 것 (섹션 6.2). 파일 수는
+     splits 환산이 아니라 dataFiles로 확인한다 (섹션 6.1)
 
 5. 파티션 스펙 변경 (hour → day 등)
    → 섹션 3.1의 24.1배가 근거를 잃는다
@@ -499,6 +553,15 @@ Iceberg [`read.split.target-size`](https://iceberg.apache.org/docs/latest/config
 - [Trino Docs — Iceberg 커넥터](https://trino.io/docs/current/connector/iceberg.html) — `query-partition-filter-required`, 메타데이터 테이블
 - [Iceberg — 테이블 설정](https://iceberg.apache.org/docs/latest/configuration/) — `read.split.target-size`
 - [Trino Release 476](https://trino.io/docs/current/release/release-476.html) — VERBOSE split 메트릭
+
+**소스 (섹션 5.1의 메트릭 의미 판정 근거)**
+
+| 파일 | 버전 | 확인한 내용 |
+|------|------|-------------|
+| `core/src/main/java/org/apache/iceberg/ManifestGroup.java` | Iceberg 1.10.1 | manifest 필터가 파티션 투영식만 사용 (252-256행), `skippedDataManifests` 카운터 (273·283행) |
+| `core/src/main/java/org/apache/iceberg/ManifestReader.java` | Iceberg 1.10.1 | 엔트리 필터가 파티션·통계 판정을 한 카운터로 집계 (240-251행) |
+| `core/src/main/java/org/apache/iceberg/SnapshotScan.java` | Iceberg 1.10.1 | `totalPlanningDuration`이 iterable close 시점까지 측정 (136-141행) |
+| `plugin/trino-iceberg/.../IcebergSplitSource.java` | Trino 482 | 노출 메트릭 목록 (539-558행), 술어 전체를 Iceberg filter로 전달 (275-283행) |
 
 **이슈·PR (섹션 2.3·2.4의 버전 판정 근거)**
 
