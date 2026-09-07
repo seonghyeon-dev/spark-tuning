@@ -351,7 +351,7 @@ WHERE date(ts) = DATE '2026-03-11'
   AND sort_b = 'value3';
 ```
 
-> ts는 `hour(ts)` Partition Pruning의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **보관 중인 전체 기간(3개월)의 파일 목록(manifest)을 처음부터 끝까지 훑는다.** 실측에서 ts 조건이 있으면 manifest 1~2개만 열고 나머지 27~29개를 건너뛰었지만, 없으면 29개를 전부 열었다.
+> ts는 `hour(ts)` Partition Pruning의 대상이다. ts 조건이 없으면 Iceberg가 시간 파티션을 걸러낼 수 없어 **보관 중인 전체 기간(3개월)의 파일 목록(manifest)을 처음부터 끝까지 훑는다.** 실측에서 ts 조건이 있으면 manifest 29개 중 1~2개만 열고 나머지 27~28개를 건너뛰었지만, 없으면 29개를 전부 열었다.
 >
 > **그래도 sort_a/sort_b 조건이 촘촘하면 최종적으로 읽는 파일과 데이터 양은 같다** — 실측 3개 파일 / 16.79MB로, ts 유무와 무관했다. 그러면 왜 ts를 넣는가. **sort 조건이 빠지거나 범위가 넓어지는 순간 ts가 전체 스캔을 막는 유일한 수단**이기 때문이다. 실측에서 sort 조건이 없는 쿼리에서 ts 조건 하나를 빼자 **파일 1,059개 / 264MB → 98,458개 / 13.65GB**가 됐다. ts와 sort_a는 서로의 안전장치이므로 **둘 다** 넣는다 ([trino-iceberg-partition-pruning.md](../tuning/trino-iceberg-partition-pruning.md) §3.4, §7.1).
 

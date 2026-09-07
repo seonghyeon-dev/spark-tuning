@@ -521,7 +521,7 @@ Compaction이 아직 안 된 최근 구간의 작은 파일(split 1개)과 row g
 
 1. Trino 484 이상으로 업그레이드
    → date_trunc('week'|'quarter') Pruning이 동작하기 시작한다 (섹션 2.3).
-     섹션 8.3의 안내 문구도 함께 정리해야 한다
+     `trino-query-guide.md` §6.5의 안내 문구(섹션 8.1 ④)도 함께 정리해야 한다
 
 2. Sort Order 변경 — 특히 sort_a가 1순위에서 빠질 때
    → 섹션 3.2·3.3의 관측이 통째로 무효가 된다. sort_a가 ts의 사본이면서
