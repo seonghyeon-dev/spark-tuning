@@ -1,0 +1,120 @@
+/*
+ * Dracula 색상 스킴 (https://draculatheme.com/contribute)
+ * Material for MkDocs 의 custom color scheme 방식 — mkdocs.yml 의 palette.scheme: dracula
+ *
+ *   Background  #282a36   Current Line #44475a   Foreground #f8f8f2   Comment #6272a4
+ *   Cyan #8be9fd  Green #50fa7b  Orange #ffb86c  Pink #ff79c6  Purple #bd93f9  Red #ff5555  Yellow #f1fa8c
+ */
+[data-md-color-scheme="dracula"] {
+  color-scheme: dark;
+
+  /* 본문 */
+  --md-hue: 231;
+  --md-default-bg-color: #282a36;
+  --md-default-bg-color--light: #2d2f3d;
+  --md-default-bg-color--lighter: #333546;
+  --md-default-bg-color--lightest: #3a3c4e;
+  --md-default-fg-color: #f8f8f2;
+  --md-default-fg-color--light: #d6d6d0;
+  --md-default-fg-color--lighter: #a3a4ac;
+  --md-default-fg-color--lightest: #44475a;
+
+  /* 헤더·탭·사이드바 강조 (primary) 와 포커스/호버 (accent) */
+  --md-primary-fg-color: #21222c;
+  --md-primary-fg-color--light: #282a36;
+  --md-primary-fg-color--dark: #191a21;
+  --md-primary-bg-color: #f8f8f2;
+  --md-primary-bg-color--light: #d6d6d0;
+  --md-accent-fg-color: #ff79c6;
+  --md-accent-fg-color--transparent: rgba(255, 121, 198, 0.1);
+  --md-accent-bg-color: #282a36;
+  --md-accent-bg-color--light: #44475a;
+
+  /* 링크·강조 */
+  --md-typeset-color: var(--md-default-fg-color);
+  --md-typeset-a-color: #8be9fd;
+  --md-typeset-mark-color: rgba(241, 250, 140, 0.35);
+  --md-typeset-del-color: rgba(255, 85, 85, 0.2);
+  --md-typeset-ins-color: rgba(80, 250, 123, 0.2);
+  --md-typeset-kbd-color: #44475a;
+  --md-typeset-kbd-accent-color: #6272a4;
+  --md-typeset-kbd-border-color: #191a21;
+  --md-typeset-table-color: rgba(248, 248, 242, 0.12);
+  --md-typeset-table-color--light: rgba(248, 248, 242, 0.035);
+
+  /* 코드 블록 — Pygments 토큰별 색 */
+  --md-code-bg-color: #21222c;
+  --md-code-fg-color: #f8f8f2;
+  --md-code-hl-color: rgba(255, 184, 108, 0.12);
+  --md-code-hl-color--light: rgba(255, 184, 108, 0.06);
+  --md-code-hl-number-color: #bd93f9;
+  --md-code-hl-special-color: #ff5555;
+  --md-code-hl-function-color: #50fa7b;
+  --md-code-hl-constant-color: #bd93f9;
+  --md-code-hl-keyword-color: #ff79c6;
+  --md-code-hl-string-color: #f1fa8c;
+  --md-code-hl-name-color: #f8f8f2;
+  --md-code-hl-operator-color: #ff79c6;
+  --md-code-hl-punctuation-color: #f8f8f2;
+  --md-code-hl-comment-color: #6272a4;
+  --md-code-hl-generic-color: #ffb86c;
+  --md-code-hl-variable-color: #ffb86c;
+
+  /* admonition, 푸터, 그림자 */
+  --md-admonition-fg-color: var(--md-default-fg-color);
+  --md-admonition-bg-color: var(--md-default-bg-color);
+  --md-footer-bg-color: #21222c;
+  --md-footer-bg-color--dark: #191a21;
+  --md-footer-fg-color: #f8f8f2;
+  --md-footer-fg-color--light: #d6d6d0;
+  --md-footer-fg-color--lighter: #a3a4ac;
+  --md-shadow-z1: 0 0.25rem 0.625rem rgba(0, 0, 0, 0.3), 0 0 0.0625rem rgba(0, 0, 0, 0.4);
+  --md-shadow-z2: 0 0.25rem 0.625rem rgba(0, 0, 0, 0.4), 0 0 0.0625rem rgba(0, 0, 0, 0.5);
+  --md-shadow-z3: 0 0.25rem 0.625rem rgba(0, 0, 0, 0.5), 0 0 0.0625rem rgba(0, 0, 0, 0.6);
+}
+
+/* 인라인 코드는 배경만 살짝 다르게, 글자는 pink 로 */
+[data-md-color-scheme="dracula"] .md-typeset code:not(pre code) {
+  color: #ff79c6;
+}
+[data-md-color-scheme="dracula"] .md-typeset a code {
+  color: #8be9fd;
+}
+
+/* 인용블록 세로선·표 헤더 */
+[data-md-color-scheme="dracula"] .md-typeset blockquote {
+  border-left-color: #6272a4;
+  color: var(--md-default-fg-color--light);
+}
+[data-md-color-scheme="dracula"] .md-typeset table:not([class]) th {
+  background-color: #44475a;
+}
+[data-md-color-scheme="dracula"] .md-typeset table:not([class]) tbody tr:hover {
+  background-color: rgba(98, 114, 164, 0.15);
+}
+
+/* 헤더 제목·탭 텍스트, 검색창 */
+[data-md-color-scheme="dracula"] .md-header,
+[data-md-color-scheme="dracula"] .md-tabs {
+  border-bottom: 1px solid #44475a;
+}
+[data-md-color-scheme="dracula"] .md-tabs__link--active,
+[data-md-color-scheme="dracula"] .md-nav__link--active,
+[data-md-color-scheme="dracula"] .md-nav__item .md-nav__link--active {
+  color: #bd93f9;
+}
+[data-md-color-scheme="dracula"] .md-search__form {
+  background-color: #44475a;
+}
+[data-md-color-scheme="dracula"] .md-search__input::placeholder {
+  color: #a3a4ac;
+}
+
+/* 제목 permalink(¶), 코드 복사 버튼 */
+[data-md-color-scheme="dracula"] .md-typeset .headerlink {
+  color: #6272a4;
+}
+[data-md-color-scheme="dracula"] .md-typeset .headerlink:hover,
+[data-md-color-scheme="dracula"] .md-typeset :target > .headerlink {
+  color: #ff79c6;
+}

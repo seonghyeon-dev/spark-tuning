@@ -29,21 +29,20 @@ theme:
     code: JetBrains Mono
   icon:
     repo: fontawesome/brands/github
+  # 기본은 Dracula (assets/dracula.css 의 custom scheme). 토글로 라이트 모드 전환 가능
   palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      primary: deep orange
-      accent: indigo
-      toggle:
-        icon: material/weather-night
-        name: 다크 모드로 전환
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: deep orange
-      accent: indigo
+    - scheme: dracula
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-sunny
         name: 라이트 모드로 전환
+    - scheme: default
+      primary: deep purple
+      accent: pink
+      toggle:
+        icon: material/weather-night
+        name: Dracula 모드로 전환
   features:
     - navigation.tabs
     - navigation.tabs.sticky
@@ -61,6 +60,7 @@ theme:
 
 extra_css:
   - assets/extra.css
+  - assets/dracula.css
 
 plugins:
   - same-dir
