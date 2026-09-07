@@ -268,6 +268,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 ├── mkdocs.yml                         # MkDocs Material 설정 (docs_dir = 저장소 루트)
 ├── requirements-docs.txt              # 문서 사이트 빌드 의존성
 ├── assets/extra.css                   # 문서 사이트 스타일 보정 (한글 줄바꿈, 표 폭)
+├── assets/dracula.css                 # Dracula 색상 스킴 (기본 테마, 토글로 라이트 전환)
 ├── .github/workflows/docs.yml         # main push 시 GitHub Pages 배포
 ├── .claude/
 │   ├── agents/
