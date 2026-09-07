@@ -31,13 +31,11 @@ jobs:
       - name: 의존성 설치
         run: pip install -r requirements-docs.txt
 
-      # --strict 는 보류: s3fileio-migration-report.md 가 참조하는 Grafana 캡처
-      # (pipeline/images/minio-api-*.png) 가 아직 첨부 전이라 경고가 남는다.
-      # 이미지 첨부 후 --strict 로 올려 깨진 링크를 빌드 실패로 잡는다.
+      # --strict: 깨진 링크·앵커 경고를 빌드 실패로 처리한다
       - name: 사이트 빌드
         env:
           DISABLE_MKDOCS_2_WARNING: "true"
-        run: mkdocs build
+        run: mkdocs build --strict
 
       - uses: actions/upload-pages-artifact@v3
         with:
