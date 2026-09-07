@@ -109,13 +109,9 @@ spark.sql.catalog.<카탈로그>.s3.delete.num-threads=8
 
 ### MinIO API 호출 추이 (Grafana)
 
-> **[그림 1] 전환 전**
->
-> ![전환 전](images/minio-api-before.png)
+> **[그림 1] 전환 전** — (Grafana 캡처 자리, 미첨부)
 
-> **[그림 2] 전환 후**
->
-> ![전환 후](images/minio-api-after.png)
+> **[그림 2] 전환 후** — (Grafana 캡처 자리, 미첨부)
 
 - **`deleteObject` 호출이 사실상 사라졌다.** 일괄 삭제로 묶여 요청 건수 자체가 줄었다
 - **`listObject` 호출도 크게 감소했다.** 디렉터리 확인용 LIST가 발생하지 않는다
