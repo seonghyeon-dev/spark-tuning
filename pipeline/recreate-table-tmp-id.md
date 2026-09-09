@@ -34,6 +34,7 @@ import org.apache.spark.sql.SparkSession
 object RecreateTable {
   val Tbl = "iceberg.db.table_a"        // 재생성 대상 (backup 의 원본, load 의 목적지)
   val Tmp = "iceberg.db.table_a_tmp"    // 임시 테이블
+  val Where = "ts >= TIMESTAMP '1970-01-01'"   // Iceberg 읽기엔 파티션 키 조건 필수. 전수 대상이라 전체 범위
 
   val OracleUrl      = "jdbc:oracle:thin:@//oracle-host:1521/SERVICE"
   val OracleUser     = "ora_user"
@@ -50,10 +51,20 @@ object RecreateTable {
     val spark = SparkSession.builder().getOrCreate()
     def count(q: String) = spark.sql(q).first().getLong(0)
 
+    // 검수: 두 쿼리 결과가 row 단위로 같은가 — 건수 일치 + 차집합(EXCEPT ALL) 0 이면 중복까지 포함해 동일
+    def assertSame(name: String, a: String, b: String): Unit = {
+      val (ca, cb, diff) = (count(s"SELECT COUNT(*) FROM ($a)"), count(s"SELECT COUNT(*) FROM ($b)"), count(s"SELECT COUNT(*) FROM ($a EXCEPT ALL $b)"))
+      println(s"[$name] $ca 건 vs $cb 건, 차이 $diff 건")
+      require(ca == cb && diff == 0, s"[$name] 정합성 실패")
+    }
+    def assertZero(name: String, q: String): Unit = {
+      val n = count(q); println(s"[$name] $n 건"); require(n == 0, s"[$name] 정합성 실패")
+    }
+
     args(0) match {
       case "backup" =>
-        spark.sql(s"CREATE TABLE $Tmp USING iceberg AS SELECT * FROM $Tbl")
-        println(s"원본 ${count(s"SELECT COUNT(*) FROM $Tbl")} 건 / 임시 ${count(s"SELECT COUNT(*) FROM $Tmp")} 건")
+        spark.sql(s"CREATE TABLE $Tmp USING iceberg AS SELECT * FROM $Tbl WHERE $Where")
+        assertSame("backup 원본 vs 임시", s"SELECT * FROM $Tbl WHERE $Where", s"SELECT * FROM $Tmp WHERE $Where")
 
       case "load" =>
         val fmt = DateTimeFormatter.ofPattern("yyyyMMdd")
@@ -68,27 +79,32 @@ object RecreateTable {
         props.setProperty("fetchsize", "10000")
         spark.read.jdbc(OracleUrl, OracleTable, chunks, props).cache().createOrReplaceTempView("ora")
 
-        // 사전 확인 — 키 중복이 있으면 조인으로 행이 불어난다. unmatched 는 '' 로 채워진다
-        println(s"ora ${count("SELECT COUNT(*) FROM ora")} 건 / 키 distinct ${count("SELECT COUNT(*) FROM (SELECT DISTINCT key1, key2 FROM ora)")} 건")
-        println(s"unmatched ${count(s"SELECT COUNT(*) FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE o.tmp_id IS NULL")} 건")
+        // 사전 검수: 키가 중복이면 조인으로 행이 불어난다. unmatched 는 '' 로 채워진다
+        assertZero("ora 키 중복", "SELECT COUNT(*) FROM (SELECT key1, key2 FROM ora GROUP BY key1, key2 HAVING COUNT(*) > 1)")
+        println(s"[unmatched] ${count(s"SELECT COUNT(*) FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE $Where AND o.tmp_id IS NULL")} 건 → '' 로 채워진다")
 
         // 신규 테이블 컬럼 순서대로 SELECT 생성. tmp_id 만 ora 에서, 나머지는 임시 테이블에서
         val cols = spark.table(Tbl).columns.map {
           case "tmp_id" => "COALESCE(o.tmp_id, '') AS tmp_id"
           case c        => s"t.$c"
         }.mkString(", ")
-        spark.sql(s"INSERT INTO $Tbl SELECT $cols FROM $Tmp t LEFT JOIN ora o ON $JoinOn")
+        spark.sql(s"INSERT INTO $Tbl SELECT $cols FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE $Where")
 
-        println(s"임시 ${count(s"SELECT COUNT(*) FROM $Tmp")} 건 / 신규 ${count(s"SELECT COUNT(*) FROM $Tbl")} 건 / tmp_id='' ${count(s"SELECT COUNT(*) FROM $Tbl WHERE tmp_id = ''")} 건")
+        // 사후 검수: ① 기존 컬럼은 한 row 도 안 바뀌었다  ② tmp_id 는 매칭되면 Oracle 값, 아니면 ''
+        val orig = spark.table(Tmp).columns.mkString(", ")
+        assertSame("load 신규 vs 임시", s"SELECT $orig FROM $Tbl WHERE $Where", s"SELECT $orig FROM $Tmp WHERE $Where")
+        assertZero("tmp_id 불일치", s"SELECT COUNT(*) FROM $Tbl t LEFT JOIN ora o ON $JoinOn WHERE $Where AND NOT (t.tmp_id <=> COALESCE(o.tmp_id, ''))")
     }
     spark.stop()
   }
 }
 ```
 
+- **검수는 `EXCEPT ALL` 전수 비교다.** `A EXCEPT ALL B`는 A에는 있고 B에는 없는 row를 중복 개수까지 세어 돌려준다. 건수가 같고 차집합이 0이면 두 테이블은 row 단위로 완전히 같다. 양쪽을 전부 읽어 모든 컬럼으로 대조하므로 전수조사이며, array 컬럼과 NaN도 정확히 비교된다. 조건이 하나라도 어긋나면 `require`로 즉시 실패한다
+- Iceberg 읽기에는 파티션 키 조건이 필수라 모든 조회에 `Where`(`ts` 하한)를 붙인다. 전수 대상이므로 전체 범위다
 - Oracle에는 SELECT만 나간다. `createOrReplaceTempView`는 Spark 세션 안의 이름 등록일 뿐이다
 - Oracle 조회는 `dt` 범위를 `ChunkDays` 단위로 잘라 chunk마다 커넥션 하나로 병렬 조회한다 (동시 커넥션 수 = executor 코어 합계). `dt`가 `YYYYMMDD`에 밀리초까지 붙은 문자열이라 `>=`/`<`로 잘라야 경계가 빠지지 않는다. 7월 이전은 파티션이 없어 chunk마다 같은 구간을 다시 훑으므로 느리지만 결과는 같다
-- Oracle 컬럼명은 대문자로 오지만 Spark SQL은 대소문자를 구분하지 않는다. `tmp_id`가 VARCHAR2가 아니면 `OracleQuery`에서 `TO_CHAR(...) AS tmp_id`
+- Oracle 컬럼명은 대문자로 오지만 Spark SQL은 대소문자를 구분하지 않는다. `tmp_id`가 VARCHAR2가 아니면 `OracleTable`에서 `TO_CHAR(...) AS tmp_id`
 - 실행은 기존 SparkApplication에서 `mainClass: RecreateTable`, `arguments: ["backup"]` / `["load"]`만 바꾼다. `restartPolicy`는 `Never`로 (재시도되면 안 된다)
 - Oracle 방화벽은 driver·executor 양쪽에 열려 있어야 한다 (JDBC 읽기는 executor에서 실행된다)
 
@@ -97,7 +113,7 @@ object RecreateTable {
 ### 1. `backup`
 
 ```
-원본 N 건 / 임시 N 건      ← 같아야 한다
+[backup 원본 vs 임시] N 건 vs N 건, 차이 0 건      ← 건수 일치 + 차집합 0. 아니면 앱이 실패한다
 ```
 
 ### 2. spark-sql 수동
@@ -126,19 +142,20 @@ ALTER TABLE iceberg.db.table_a WRITE ORDERED BY sort_a, sort_b;   -- Sort Order 
 ### 3. `load`
 
 ```
-ora M 건 / 키 distinct M 건          ← 같아야 한다 (다르면 Oracle 쿼리를 좁히고 다시)
-unmatched U 건                       ← '' 로 채워질 건수. 납득되면 진행 (INSERT 전 출력)
-임시 N 건 / 신규 N 건 / tmp_id='' U 건  ← N 일치, U 일치
+[ora 키 중복] 0 건                              ← 0 이 아니면 실패. Oracle 쿼리를 좁히고 다시
+[unmatched] U 건 → '' 로 채워진다               ← 납득되는 수인지 본다 (INSERT 전 출력)
+[load 신규 vs 임시] N 건 vs N 건, 차이 0 건      ← 기존 컬럼은 한 row 도 안 바뀌었다
+[tmp_id 불일치] 0 건                            ← 매칭 row 는 Oracle 값, 나머지는 '' 로 정확히 들어갔다
 ```
 
-INSERT는 Iceberg 단일 커밋이라 중간에 실패해도 신규 테이블은 비어 있다. 다시 돌리면 된다.
+INSERT는 Iceberg 단일 커밋이라 중간에 실패해도 신규 테이블은 비어 있다. 다시 돌리면 된다. 사후 검수에서 실패하면 신규 테이블을 `DROP ... PURGE` 하고 CREATE부터 다시 한다.
 
 ### 4. 마무리
 
 ```sql
 -- Trino
 SHOW CREATE TABLE iceberg.db.table_a;                          -- tmp_id 위치·NOT NULL
-SELECT count(*) FROM iceberg.db.table_a WHERE tmp_id = '';     -- == U
+SELECT count(*) FROM iceberg.db.table_a WHERE ts >= TIMESTAMP '1970-01-01' AND tmp_id = '';   -- == U
 
 -- 며칠 뒤
 DROP TABLE iceberg.db.table_a_tmp PURGE;
