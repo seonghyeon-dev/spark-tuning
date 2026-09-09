@@ -27,6 +27,8 @@ Iceberg는 비어 있지 않은 테이블에 NOT NULL 컬럼을 추가할 수 �
 ```
 
 ```scala title="RecreateTable.scala"
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import org.apache.spark.sql.SparkSession
 
 object RecreateTable {
@@ -36,8 +38,13 @@ object RecreateTable {
   val OracleUrl      = "jdbc:oracle:thin:@//oracle-host:1521/SERVICE"
   val OracleUser     = "ora_user"
   val OraclePassword = "ora_password"
-  val OracleQuery    = "(SELECT key1, key2, tmp_id FROM ORA_SCHEMA.ORA_TABLE) t"
+  val OracleTable    = "(SELECT key1, key2, tmp_id, dt FROM ORA_SCHEMA.ORA_TABLE) t"
   val JoinOn         = "t.key1 = o.key1 AND t.key2 = o.key2"
+
+  // dt('YYYYMMDD...') 범위를 ChunkDays 단위로 잘라 chunk 마다 커넥션 하나로 병렬 조회
+  val DtFrom = "20260512"
+  val DtTo   = "20260909"
+  val ChunkDays = 7
 
   def main(args: Array[String]): Unit = {
     val spark = SparkSession.builder().getOrCreate()
@@ -49,10 +56,17 @@ object RecreateTable {
         println(s"원본 ${count(s"SELECT COUNT(*) FROM $Tbl")} 건 / 임시 ${count(s"SELECT COUNT(*) FROM $Tmp")} 건")
 
       case "load" =>
-        spark.read.format("jdbc")
-          .option("url", OracleUrl).option("user", OracleUser).option("password", OraclePassword)
-          .option("driver", "oracle.jdbc.OracleDriver").option("dbtable", OracleQuery).option("fetchsize", "10000")
-          .load().cache().createOrReplaceTempView("ora")
+        val fmt = DateTimeFormatter.ofPattern("yyyyMMdd")
+        val chunks = Iterator.iterate(LocalDate.parse(DtFrom, fmt))(_.plusDays(ChunkDays))
+          .takeWhile(!_.isAfter(LocalDate.parse(DtTo, fmt)))
+          .map(d => s"dt >= '${d.format(fmt)}' AND dt < '${d.plusDays(ChunkDays).format(fmt)}'").toArray
+
+        val props = new java.util.Properties()
+        props.setProperty("user", OracleUser)
+        props.setProperty("password", OraclePassword)
+        props.setProperty("driver", "oracle.jdbc.OracleDriver")
+        props.setProperty("fetchsize", "10000")
+        spark.read.jdbc(OracleUrl, OracleTable, chunks, props).cache().createOrReplaceTempView("ora")
 
         // 사전 확인 — 키 중복이 있으면 조인으로 행이 불어난다. unmatched 는 '' 로 채워진다
         println(s"ora ${count("SELECT COUNT(*) FROM ora")} 건 / 키 distinct ${count("SELECT COUNT(*) FROM (SELECT DISTINCT key1, key2 FROM ora)")} 건")
@@ -73,6 +87,7 @@ object RecreateTable {
 ```
 
 - Oracle에는 SELECT만 나간다. `createOrReplaceTempView`는 Spark 세션 안의 이름 등록일 뿐이다
+- Oracle 조회는 `dt` 범위를 `ChunkDays` 단위로 잘라 chunk마다 커넥션 하나로 병렬 조회한다 (동시 커넥션 수 = executor 코어 합계). `dt`가 `YYYYMMDD`에 밀리초까지 붙은 문자열이라 `>=`/`<`로 잘라야 경계가 빠지지 않는다. 7월 이전은 파티션이 없어 chunk마다 같은 구간을 다시 훑으므로 느리지만 결과는 같다
 - Oracle 컬럼명은 대문자로 오지만 Spark SQL은 대소문자를 구분하지 않는다. `tmp_id`가 VARCHAR2가 아니면 `OracleQuery`에서 `TO_CHAR(...) AS tmp_id`
 - 실행은 기존 SparkApplication에서 `mainClass: RecreateTable`, `arguments: ["backup"]` / `["load"]`만 바꾼다. `restartPolicy`는 `Never`로 (재시도되면 안 된다)
 - Oracle 방화벽은 driver·executor 양쪽에 열려 있어야 한다 (JDBC 읽기는 executor에서 실행된다)
