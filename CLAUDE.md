@@ -264,6 +264,19 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **컬럼 명명 통일 완료 (2026-09-05)**: 전 문서에 `par_*`/`sort_*`/`col_*` 규칙 적용. 변환표는 공통 컨텍스트의 대상 테이블 절과 작업 8 문서 §1.3
 - **미확인**: `par_a` 분포가 `schema/` 문서(2026-03-18)와 순위가 다른 원인, `iceberg.query-partition-filter-required` 실제 설정값, `$partitions` 대조(`date(ts)` 1,059 파일 = 해당 날 파티션 `file_count` 합계인지 — `col_b` 통계 개입 배제용, 낮음), 규모 증가 시 manifest 전수 조회가 비용으로 드러나는지(판정 지표 부재로 보류)
 
+## 작업 9: Iceberg 테이블 재생성 + `tmp_id`(NOT NULL) 추가 — 코드·매니페스트 작성 완료, 설정값 대기
+
+- **산출물**: `pipeline/recreate-table/` — `README.md`(runbook), `build.sbt`, `src/main/scala/RecreateTable.scala`, `k8s/recreate-table-sparkapp.yaml`
+- **상태**: sbt 프로젝트 + 앱 + SparkApplication 매니페스트 작성, `sbt assembly` 통과(fat jar 7.4MB = 앱 + ojdbc8). **테이블명·컬럼·Oracle 접속정보는 미기입** — 설정 블록의 `TODO` 채운 뒤 `check` → `run`
+- **배경**: Iceberg는 비어 있지 않은 테이블에 required 컬럼 추가를 거부한다. Spark `ADD COLUMN ... NOT NULL`·`SET NOT NULL`·`DEFAULT`(1.11.0 기준 미지원), Trino `NOT NULL`·`AFTER`·`SET NOT NULL` 전부 불가 → **백업 → `DROP ... PURGE` → `CREATE` → `INSERT`가 유일한 방법**. 새 테이블은 snapshot 이력·UUID 초기화
+- **값 출처**: Oracle을 2개 키로 LEFT JOIN, 미매칭은 `''`. Oracle에는 SELECT만(jdbc temp view는 세션 내 이름 등록일 뿐). 접속정보는 1회성이라 코드 하드코딩 — **커밋 금지**
+- **버전**: 운영 스택 실측에 맞춤 — Scala 2.12.18 / Spark 3.5.8(provided) / Iceberg 1.10.1(provided) / ojdbc8 23.9(fat jar). 이미지 변경·`--jars` 불필요 (배치 원칙 작업 6 §5.0.5)
+- **실행 모드**: `check`(쓰기 없음 — Oracle 읽기·키 중복·unmatched 집계·DDL↔SELECT 정합성) / `run`(전체) / `resume`(4·5단계 실패 후 백업으로 재개). **4단계 DROP부터 롤백 없음** — 0~3단계 `require`가 안전장치, `run` 전 `check` 필수
+- **DROP 전 자동 검사**: `CreateDdl` 파싱 → `tmp_id` 존재·NOT NULL, INSERT SELECT와 컬럼 이름·순서 일치, 원본 컬럼 누락/추가 없음, `gc.enabled≠false`(PURGE 거부 방지), `ora` 키 중복 0건. 타입은 나란히 출력해 눈으로 대조
+- **사후 검증**: 새 COUNT == 백업 COUNT, `tmp_id = ''` == unmatched, `tmp_id IS NULL` == 0
+- **주의**: `restartPolicy: Never` 필수 · JDBC 읽기는 executor에서 실행되므로 Oracle 방화벽은 driver·executor 양쪽 · 백업 CTAS는 파티션·Sort Order 없는 평면 테이블(INSERT 시 새 테이블 설정으로 재분배되므로 무관) · Sort Order는 CREATE에 못 쓰므로 `postCreateDdls`의 `WRITE ORDERED BY` · 재처리 DAG의 `.snapshots` batch_id 영수증도 사라짐 · 며칠 뒤 백업 `DROP ... PURGE`(PURGE 없으면 파일 잔존)
+- **다음 단계**: 테이블명/컬럼/Oracle 정보 확보 → 설정 블록 채우기 → Airflow 쓰기 DAG 중지 → `check` → `run` → Trino 확인 → DAG 재개
+
 ## 파일 구조
 
 ```
@@ -300,6 +313,11 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
     ├── compaction-executor-sizing-design.md  # Compaction executor 자원 할당 설계 (DA+ratio)
     ├── dags/
     │   └── iceberg_reprocess.py        # 재처리 DAG 정의 (신규 파일은 이것 하나)
+    ├── recreate-table/                 # 테이블 재생성 + tmp_id(NOT NULL) 추가 (1회성 Scala 앱, 작업 9)
+    │   ├── README.md                   # runbook (절차·안전장치·실패 시 조치)
+    │   ├── build.sbt                   # Scala 2.12 / Spark 3.5.8 / Iceberg 1.10.1 / ojdbc8
+    │   ├── src/main/scala/RecreateTable.scala
+    │   └── k8s/recreate-table-sparkapp.yaml   # SparkApplication (카탈로그·S3A conf)
     └── examples/
         ├── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
         ├── compaction_dag_example.py          # Compaction DAG 변경(tables 필터 = mapped task) 예시

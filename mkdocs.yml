@@ -117,3 +117,4 @@ nav:
       - 재처리 DAG 설계: pipeline/reprocessing-dag-design.md
       - 재처리 DAG 처리 흐름 (보고용): pipeline/reprocess-flow.md
       - Compaction executor 자원 할당 설계: pipeline/compaction-executor-sizing-design.md
+      - 테이블 재생성 + tmp_id 추가 (runbook): pipeline/recreate-table/README.md
