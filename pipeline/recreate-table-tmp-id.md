@@ -2,7 +2,7 @@
 
 Iceberg는 비어 있지 않은 테이블에 NOT NULL 컬럼을 추가할 수 없다 (Spark `ADD COLUMN ... NOT NULL`, `SET NOT NULL`, `DEFAULT`, Trino 전부 불가). 그래서 **임시 테이블로 복사 → DROP → CREATE → 조인해서 INSERT** 로 다시 만든다.
 
-이름은 전부 자리표시자다: `iceberg.db.table_a`, `table_a_tmp`, `key1`/`key2`, `ORA_SCHEMA.ORA_TABLE`.
+이름은 전부 자리표시자다: `iceberg.db`, `table_a`, `key1`/`key2`, `ORA_SCHEMA.ORA_TABLE`. 테이블명은 실행 인자로 받으므로 여러 테이블에 같은 코드를 쓴다.
 
 ## 절차
 
@@ -32,8 +32,7 @@ import java.time.format.DateTimeFormatter
 import org.apache.spark.sql.SparkSession
 
 object RecreateTable {
-  val Tbl = "iceberg.db.table_a"        // 재생성 대상 (backup 의 원본, load 의 목적지)
-  val Tmp = "iceberg.db.table_a_tmp"    // 임시 테이블
+  val Db = "iceberg.db"                        // 카탈로그.DB — 테이블명은 args 로 받는다
   val Where = "ts >= TIMESTAMP '1970-01-01'"   // Iceberg 읽기엔 파티션 키 조건 필수. 전수 대상이라 전체 범위
 
   val OracleUrl      = "jdbc:oracle:thin:@//oracle-host:1521/SERVICE"
@@ -47,7 +46,12 @@ object RecreateTable {
   val DtTo   = "20260909"
   val ChunkDays = 7
 
+  // 실행: RecreateTable <backup|load> <테이블명>
   def main(args: Array[String]): Unit = {
+    val mode = args(0)
+    val Tbl  = s"$Db.${args(1)}"               // 재생성 대상 (backup 의 원본, load 의 목적지)
+    val Tmp  = s"${Tbl}_tmp"                   // 임시 테이블
+
     val spark = SparkSession.builder().getOrCreate()
     def count(q: String) = spark.sql(q).first().getLong(0)
 
@@ -61,7 +65,7 @@ object RecreateTable {
       val n = count(q); println(s"[$name] $n 건"); require(n == 0, s"[$name] 정합성 실패")
     }
 
-    args(0) match {
+    mode match {
       case "backup" =>
         spark.sql(s"CREATE TABLE $Tmp USING iceberg AS SELECT * FROM $Tbl WHERE $Where")
         assertSame("backup 원본 vs 임시", s"SELECT * FROM $Tbl WHERE $Where", s"SELECT * FROM $Tmp WHERE $Where")
@@ -105,7 +109,7 @@ object RecreateTable {
 - Oracle에는 SELECT만 나간다. `createOrReplaceTempView`는 Spark 세션 안의 이름 등록일 뿐이다
 - Oracle 조회는 `dt` 범위를 `ChunkDays` 단위로 잘라 chunk마다 커넥션 하나로 병렬 조회한다 (동시 커넥션 수 = executor 코어 합계). `dt`가 `YYYYMMDD`에 밀리초까지 붙은 문자열이라 `>=`/`<`로 잘라야 경계가 빠지지 않는다. 7월 이전은 파티션이 없어 chunk마다 같은 구간을 다시 훑으므로 느리지만 결과는 같다
 - Oracle 컬럼명은 대문자로 오지만 Spark SQL은 대소문자를 구분하지 않는다. `tmp_id`가 VARCHAR2가 아니면 `OracleTable`에서 `TO_CHAR(...) AS tmp_id`
-- 실행은 기존 SparkApplication에서 `mainClass: RecreateTable`, `arguments: ["backup"]` / `["load"]`만 바꾼다. `restartPolicy`는 `Never`로 (재시도되면 안 된다)
+- 실행은 기존 SparkApplication에서 `mainClass: RecreateTable`, `arguments: ["backup", "table_a"]` / `["load", "table_a"]`만 바꾼다. 테이블명은 인자로 받고 임시 테이블은 `<테이블명>_tmp`다 — 다른 테이블도 같은 코드로 처리한다. `restartPolicy`는 `Never`로 (재시도되면 안 된다)
 - Oracle 방화벽은 driver·executor 양쪽에 열려 있어야 한다 (JDBC 읽기는 executor에서 실행된다)
 
 ## 실행
