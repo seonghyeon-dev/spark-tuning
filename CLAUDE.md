@@ -266,15 +266,12 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 
 ## 작업 9: Iceberg 테이블 재생성 + `tmp_id`(NOT NULL) 추가 — 절차서 작성 완료, 이름·Oracle 정보는 사용자 교체
 
-- **산출물**: `pipeline/recreate-table-tmp-id.md` — **단일 절차서** (빌드 구성·앱 코드·SparkApplication·수동 DDL·단계별 명령과 기대 로그·실패 시 조치를 코드블록으로 한 문서에). 별도 소스 파일은 두지 않는다 (1회성 작업이라 참고 편의 우선 — 2026-09-09 사용자 요청)
-- **상태**: 코드는 Scala 2.12.18 / Spark 3.5.8 / Iceberg 1.10.1 조합으로 `sbt assembly` 컴파일 검증 완료(경고 0, fat jar 7.4MB = 앱 + ojdbc8). **이름은 전부 자리표시자**(`iceberg.db.table_a`, `table_a_tmp`, `key1`/`key2`, `ORA_SCHEMA.ORA_TABLE`) — 사용자가 직접 교체. 신규 컬럼은 `STRING NOT NULL`만 확정
-- **배경**: Iceberg는 비어 있지 않은 테이블에 required 컬럼 추가를 거부한다. Spark `ADD COLUMN ... NOT NULL`·`SET NOT NULL`·`DEFAULT`(1.11.0 기준 미지원), Trino `NOT NULL`·`AFTER`·`SET NOT NULL` 전부 불가 → **임시 테이블 복사 → `DROP ... PURGE` → `CREATE` → 조인 `INSERT`가 유일한 방법**. 새 테이블은 snapshot 이력·UUID 초기화
-- **역할 분담**: **DROP/CREATE는 앱이 아니라 spark-sql 수동**(리스크 판단). 앱은 `backup`(원본 → 임시 CTAS + 건수 require + `SHOW CREATE TABLE` 로그) / `check`(쓰기 없음 — Oracle 읽기·키 중복 require·unmatched 집계) / `load`(임시 LEFT JOIN Oracle → 신규 INSERT → 검증) 3개 모드
-- **Iceberg 접근은 기존 Job 그대로, 신규는 Oracle 접근뿐** — 기존 SparkApplication 스펙을 복사하고 mainClass/jar/arguments/`restartPolicy: Never`만 바꾼다. ojdbc8 23.9는 fat jar에 포함(이미지·`--jars` 변경 없음). 기존 앱(Maven)에 합칠 땐 pom 의존성 1개만. Oracle에는 SELECT만(jdbc temp view는 세션 내 이름 등록일 뿐). 접속정보는 코드 하드코딩 — **커밋 금지**
-- **컬럼 목록은 설정하지 않는다** — `load`가 신규 테이블 스키마를 읽어 그 순서대로 SELECT를 만들고 `tmp_id` 자리에만 `COALESCE(CAST(o.tmp_id AS STRING), '')`. 설정은 테이블 이름·Oracle URL/계정/쿼리·`JoinKeys`뿐
-- **`load`의 안전장치**: 신규 COUNT == 0(원본 미삭제·중복 load 차단), `tmp_id` 존재·`string`·NOT NULL, 신규 컬럼(tmp_id 제외) == 임시 컬럼(누락·추가 차단), `ora` 키 중복 0. 사후: 신규 COUNT == 임시 COUNT, `tmp_id = ''` == unmatched, `tmp_id IS NULL` == 0
-- **주의**: `restartPolicy: Never`(모드가 멱등 아님) · JDBC 읽기는 executor에서 실행되므로 Oracle 방화벽은 driver·executor 양쪽 · 임시 테이블은 파티션·Sort Order 없는 평면 CTAS(load 시 신규 설정으로 재분배되므로 무관, rename 재사용 금지) · Sort Order는 CREATE에 못 쓰므로 `WRITE ORDERED BY` 별도 · `gc.enabled=false`면 PURGE 거부 · 재처리 DAG의 `.snapshots` batch_id 영수증 소실 · 며칠 뒤 임시 `DROP ... PURGE`
-- **다음 단계**: 자리표시자 교체 → Airflow 쓰기 DAG 중지 → `backup` → `check` → 수동 DDL → `load` → Trino 확인 → DAG 재개
+- **산출물**: `pipeline/recreate-table-tmp-id.md` — 단일 절차서. 코드(약 40줄)·수동 DDL·실행 순서·기대 출력을 한 문서에. **의도적으로 짧게 유지한다** (2026-09-09 사용자 요청: 1회성 작업이라 코드·설명이 많으면 확인이 어렵다 — 검증 로직·모드·매니페스트를 늘리지 말 것)
+- **배경**: Iceberg는 비어 있지 않은 테이블에 required 컬럼 추가를 거부한다 (Spark `ADD COLUMN ... NOT NULL`·`SET NOT NULL`·`DEFAULT`, Trino 전부 불가) → 임시 테이블 복사 → `DROP ... PURGE` → `CREATE` → 조인 `INSERT`. 새 테이블은 snapshot 이력·UUID 초기화
+- **역할 분담**: DROP/CREATE는 spark-sql 수동. 앱은 `backup`(원본 → 임시 CTAS) / `load`(임시 LEFT JOIN Oracle → 신규 INSERT) 두 모드, 검증은 건수 출력으로 사용자가 대조. INSERT 컬럼 목록은 신규 테이블 스키마에서 자동 생성 — 설정은 테이블 이름·Oracle 접속/쿼리·조인 조건뿐
+- **신규 요소는 Oracle JDBC뿐** — 기존 앱에 클래스 1개 + pom에 ojdbc8 의존성 1개. Iceberg 접근·SparkApplication은 기존 것 그대로(mainClass/arguments/`restartPolicy: Never`만). Oracle에는 SELECT만. 접속정보는 코드 하드코딩 — **커밋 금지**
+- **상태**: 코드는 Scala 2.12.18 / Spark 3.5.8 / Iceberg 1.10.1로 컴파일 검증 완료. 이름은 전부 자리표시자(`iceberg.db.table_a`, `table_a_tmp`, `key1`/`key2`, `ORA_SCHEMA.ORA_TABLE`). 신규 컬럼은 `STRING NOT NULL`만 확정
+- **주의**: `gc.enabled=false`면 PURGE 거부 · JDBC 읽기는 executor에서 실행되므로 Oracle 방화벽은 driver·executor 양쪽 · 임시 테이블은 파티션·Sort Order 없는 CTAS(rename 재사용 금지) · Sort Order는 `WRITE ORDERED BY` 별도 · 재처리 DAG의 `.snapshots` batch_id 영수증 소실
 
 ## 파일 구조
 
@@ -312,7 +309,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
     ├── compaction-executor-sizing-design.md  # Compaction executor 자원 할당 설계 (DA+ratio)
     ├── dags/
     │   └── iceberg_reprocess.py        # 재처리 DAG 정의 (신규 파일은 이것 하나)
-    ├── recreate-table-tmp-id.md        # 테이블 재생성 + tmp_id(NOT NULL) 추가 절차서 (코드·DDL·매니페스트 포함, 작업 9)
+    ├── recreate-table-tmp-id.md        # 테이블 재생성 + tmp_id(NOT NULL) 추가 절차서 (코드·DDL 포함, 작업 9)
     └── examples/
         ├── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
         ├── compaction_dag_example.py          # Compaction DAG 변경(tables 필터 = mapped task) 예시
