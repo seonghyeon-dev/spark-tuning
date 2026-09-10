@@ -83,9 +83,10 @@ object RecreateTable {
         props.setProperty("fetchsize", "10000")
         spark.read.jdbc(OracleUrl, OracleTable, chunks, props).cache().createOrReplaceTempView("ora")
 
-        // 사전 검수: 키가 중복이면 조인으로 행이 불어난다. unmatched 는 '' 로 채워진다
+        // 사전 검수 ①: Oracle 에 같은 키가 2건 이상이면 조인으로 row 가 불어난다 → 0 이어야 한다
         assertZero("ora 키 중복", "SELECT COUNT(*) FROM (SELECT key1, key2 FROM ora GROUP BY key1, key2 HAVING COUNT(*) > 1)")
-        println(s"[unmatched] ${count(s"SELECT COUNT(*) FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE $Where AND o.tmp_id IS NULL")} 건 → '' 로 채워진다")
+        // 사전 확인 ②: Oracle 에 키가 없는 row 는 tmp_id 를 못 받으므로 '' 가 들어간다. 그 건수를 INSERT 전에 보여 준다
+        println(s"[Oracle 에 키 없는 row] ${count(s"SELECT COUNT(*) FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE $Where AND o.tmp_id IS NULL")} 건 → tmp_id = ''")
 
         // 신규 테이블 컬럼 순서대로 SELECT 생성. tmp_id 만 ora 에서, 나머지는 임시 테이블에서
         val cols = spark.table(Tbl).columns.map {
@@ -96,7 +97,7 @@ object RecreateTable {
 
         // 사후 검수 ①: 신규 테이블에서 tmp_id 를 뺀 나머지 컬럼만 보면 임시 테이블과 완전히 같아야 한다
         //             (조인·INSERT 가 기존 데이터를 바꾸거나 누락·중복시키지 않았는지)
-        // 사후 검수 ②: tmp_id 는 Oracle 에 매칭된 row 면 Oracle 값, 아니면 '' 여야 한다
+        // 사후 검수 ②: tmp_id 는 Oracle 에 키가 있는 row 면 Oracle 값, 없는 row 면 '' 여야 한다
         val orig = spark.table(Tmp).columns.mkString(", ")
         assertSame("load 신규 vs 임시", s"SELECT $orig FROM $Tbl WHERE $Where", s"SELECT $orig FROM $Tmp WHERE $Where")
         assertZero("tmp_id 불일치", s"SELECT COUNT(*) FROM $Tbl t LEFT JOIN ora o ON $JoinOn WHERE $Where AND NOT (t.tmp_id <=> COALESCE(o.tmp_id, ''))")
@@ -149,9 +150,9 @@ ALTER TABLE iceberg.db.table_a WRITE ORDERED BY sort_a, sort_b;   -- Sort Order 
 
 ```
 [ora 키 중복] 0 건                              ← 0 이 아니면 실패. Oracle 쿼리를 좁히고 다시
-[unmatched] U 건 → '' 로 채워진다               ← 납득되는 수인지 본다 (INSERT 전 출력)
+[Oracle 에 키 없는 row] U 건 → tmp_id = ''       ← Oracle 에 키가 없어 '' 가 들어갈 row 수. 납득되는 수인지 본다 (INSERT 전 출력)
 [load 신규 vs 임시] N 건 vs N 건, 차이 0 건      ← tmp_id 를 뺀 나머지 컬럼은 임시 테이블과 완전히 같다 (누락·중복·값 변경 없음)
-[tmp_id 불일치] 0 건                            ← tmp_id 는 매칭 row 면 Oracle 값, 아니면 '' 이다
+[tmp_id 불일치] 0 건                            ← tmp_id 는 Oracle 에 키가 있는 row 면 Oracle 값, 없는 row 면 '' 이다
 ```
 
 INSERT는 Iceberg 단일 커밋이라 중간에 실패해도 신규 테이블은 비어 있다. 다시 돌리면 된다. 사후 검수에서 실패하면 신규 테이블을 `DROP ... PURGE` 하고 CREATE부터 다시 한다.
