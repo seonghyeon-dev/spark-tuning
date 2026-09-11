@@ -71,6 +71,8 @@ object RecreateTable {
         assertSame("backup 원본 vs 임시", s"SELECT * FROM $Tbl WHERE $Where", s"SELECT * FROM $Tmp WHERE $Where")
 
       case "load" =>
+        require(spark.table(Tbl).columns.exists(_.equalsIgnoreCase("tmp_id")), s"$Tbl 에 tmp_id 컬럼이 없다 — 수동 DROP/CREATE 먼저")
+
         val fmt = DateTimeFormatter.ofPattern("yyyyMMdd")
         val chunks = Iterator.iterate(LocalDate.parse(DtFrom, fmt))(_.plusDays(ChunkDays))
           .takeWhile(!_.isAfter(LocalDate.parse(DtTo, fmt)))
@@ -89,9 +91,10 @@ object RecreateTable {
         println(s"[Oracle 에 키 없는 row] ${count(s"SELECT COUNT(*) FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE $Where AND o.tmp_id IS NULL")} 건 → tmp_id = ''")
 
         // 신규 테이블 컬럼 순서대로 SELECT 생성. tmp_id 만 ora 에서, 나머지는 임시 테이블에서
+        // (컬럼명은 DDL 에 쓴 대소문자 그대로 오므로 equalsIgnoreCase 로 비교)
         val cols = spark.table(Tbl).columns.map {
-          case "tmp_id" => "COALESCE(o.tmp_id, '') AS tmp_id"
-          case c        => s"t.$c"
+          case c if c.equalsIgnoreCase("tmp_id") => s"COALESCE(o.tmp_id, '') AS $c"
+          case c                                 => s"t.$c"
         }.mkString(", ")
         spark.sql(s"INSERT INTO $Tbl SELECT $cols FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE $Where")
 
