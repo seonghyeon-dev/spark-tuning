@@ -275,6 +275,9 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **신규 요소는 Oracle JDBC뿐** — 기존 앱에 클래스 1개 + pom에 ojdbc8 의존성 1개. Iceberg 접근·SparkApplication은 기존 것 그대로(mainClass/arguments/`restartPolicy: Never`만). Oracle에는 SELECT만. 접속정보는 코드 하드코딩 — **커밋 금지**
 - **상태**: 코드는 Scala 2.12.18 / Spark 3.5.8 / Iceberg 1.10.1로 컴파일 검증 완료. 이름은 전부 자리표시자(`iceberg.db.table_a`, `table_a_tmp`, `key1`/`key2`, `ORA_SCHEMA.ORA_TABLE`). 신규 컬럼은 `STRING NOT NULL`만 확정
 - **주의**: `gc.enabled=false`면 PURGE 거부 · JDBC 읽기는 executor에서 실행되므로 Oracle 방화벽은 driver·executor 양쪽 · 임시 테이블은 파티션·Sort Order 없는 CTAS(rename 재사용 금지) · Sort Order는 `WRITE ORDERED BY` 별도 · 재처리 DAG의 `.snapshots` batch_id 영수증 소실
+- **진행 상태 (2026-09-11 세션 종료 시점)**: 개발 클러스터에서 `backup` 통과(건수 일치). `load`는 `[Oracle 에 키 없는 row]` 로그 직후 `AnalysisException UNRESOLVED_COLUMN t.tmp_id`로 실패 — **원인 미확정**. 유력 가설: 개발의 신규 테이블이 `tmp_id`를 넣은 DDL로 재생성되지 않아 INSERT·`load 신규 vs 임시` 검수는 통과하고 마지막 `tmp_id 불일치` 쿼리(`FROM 신규 t ... t.tmp_id`)에서 난 것. 확인 방법: 에러 직전 `[load 신규 vs 임시]` 로그 유무, `DESCRIBE` 로 `tmp_id` 존재. Oracle 컬럼명 대문자·Iceberg 소문자 조합은 문제 아님(Spark SQL 대소문자 무시, 직전 쿼리 `o.tmp_id` 성공이 증거). 방어 2건 반영(PR #64): `load` 시작 시 `tmp_id` 존재 `require`, 컬럼 매칭 `equalsIgnoreCase`
+- **사용자 결정 (유지할 것)**: 검수는 별도 모드로 빼지 않고 `backup`/`load` 안에 둔다(제안했으나 "그냥 냅둬") · 절차서는 짧게, 코드 변경은 "변경 전/후" 대비로 정리해서 전달 · 코드 컴파일 확인은 scratchpad에 sbt 런처(Maven Central `sbt-launch-1.10.7.jar`) + `spark-sql`/`iceberg-spark-runtime-3.5_2.12` provided로 했으며 세션 종료 시 사라지므로 새 세션에서는 재구성 필요
+- **다음 단계**: 개발 `load` 에러 원인 확정 → 개발에서 backup → 수동 DDL → load 전 구간 통과 → 운영 적용 (Airflow 중지 → backup → DDL → load → Trino 확인 → 재개 → 며칠 뒤 임시 `DROP ... PURGE`) → 다른 테이블에 같은 절차 반복
 
 ## 파일 구조
 
