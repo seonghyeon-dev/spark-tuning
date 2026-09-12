@@ -14,6 +14,8 @@ exclude_docs: |
   site/
   mkdocs.yml
   requirements-docs.txt
+  # intent.md · spec.md · plan.md 는 내부 작업 기록 — 저장소에는 두되 사이트에는 게시하지 않는다
+  /intent/
 
 # 문서 간 링크·페이지 내 앵커가 깨지면 빌드 로그에 경고로 남긴다
 validation:
