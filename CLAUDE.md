@@ -266,6 +266,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 
 ## 작업 9: Iceberg 테이블 재생성 + `tmp_id`(NOT NULL) 추가 — 절차서 작성 완료, 이름·Oracle 정보는 사용자 교체
 
+- **intent**: `intent/schema/recreate-table-tmp-id/intent.md` (2026-09-12 승인, 사후 기록). 미결 항목은 이 문서의 Open questions 참조. `intent/`는 사이트 게시 제외(`mkdocs.yml`)라 링크가 아니라 경로 텍스트로만 적는다
 - **산출물**: `pipeline/recreate-table-tmp-id.md` — 단일 절차서. 코드(약 40줄)·수동 DDL·실행 순서·기대 출력을 한 문서에. **의도적으로 짧게 유지한다** (2026-09-09 사용자 요청: 1회성 작업이라 코드·설명이 많으면 확인이 어렵다 — 검증 로직·모드·매니페스트를 늘리지 말 것)
 - **배경**: Iceberg는 비어 있지 않은 테이블에 required 컬럼 추가를 거부한다 (Spark `ADD COLUMN ... NOT NULL`·`SET NOT NULL`·`DEFAULT`, Trino 전부 불가) → 임시 테이블 복사 → `DROP ... PURGE` → `CREATE` → 조인 `INSERT`. 새 테이블은 snapshot 이력·UUID 초기화
 - **Oracle 조회는 `dt`(varchar2 `YYYYMMDD…`) 범위를 주 단위 chunk로 잘라 `spark.read.jdbc(predicates)`로 병렬 조회** (2026-09-09). Oracle 테이블의 `dt` 파티션은 7월부터라 그 이전 chunk는 같은 파티션을 반복 스캔해 느리지만, 사용자 결정으로 **단순한 균일 chunk 유지** (7월 이전 별도 처리·hash 분할·PARALLEL 힌트 안 씀)
@@ -296,6 +297,8 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 │   └── skills/
 │       ├── verify-implementation/     # 통합 검증 (에이전트 병렬 + 스킬 순차)
 │       └── manage-skills/             # 검증 항목 유지보수
+├── intent/                            # 작업별 intent 확정본 (사이트 게시 제외)
+│   └── schema/recreate-table-tmp-id/intent.md
 ├── tuning/
 │   ├── spark-tuning-guide.md          # Spark 튜닝 가이드 (append Job)
 │   ├── compaction-tuning-guide.md     # Compaction 튜닝 가이드 (hourly, 상세)
