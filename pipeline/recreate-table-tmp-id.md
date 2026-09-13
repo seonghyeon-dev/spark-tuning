@@ -134,6 +134,7 @@ SHOW CREATE TABLE iceberg.db.table_a;      -- 출력을 복사해 둔다
 DROP TABLE iceberg.db.table_a PURGE;       -- PURGE 없으면 데이터 파일이 남는다. 여기부터 롤백 없음
 
 -- 복사해 둔 DDL에 tmp_id 한 줄만 원하는 위치에 끼운다. 파티션·TBLPROPERTIES는 그대로
+-- 복사본에 섞여 나오는 'sort-order'·'current-snapshot-id' 줄은 CREATE 가 에러 없이 무시한다 → Sort Order 는 아래 ALTER 로만 들어간다
 CREATE TABLE iceberg.db.table_a (
   ts      TIMESTAMP_NTZ,
   par_a   STRING,
@@ -147,13 +148,14 @@ PARTITIONED BY (hours(ts), par_a)
 TBLPROPERTIES ( ... );
 
 ALTER TABLE iceberg.db.table_a WRITE ORDERED BY sort_a, sort_b;   -- Sort Order 는 CREATE 에 못 쓴다
+SHOW CREATE TABLE iceberg.db.table_a;      -- 'sort-order' = 'sort_a ASC ..., sort_b ASC ...' 가 보여야 load 로 넘어간다 (load 검수는 Sort Order 를 못 잡는다)
 ```
 
 ### 3. `load`
 
 ```
 [ora 키 중복] 0 건                              ← 0 이 아니면 실패. Oracle 쿼리를 좁히고 다시
-[Oracle 에 키 없는 row] U 건 → tmp_id = ''       ← Oracle 에 키가 없어 '' 가 들어갈 row 수. 납득되는 수인지 본다 (INSERT 전 출력)
+[Oracle 에 키 없는 row] U 건 → tmp_id = ''       ← Oracle 에 키가 없어 '' 가 들어갈 row 수. DtFrom~DtTo 밖의 Oracle row 도 포함. 납득되는 수인지 본다 (INSERT 전 출력)
 [load 신규 vs 임시] N 건 vs N 건, 차이 0 건      ← tmp_id 를 뺀 나머지 컬럼은 임시 테이블과 완전히 같다 (누락·중복·값 변경 없음)
 [tmp_id 불일치] 0 건                            ← tmp_id 는 Oracle 에 키가 있는 row 면 Oracle 값, 없는 row 면 '' 이다
 ```
