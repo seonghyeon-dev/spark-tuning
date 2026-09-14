@@ -264,7 +264,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **컬럼 명명 통일 완료 (2026-09-05)**: 전 문서에 `par_*`/`sort_*`/`col_*` 규칙 적용. 변환표는 공통 컨텍스트의 대상 테이블 절과 작업 8 문서 §1.3
 - **미확인**: `par_a` 분포가 `schema/` 문서(2026-03-18)와 순위가 다른 원인, `iceberg.query-partition-filter-required` 실제 설정값, `$partitions` 대조(`date(ts)` 1,059 파일 = 해당 날 파티션 `file_count` 합계인지 — `col_b` 통계 개입 배제용, 낮음), 규모 증가 시 manifest 전수 조회가 비용으로 드러나는지(판정 지표 부재로 보류)
 
-## 작업 9: Iceberg 테이블 재생성 + `tmp_id`(NOT NULL) 추가 — 절차서 작성 완료, 이름·Oracle 정보는 사용자 교체
+## 작업 9: Iceberg 테이블 재생성 + `tmp_id`(NOT NULL) 추가 — 개발 검증 완료(2026-09-14), 운영 적용 대기. 코드 변경 없음
 
 - **intent**: `intent/schema/recreate-table-tmp-id/intent.md` (2026-09-12 승인, 사후 기록). 미결 항목은 이 문서의 Open questions 참조. `intent/`는 사이트 게시 제외(`mkdocs.yml`)라 링크가 아니라 경로 텍스트로만 적는다
 - **산출물**: `pipeline/recreate-table-tmp-id.md` — 단일 절차서. 코드(약 40줄)·수동 DDL·실행 순서·기대 출력을 한 문서에. **의도적으로 짧게 유지한다** (2026-09-09 사용자 요청: 1회성 작업이라 코드·설명이 많으면 확인이 어렵다 — 검증 로직·모드·매니페스트를 늘리지 말 것)
@@ -280,7 +280,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **현 테이블은 Sort Order 미적용** (사용자 확인, 2026-09-14). 절차서의 `WRITE ORDERED BY`·`SHOW CREATE TABLE` 확인 줄은 "기존에 있었으면"으로 조건부 유지
 - **로컬 재현으로 확인 (2026-09-13~14, Spark 3.5.8 / Iceberg 1.10.1, Oracle은 Derby 인메모리 대역)**: ①정상 경로 전 구간 통과 — NOT NULL 컬럼에 `COALESCE(o.tmp_id, '')` INSERT 허용, 완전 중복 row·NULL array·NaN 모두 `EXCEPT ALL` 검수 통과 ②패턴/컬럼 대소문자 불일치는 어느 방향이든 INSERT 단계 `UNRESOLVED_COLUMN t.<컬럼명>`으로 실패, 현재 코드는 양방향 통과 ③`SHOW CREATE TABLE` 출력을 그대로 CREATE에 쓰면 `'sort-order'`·`'current-snapshot-id'` 줄은 에러 없이 무시된다 — DDL을 그렇게 만들 계획은 없었으나 참고로 유지 ④`[Oracle 에 키 없는 row]`에는 `DtFrom`~`DtTo` 밖의 Oracle row도 들어간다. 재현 환경은 scratchpad라 세션 종료 시 사라짐: Spark 배포판 + `iceberg-spark-runtime-3.5_2.12-1.10.1.jar`, JDK 17(apt), 컴파일은 배포판의 `scala-compiler` jar(`java -cp "jars/*" scala.tools.nsc.Main -usejavacp`), Oracle 대역은 배포판 내장 Derby(`jdbc:derby:memory:`)
 - **사용자 결정 (유지할 것)**: 검수는 별도 모드로 빼지 않고 `backup`/`load` 안에 둔다(제안했으나 "그냥 냅둬") · `[Oracle 에 키 없는 row]`에 상한 `require`를 넣지 않는다 — 로그만 보고 사람이 판단 (2026-09-14, 제안했으나 거절) · 절차서는 짧게, 코드 변경은 "변경 전/후" 대비로 정리해서 전달 · 코드 컴파일 확인은 scratchpad에 sbt 런처(Maven Central `sbt-launch-1.10.7.jar`) + `spark-sql`/`iceberg-spark-runtime-3.5_2.12` provided로 했으며 세션 종료 시 사라지므로 새 세션에서는 재구성 필요
-- **다음 단계**: 개발 배포 코드를 절차서 버전(`equalsIgnoreCase`)으로 교체 → `load` 재실행(테이블은 비어 있으므로 DDL 재실행 불필요) → 전 구간 통과 → 운영 적용 (Airflow 중지 → backup → DDL → load → Trino 확인 → 재개 → 며칠 뒤 임시 `DROP ... PURGE`) → 다른 테이블에 같은 절차 반복
+- **다음 단계**: 개발 `backup`→DDL→`load` 전 구간 통과(2026-09-14, 코드 교체 후). 남은 것은 운영 적용뿐 — 사전 확인: `DtFrom`/`DtTo`가 운영 데이터 전체 기간을 덮는지, `gc.enabled=false` 여부, Airflow 중지 범위(append 외 Compaction·expire·orphan 포함). 운영 적용 (Airflow 중지 → backup → DDL → load → Trino 확인 → 재개 → 며칠 뒤 임시 `DROP ... PURGE`) → 다른 테이블에 같은 절차 반복
 
 ## 파일 구조
 
