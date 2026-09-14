@@ -17,7 +17,7 @@ drafted-by: Claude
 - Oracle 원천의 `tmp_id`를 Iceberg 테이블(TABLE_A 및 같은 구조의 테이블들)에 **NOT NULL 컬럼**으로 추가해야 한다.
 - Iceberg는 비어 있지 않은 테이블에 required 컬럼을 추가하지 못한다. Spark `ADD COLUMN ... NOT NULL`, `SET NOT NULL`, `DEFAULT`, Trino 모두 거부한다. 그래서 컬럼 추가가 아니라 **테이블 재생성**이 된다.
 - 기존 row에는 `tmp_id` 값이 없으므로 Oracle에서 조인해 채워야 하고, Oracle에 키가 없는 row는 `''`로 채운다.
-- 현재 상태(2026-09-11): 절차서와 코드(약 40줄)는 완성. 개발 클러스터에서 `backup` 통과, `load`는 `AnalysisException UNRESOLVED_COLUMN t.tmp_id`로 실패 — 원인 미확정. 운영 미실행.
+- 현재 상태(2026-09-11): 절차서와 코드(약 40줄)는 완성. 개발 클러스터에서 `backup` 통과, `load`는 `AnalysisException UNRESOLVED_COLUMN t.tmp_id`로 실패 — 원인은 2026-09-14 확정(Open questions 참조). 운영 미실행.
 
 ## Proposed outcome
 
@@ -35,7 +35,7 @@ drafted-by: Claude
 | Spark 앱 + SparkApplication | 클래스 1개(`RecreateTable`) + pom ojdbc8. `mainClass`/`arguments`/`restartPolicy: Never`만 변경 |
 | Oracle | SELECT만. driver·executor 양쪽에서 JDBC 접근 |
 | Trino 조회 사용자 | DROP부터 `load` 커밋까지 테이블이 없거나 비어 있음 (절차서에 안내 없음) |
-| 재처리 DAG (운영·maintenance 작업) | `.snapshots` batch_id 영수증 소실. 아직 미배포라 지금은 영향 없음 |
+| 재처리 DAG (운영 배포됨) | `.snapshots` batch_id 영수증 소실. 최근 2일 `FAILURE`·`IN_PROGRESS` row 중 실제 커밋된 건이 있으면 재적재로 중복 — 운영 전 0건 확인 |
 | 문서 | `pipeline/recreate-table-tmp-id.md` |
 
 ## Constraints
@@ -61,16 +61,15 @@ drafted-by: Claude
 
 ## Open questions
 
-- **개발 `load` 실패 원인.** 유력 가설: 개발 신규 테이블이 `tmp_id` DDL로 재생성되지 않았다. 확인: 에러 직전 `[load 신규 vs 임시]` 로그 유무, `DESCRIBE`. 방어 2건은 PR #64에 반영됨
+- ~~**개발 `load` 실패 원인.**~~ 2026-09-14 확정 — 개발 배포 코드의 `case "TMP_ID"` 문자열 완전 일치가 소문자 컬럼 `tmp_id`와 안 맞아 INSERT 에 `t.tmp_id` 가 들어간 것 (사용자 진단, 로컬 재현 로그 일치). 신규 테이블에 `tmp_id` 는 존재했다. 2026-09-13 의 "`tmp_id` 없이 재생성" 진단은 오진. 절차서 현재 코드(`equalsIgnoreCase`)로 교체 후 `load` 재실행하면 된다
 - **`tmp_id`가 필요한 이유** — 어떤 조회·조인에 쓰는가. 기록 없음
 - **대상 테이블 목록과 순서**
-- **자리표시자 실제값**: 테이블명, 조인 키 `key1`/`key2`(19컬럼 중 어느 것), Oracle 원천, `DtFrom`/`DtTo`/`ChunkDays`가 실제값인지·테이블별로 바뀌는지, `tmp_id`의 Oracle 타입(VARCHAR2 아니면 `TO_CHAR`), `tmp_id` 컬럼 위치
-- **재생성 후 보존 확인 기준.** DDL이 `SHOW CREATE TABLE` 복사에 의존하는데, 보존해야 할 TBLPROPERTIES 목록(`write.distribution-mode=range`, `write.target-file-size-bytes`, `write.parquet.compression-codec`, array metrics `none` 8개, `gc.enabled`)이 절차서에 없고 운영 테이블의 현재 값도 기록에 없다
+- **자리표시자 실제값**: 테이블명, 조인 키 `key1`/`key2`(19컬럼 중 어느 것), Oracle 원천, `DtFrom`/`DtTo`/`ChunkDays`가 실제값인지·테이블별로 바뀌는지(범위 밖 Oracle row는 조용히 `''`가 된다 — 2026-09-13 확인), `tmp_id`의 Oracle 타입(VARCHAR2 아니면 `TO_CHAR`), `tmp_id` 컬럼 위치
+- **재생성 후 보존 확인 기준.** DDL이 `SHOW CREATE TABLE` 복사에 의존하는데, **복사본의 `'sort-order'` 줄은 CREATE가 조용히 무시한다**(2026-09-13 로컬 확인). 다만 실제 DDL은 `SHOW CREATE TABLE` 복사가 아니라 기존 DDL에 컬럼 한 줄을 추가한 것이고, **현 테이블은 Sort Order 미적용**(2026-09-14 사용자 확인)이라 이 항목은 참고용. 나머지 TBLPROPERTIES는 복사로 보존됨을 확인했으나, 보존해야 할 TBLPROPERTIES 목록(`write.distribution-mode=range`, `write.target-file-size-bytes`, `write.parquet.compression-codec`, array metrics `none` 8개, `gc.enabled`)이 절차서에 없고 운영 테이블의 현재 값도 기록에 없다
 - **Airflow 중지 범위**: append DAG만인지, Compaction·expire·orphan·rewrite manifests DAG도 포함인지
 - **재생성 소요 시간과 Trino 조회 불가 구간** — 사용자 안내가 필요한지
 - Oracle 방화벽이 driver·executor 양쪽에 열려 있는지
 - ojdbc8·`RecreateTable`이 실제 앱 저장소·이미지에 반영됐는지 (컴파일 검증은 scratchpad sbt 환경이었고 세션 종료로 사라짐)
-- 재처리 DAG 배포와의 순서 (재생성이 먼저면 영수증 소실은 무관)
 - 스키마 설계에서 미결인 항목(`ts`/`par_a`/`col_a` NOT NULL, 필터 컬럼 metrics `full`)을 이번 재생성에 같이 넣을지 — "짧게" 제약과 충돌
 - 임시 테이블 삭제 시점("며칠 뒤")
 - `hours(ts)` vs `hour(ts)` 표기 — `SHOW CREATE TABLE` 출력을 그대로 쓰면 무관

@@ -134,6 +134,7 @@ SHOW CREATE TABLE iceberg.db.table_a;      -- 출력을 복사해 둔다
 DROP TABLE iceberg.db.table_a PURGE;       -- PURGE 없으면 데이터 파일이 남는다. 여기부터 롤백 없음
 
 -- 복사해 둔 DDL에 tmp_id 한 줄만 원하는 위치에 끼운다. 파티션·TBLPROPERTIES는 그대로
+-- 복사본에 섞여 나오는 'sort-order'·'current-snapshot-id' 줄은 CREATE 가 에러 없이 무시한다 → Sort Order 는 아래 ALTER 로만 들어간다
 CREATE TABLE iceberg.db.table_a (
   ts      TIMESTAMP_NTZ,
   par_a   STRING,
@@ -146,19 +147,21 @@ USING iceberg
 PARTITIONED BY (hours(ts), par_a)
 TBLPROPERTIES ( ... );
 
+-- 기존 테이블에 Sort Order 가 있었을 때만 (없었으면 두 줄 생략)
 ALTER TABLE iceberg.db.table_a WRITE ORDERED BY sort_a, sort_b;   -- Sort Order 는 CREATE 에 못 쓴다
+SHOW CREATE TABLE iceberg.db.table_a;      -- 'sort-order' = 'sort_a ASC ..., sort_b ASC ...' 가 보여야 load 로 넘어간다 (load 검수는 Sort Order 를 못 잡는다)
 ```
 
 ### 3. `load`
 
 ```
 [ora 키 중복] 0 건                              ← 0 이 아니면 실패. Oracle 쿼리를 좁히고 다시
-[Oracle 에 키 없는 row] U 건 → tmp_id = ''       ← Oracle 에 키가 없어 '' 가 들어갈 row 수. 납득되는 수인지 본다 (INSERT 전 출력)
+[Oracle 에 키 없는 row] U 건 → tmp_id = ''       ← Oracle 에 키가 없어 '' 가 들어갈 row 수. DtFrom~DtTo 밖의 Oracle row 도 포함. 납득되는 수인지 본다 (INSERT 전 출력)
 [load 신규 vs 임시] N 건 vs N 건, 차이 0 건      ← tmp_id 를 뺀 나머지 컬럼은 임시 테이블과 완전히 같다 (누락·중복·값 변경 없음)
 [tmp_id 불일치] 0 건                            ← tmp_id 는 Oracle 에 키가 있는 row 면 Oracle 값, 없는 row 면 '' 이다
 ```
 
-INSERT는 Iceberg 단일 커밋이라 중간에 실패해도 신규 테이블은 비어 있다. 다시 돌리면 된다. 사후 검수에서 실패하면 신규 테이블을 `DROP ... PURGE` 하고 CREATE부터 다시 한다.
+검수 실패는 `require` 예외로 driver 가 즉시 죽어 SparkApplication 이 `FAILED` 로 끝난다 — 다음 단계로 넘어가지 않는다 (로컬 확인: exit code 1, `restartPolicy: Never` 라 재시도 없음). `[ora 키 중복]` 은 INSERT 전이라 실패해도 신규 테이블은 비어 있다(snapshot 0). `[Oracle 에 키 없는 row]` 는 `require` 가 없어 수치와 무관하게 INSERT 로 진행한다 — 사람이 보고 판단한다. INSERT는 Iceberg 단일 커밋이라 중간에 실패해도 신규 테이블은 비어 있다. 다시 돌리면 된다. 사후 검수에서 실패하면 데이터는 이미 커밋된 뒤이므로 신규 테이블을 `DROP ... PURGE` 하고 CREATE부터 다시 한다.
 
 ### 4. 마무리
 
@@ -173,7 +176,7 @@ DROP TABLE iceberg.db.table_a_tmp PURGE;
 
 ## 주의
 
-- 새 테이블은 snapshot 이력·UUID가 초기화된다. 재처리 DAG의 `.snapshots` batch_id 영수증도 사라진다
+- 새 테이블은 snapshot 이력·UUID가 초기화된다. 재처리 DAG의 `.snapshots` batch_id 영수증도 사라지므로, 재생성 전 Oracle Job History에서 대상 테이블의 최근 2일 `FAILURE`·`IN_PROGRESS` row가 0건인지 확인한다 (있으면 재처리가 영수증 없이 재적재해 중복)
 - `gc.enabled=false`인 테이블은 `DROP ... PURGE`가 거부된다 — `SHOW TBLPROPERTIES`로 확인
 - 임시 테이블은 파티션·Sort Order 없는 평면 CTAS다. `load` 시 신규 테이블 설정으로 다시 분배되므로 무관하지만, rename 해서 그대로 쓰지는 않는다
 - Oracle 접속정보는 커밋하지 않는다
