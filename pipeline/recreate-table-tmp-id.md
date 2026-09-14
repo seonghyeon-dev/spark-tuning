@@ -147,6 +147,7 @@ USING iceberg
 PARTITIONED BY (hours(ts), par_a)
 TBLPROPERTIES ( ... );
 
+-- 기존 테이블에 Sort Order 가 있었을 때만 (없었으면 두 줄 생략)
 ALTER TABLE iceberg.db.table_a WRITE ORDERED BY sort_a, sort_b;   -- Sort Order 는 CREATE 에 못 쓴다
 SHOW CREATE TABLE iceberg.db.table_a;      -- 'sort-order' = 'sort_a ASC ..., sort_b ASC ...' 가 보여야 load 로 넘어간다 (load 검수는 Sort Order 를 못 잡는다)
 ```
