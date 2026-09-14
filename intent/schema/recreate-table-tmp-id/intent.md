@@ -35,7 +35,7 @@ drafted-by: Claude
 | Spark 앱 + SparkApplication | 클래스 1개(`RecreateTable`) + pom ojdbc8. `mainClass`/`arguments`/`restartPolicy: Never`만 변경 |
 | Oracle | SELECT만. driver·executor 양쪽에서 JDBC 접근 |
 | Trino 조회 사용자 | DROP부터 `load` 커밋까지 테이블이 없거나 비어 있음 (절차서에 안내 없음) |
-| 재처리 DAG (운영·maintenance 작업) | `.snapshots` batch_id 영수증 소실. 아직 미배포라 지금은 영향 없음 |
+| 재처리 DAG (운영 배포됨) | `.snapshots` batch_id 영수증 소실. 최근 2일 `FAILURE`·`IN_PROGRESS` row 중 실제 커밋된 건이 있으면 재적재로 중복 — 운영 전 0건 확인 |
 | 문서 | `pipeline/recreate-table-tmp-id.md` |
 
 ## Constraints
@@ -70,7 +70,6 @@ drafted-by: Claude
 - **재생성 소요 시간과 Trino 조회 불가 구간** — 사용자 안내가 필요한지
 - Oracle 방화벽이 driver·executor 양쪽에 열려 있는지
 - ojdbc8·`RecreateTable`이 실제 앱 저장소·이미지에 반영됐는지 (컴파일 검증은 scratchpad sbt 환경이었고 세션 종료로 사라짐)
-- 재처리 DAG 배포와의 순서 (재생성이 먼저면 영수증 소실은 무관)
 - 스키마 설계에서 미결인 항목(`ts`/`par_a`/`col_a` NOT NULL, 필터 컬럼 metrics `full`)을 이번 재생성에 같이 넣을지 — "짧게" 제약과 충돌
 - 임시 테이블 삭제 시점("며칠 뒤")
 - `hours(ts)` vs `hour(ts)` 표기 — `SHOW CREATE TABLE` 출력을 그대로 쓰면 무관

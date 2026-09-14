@@ -118,10 +118,10 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **핵심 내용**: ts 필터링 방법(date, date_trunc, 범위 조건), WHERE 필수 컬럼, 잘못된 쿼리 패턴
 - **근거 계층**: `tuning/trino-iceberg-partition-pruning.md` (작업 8) — 이 가이드가 "무엇을 쓰라"면, 그쪽은 "왜 그렇게 되는지와 그 경계"
 
-## 작업 4: 재처리(Reprocessing) DAG 설계 — 설계 완료
+## 작업 4: 재처리(Reprocessing) DAG 설계 — 설계 완료, 운영 배포 완료
 
 - **산출물**: `pipeline/reprocessing-dag-design.md` (설계), `pipeline/reprocess-flow.md` (보고용 흐름 요약), `pipeline/dags/iceberg_reprocess.py` (구현 스켈레톤 — 기존 인프라 연결 지점은 TODO 표시)
-- **상태**: 설계 확정, 구현 스켈레톤 작성 (기존 인프라 연결 대기)
+- **상태**: **운영 배포 완료** (사용자 확인 2026-09-14, 배포 시점 미기록). 저장소의 `iceberg_reprocess.py`는 설계 시점 스켈레톤이며 운영 코드와 다를 수 있다
 - **배경**: append DAG의 Oracle 조회 기간(최근 1일 rolling — Job History `ts` 날짜 키 파티셔닝 제약)에서 밀려난 WAIT_SCHEDULING 데이터와, `get_jobs`가 조회하지 않는 FAILURE 데이터가 영구 잔류하는 문제
 - **시스템 구조**: Iceberg 테이블 20개+ (hourly/daily 그룹), append DAG은 py 1개에서 테이블별 동적 생성(약 5분 주기, `ts` string `YYYYMMDDHHmmSSsss` 기준 ORDER BY ASC, ROWNUM 200), Compaction DAG은 hourly/daily 각 1개(내부 테이블별 task 순차). **Job History는 Oracle DB 2개에 동일 스키마로 존재 — conn_list loop로 DB별 동일 쿼리 실행, `job_id`는 DB 간 유일 보장 없음(상태 UPDATE는 원천 DB로)**
 - **핵심 설계**:
@@ -275,12 +275,12 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **역할 분담**: DROP/CREATE는 spark-sql 수동. 앱은 `backup`(원본 → 임시 CTAS) / `load`(임시 LEFT JOIN Oracle → 신규 INSERT) 두 모드. INSERT 컬럼 목록은 신규 테이블 스키마에서 자동 생성 — 설정은 테이블 이름·Oracle 접속/쿼리·조인 조건뿐
 - **신규 요소는 Oracle JDBC뿐** — 기존 앱에 클래스 1개 + pom에 ojdbc8 의존성 1개. Iceberg 접근·SparkApplication은 기존 것 그대로(mainClass/arguments/`restartPolicy: Never`만). Oracle에는 SELECT만. 접속정보는 코드 하드코딩 — **커밋 금지**
 - **상태**: 코드는 Scala 2.12.18 / Spark 3.5.8 / Iceberg 1.10.1로 컴파일 검증 완료. 이름은 전부 자리표시자(`iceberg.db.table_a`, `table_a_tmp`, `key1`/`key2`, `ORA_SCHEMA.ORA_TABLE`). 신규 컬럼은 `STRING NOT NULL`만 확정
-- **주의**: `gc.enabled=false`면 PURGE 거부 · JDBC 읽기는 executor에서 실행되므로 Oracle 방화벽은 driver·executor 양쪽 · 임시 테이블은 파티션·Sort Order 없는 CTAS(rename 재사용 금지) · Sort Order는 `WRITE ORDERED BY` 별도 · 재처리 DAG의 `.snapshots` batch_id 영수증 소실
+- **주의**: `gc.enabled=false`면 PURGE 거부 · JDBC 읽기는 executor에서 실행되므로 Oracle 방화벽은 driver·executor 양쪽 · 임시 테이블은 파티션·Sort Order 없는 CTAS(rename 재사용 금지) · Sort Order는 `WRITE ORDERED BY` 별도 · **재처리 DAG(운영 배포됨)의 `.snapshots` batch_id 영수증 소실** — 재생성 전 커밋의 영수증이 전부 사라지므로, 최근 2일(재처리 자동 범위)에 대상 테이블의 `FAILURE`·`IN_PROGRESS` row가 있고 그 데이터가 실제로는 커밋됐다면 재처리가 영수증 없이 재적재해 중복이 난다. **운영 전 Oracle Job History에서 해당 건 0건 확인**, 있으면 먼저 정리
 - **진행 상태 (2026-09-14)**: 개발 클러스터에서 `backup` 통과(건수 일치). `load`는 `[Oracle 에 키 없는 row]` 로그 직후 `AnalysisException UNRESOLVED_COLUMN t.tmp_id`(driver 로그 `'Project [..., 't.tmp_id, ...]`)로 실패. **원인 확정(사용자 진단 + 로컬 재현 일치)**: 개발에 배포된 코드의 컬럼 매칭이 `case "TMP_ID" => ...` 문자열 완전 일치였고 신규 테이블 컬럼은 소문자 `tmp_id`라 매칭에 실패 → 그 컬럼이 일반 컬럼처럼 `t.tmp_id`로 생성돼 INSERT 분석 단계에서 죽은 것. 신규 테이블에 `tmp_id`는 확실히 존재했다 (`RelationV2[..., tmp_id, ...]`). Scala 문자열 match는 대소문자를 구분한다. **2026-09-13에 기록했던 "신규 테이블에 `tmp_id` 없음" 원인은 오진**이었다 — 그 경우는 INSERT가 통과하고 마지막 `tmp_id 불일치` 쿼리에서 실패하므로 로그 위치가 다르다. **조치**: 절차서의 현재 코드(PR #64, `equalsIgnoreCase`)가 이 문제를 이미 막는다 — 개발 배포 코드를 절차서 버전으로 교체하고 `load` 재실행. INSERT가 분석 단계에서 실패했으므로 신규 테이블은 비어 있고 DROP/CREATE 재실행 불필요
 - **현 테이블은 Sort Order 미적용** (사용자 확인, 2026-09-14). 절차서의 `WRITE ORDERED BY`·`SHOW CREATE TABLE` 확인 줄은 "기존에 있었으면"으로 조건부 유지
 - **로컬 재현으로 확인 (2026-09-13~14, Spark 3.5.8 / Iceberg 1.10.1, Oracle은 Derby 인메모리 대역)**: ①정상 경로 전 구간 통과 — NOT NULL 컬럼에 `COALESCE(o.tmp_id, '')` INSERT 허용, 완전 중복 row·NULL array·NaN 모두 `EXCEPT ALL` 검수 통과 ②패턴/컬럼 대소문자 불일치는 어느 방향이든 INSERT 단계 `UNRESOLVED_COLUMN t.<컬럼명>`으로 실패, 현재 코드는 양방향 통과 ③`SHOW CREATE TABLE` 출력을 그대로 CREATE에 쓰면 `'sort-order'`·`'current-snapshot-id'` 줄은 에러 없이 무시된다 — DDL을 그렇게 만들 계획은 없었으나 참고로 유지 ④`[Oracle 에 키 없는 row]`에는 `DtFrom`~`DtTo` 밖의 Oracle row도 들어간다. 재현 환경은 scratchpad라 세션 종료 시 사라짐: Spark 배포판 + `iceberg-spark-runtime-3.5_2.12-1.10.1.jar`, JDK 17(apt), 컴파일은 배포판의 `scala-compiler` jar(`java -cp "jars/*" scala.tools.nsc.Main -usejavacp`), Oracle 대역은 배포판 내장 Derby(`jdbc:derby:memory:`)
 - **사용자 결정 (유지할 것)**: 검수는 별도 모드로 빼지 않고 `backup`/`load` 안에 둔다(제안했으나 "그냥 냅둬") · `[Oracle 에 키 없는 row]`에 상한 `require`를 넣지 않는다 — 로그만 보고 사람이 판단 (2026-09-14, 제안했으나 거절) · 절차서는 짧게, 코드 변경은 "변경 전/후" 대비로 정리해서 전달 · 코드 컴파일 확인은 scratchpad에 sbt 런처(Maven Central `sbt-launch-1.10.7.jar`) + `spark-sql`/`iceberg-spark-runtime-3.5_2.12` provided로 했으며 세션 종료 시 사라지므로 새 세션에서는 재구성 필요
-- **다음 단계**: 개발 `backup`→DDL→`load` 전 구간 통과(2026-09-14, 코드 교체 후). 남은 것은 운영 적용뿐 — 사전 확인: `DtFrom`/`DtTo`가 운영 데이터 전체 기간을 덮는지, `gc.enabled=false` 여부, Airflow 중지 범위(append 외 Compaction·expire·orphan 포함). 운영 적용 (Airflow 중지 → backup → DDL → load → Trino 확인 → 재개 → 며칠 뒤 임시 `DROP ... PURGE`) → 다른 테이블에 같은 절차 반복
+- **다음 단계**: 개발 `backup`→DDL→`load` 전 구간 통과(2026-09-14, 코드 교체 후). 남은 것은 운영 적용뿐 — 사전 확인: `DtFrom`/`DtTo`가 운영 데이터 전체 기간을 덮는지, `gc.enabled=false` 여부, Airflow 중지 범위(append 외 Compaction·expire·orphan·재처리 포함), 대상 테이블 최근 2일 `FAILURE`·`IN_PROGRESS` 0건. 운영 적용 (Airflow 중지 → backup → DDL → load → Trino 확인 → 재개 → 며칠 뒤 임시 `DROP ... PURGE`) → 다른 테이블에 같은 절차 반복
 
 ## 파일 구조
 

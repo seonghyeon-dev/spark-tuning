@@ -176,7 +176,7 @@ DROP TABLE iceberg.db.table_a_tmp PURGE;
 
 ## 주의
 
-- 새 테이블은 snapshot 이력·UUID가 초기화된다. 재처리 DAG의 `.snapshots` batch_id 영수증도 사라진다
+- 새 테이블은 snapshot 이력·UUID가 초기화된다. 재처리 DAG의 `.snapshots` batch_id 영수증도 사라지므로, 재생성 전 Oracle Job History에서 대상 테이블의 최근 2일 `FAILURE`·`IN_PROGRESS` row가 0건인지 확인한다 (있으면 재처리가 영수증 없이 재적재해 중복)
 - `gc.enabled=false`인 테이블은 `DROP ... PURGE`가 거부된다 — `SHOW TBLPROPERTIES`로 확인
 - 임시 테이블은 파티션·Sort Order 없는 평면 CTAS다. `load` 시 신규 테이블 설정으로 다시 분배되므로 무관하지만, rename 해서 그대로 쓰지는 않는다
 - Oracle 접속정보는 커밋하지 않는다
