@@ -163,6 +163,20 @@ SHOW CREATE TABLE iceberg.db.table_a;      -- 'sort-order' = 'sort_a ASC ..., so
 
 검수 실패는 `require` 예외로 driver 가 즉시 죽어 SparkApplication 이 `FAILED` 로 끝난다 — 다음 단계로 넘어가지 않는다 (로컬 확인: exit code 1, `restartPolicy: Never` 라 재시도 없음). `[ora 키 중복]` 은 INSERT 전이라 실패해도 신규 테이블은 비어 있다(snapshot 0). `[Oracle 에 키 없는 row]` 는 `require` 가 없어 수치와 무관하게 INSERT 로 진행한다 — 사람이 보고 판단한다. INSERT는 Iceberg 단일 커밋이라 중간에 실패해도 신규 테이블은 비어 있다. 다시 돌리면 된다. 사후 검수에서 실패하면 데이터는 이미 커밋된 뒤이므로 신규 테이블을 `DROP ... PURGE` 하고 CREATE부터 다시 한다.
 
+**`load` 뒤에 `tmp_id = ''` 를 다시 채워야 할 때** (`DtTo` 를 잘못 잡았거나 다른 Oracle 로 마저 매핑할 때): 상수(`DtFrom`/`DtTo`/Oracle 접속)를 고치고 `load` 의 두 줄만 바꿔 다시 실행한다. 이미 채워진 row 는 건드리지 않으므로 반복 실행 가능. `UPDATE` 는 Iceberg SQL 확장(`spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions`)이 필요하다
+
+```scala
+// 변경 전: val cols = ... 부터 INSERT 까지
+spark.sql(s"INSERT INTO $Tbl SELECT $cols FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE $Where")
+// 변경 후: tmp_id 가 '' 이고 Oracle 에 키가 있는 row 만 UPDATE (max() 는 키당 1건임을 Spark 에 알리는 포장 — 유일성은 ora 키 중복 검수가 보장)
+spark.sql(s"UPDATE $Tbl t SET tmp_id = (SELECT max(o.tmp_id) FROM ora o WHERE $JoinOn) WHERE $Where AND t.tmp_id = '' AND EXISTS (SELECT 1 FROM ora o WHERE $JoinOn AND o.tmp_id IS NOT NULL)")
+
+// 변경 전: 사후 검수 ②
+assertZero("tmp_id 불일치", s"SELECT COUNT(*) FROM $Tbl t LEFT JOIN ora o ON $JoinOn WHERE $Where AND NOT (t.tmp_id <=> COALESCE(o.tmp_id, ''))")
+// 변경 후: Oracle 에 키가 있는데 '' 로 남은 row 가 0 인지 (다른 Oracle 로 돌릴 때 앞서 채운 값은 이 Oracle 에 없으므로 불일치 검수는 못 쓴다)
+assertZero("tmp_id 미반영", s"SELECT COUNT(*) FROM $Tbl t JOIN ora o ON $JoinOn WHERE $Where AND t.tmp_id = '' AND o.tmp_id IS NOT NULL")
+```
+
 ### 4. 마무리
 
 ```sql
