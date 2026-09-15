@@ -803,7 +803,7 @@ daily:  888GB  → 30~60분        ← 약 24배 선형
                (`outsideDesiredFileSizeRange`, :165-167)
                + delete file 조건 (`BinPackRewriteFilePlanner.java:189-194`, append 전용 테이블은 무관)
 ② group 필터 : ①에서 남은 파일을 파티션별로 bin-packing한 뒤, 아래 하나라도 만족하는 group만 rewrite
-               (`BinPackRewriteFilePlanner.java:197-205`)
+               (`BinPackRewriteFilePlanner.java:197-205`, 아래 세 판정은 `SizeBasedFileRewritePlanner.java`)
                - enoughInputFiles : 파일 2개 이상 AND 파일 수 ≥ min-input-files(5)     (:176-178)
                - enoughContent    : 파일 2개 이상 AND 합계 > target-file-size(512MB)  (:180-182)
                - tooMuchContent   : 합계 > max-file-size(922MB)                      (:184-186)
