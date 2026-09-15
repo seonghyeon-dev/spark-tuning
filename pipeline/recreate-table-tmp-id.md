@@ -46,7 +46,7 @@ object RecreateTable {
   val DtTo   = "20260909"
   val ChunkDays = 7
 
-  // 실행: RecreateTable <backup|load> <테이블명>
+  // 실행: RecreateTable <backup|load|fix> <테이블명>
   def main(args: Array[String]): Unit = {
     val mode = args(0)
     val Tbl  = s"$Db.${args(1)}"               // 재생성 대상 (backup 의 원본, load 의 목적지)
@@ -65,6 +65,24 @@ object RecreateTable {
       val n = count(q); println(s"[$name] $n 건"); require(n == 0, s"[$name] 정합성 실패")
     }
 
+    // Oracle 조회 → 임시 뷰 ora (load·fix 공용)
+    def loadOracle(): Unit = {
+      val fmt = DateTimeFormatter.ofPattern("yyyyMMdd")
+      val chunks = Iterator.iterate(LocalDate.parse(DtFrom, fmt))(_.plusDays(ChunkDays))
+        .takeWhile(!_.isAfter(LocalDate.parse(DtTo, fmt)))
+        .map(d => s"dt >= '${d.format(fmt)}' AND dt < '${d.plusDays(ChunkDays).format(fmt)}'").toArray
+
+      val props = new java.util.Properties()
+      props.setProperty("user", OracleUser)
+      props.setProperty("password", OraclePassword)
+      props.setProperty("driver", "oracle.jdbc.OracleDriver")
+      props.setProperty("fetchsize", "10000")
+      spark.read.jdbc(OracleUrl, OracleTable, chunks, props).cache().createOrReplaceTempView("ora")
+
+      // 사전 검수 ①: Oracle 에 같은 키가 2건 이상이면 조인으로 row 가 불어난다 → 0 이어야 한다
+      assertZero("ora 키 중복", "SELECT COUNT(*) FROM (SELECT key1, key2 FROM ora GROUP BY key1, key2 HAVING COUNT(*) > 1)")
+    }
+
     mode match {
       case "backup" =>
         spark.sql(s"CREATE TABLE $Tmp USING iceberg AS SELECT * FROM $Tbl WHERE $Where")
@@ -73,20 +91,8 @@ object RecreateTable {
       case "load" =>
         require(spark.table(Tbl).columns.exists(_.equalsIgnoreCase("tmp_id")), s"$Tbl 에 tmp_id 컬럼이 없다 — 수동 DROP/CREATE 먼저")
 
-        val fmt = DateTimeFormatter.ofPattern("yyyyMMdd")
-        val chunks = Iterator.iterate(LocalDate.parse(DtFrom, fmt))(_.plusDays(ChunkDays))
-          .takeWhile(!_.isAfter(LocalDate.parse(DtTo, fmt)))
-          .map(d => s"dt >= '${d.format(fmt)}' AND dt < '${d.plusDays(ChunkDays).format(fmt)}'").toArray
+        loadOracle()
 
-        val props = new java.util.Properties()
-        props.setProperty("user", OracleUser)
-        props.setProperty("password", OraclePassword)
-        props.setProperty("driver", "oracle.jdbc.OracleDriver")
-        props.setProperty("fetchsize", "10000")
-        spark.read.jdbc(OracleUrl, OracleTable, chunks, props).cache().createOrReplaceTempView("ora")
-
-        // 사전 검수 ①: Oracle 에 같은 키가 2건 이상이면 조인으로 row 가 불어난다 → 0 이어야 한다
-        assertZero("ora 키 중복", "SELECT COUNT(*) FROM (SELECT key1, key2 FROM ora GROUP BY key1, key2 HAVING COUNT(*) > 1)")
         // 사전 확인 ②: Oracle 에 키가 없는 row 는 tmp_id 를 못 받으므로 '' 가 들어간다. 그 건수를 INSERT 전에 보여 준다
         println(s"[Oracle 에 키 없는 row] ${count(s"SELECT COUNT(*) FROM $Tmp t LEFT JOIN ora o ON $JoinOn WHERE $Where AND o.tmp_id IS NULL")} 건 → tmp_id = ''")
 
@@ -104,6 +110,17 @@ object RecreateTable {
         val orig = spark.table(Tmp).columns.mkString(", ")
         assertSame("load 신규 vs 임시", s"SELECT $orig FROM $Tbl WHERE $Where", s"SELECT $orig FROM $Tmp WHERE $Where")
         assertZero("tmp_id 불일치", s"SELECT COUNT(*) FROM $Tbl t LEFT JOIN ora o ON $JoinOn WHERE $Where AND NOT (t.tmp_id <=> COALESCE(o.tmp_id, ''))")
+
+      case "fix" =>
+        // 이미 적재된 신규 테이블에서 tmp_id = '' 인 row 만 Oracle 로 다시 채운다. DtFrom/DtTo·Oracle 접속을 바꿔 가며 반복 실행 가능
+        loadOracle()
+        println(s"[fix 대상] ${count(s"SELECT COUNT(*) FROM $Tbl WHERE $Where AND tmp_id = ''")} 건")
+        spark.sql(s"MERGE INTO $Tbl t USING ora o ON $JoinOn AND $Where AND t.tmp_id = '' AND o.tmp_id IS NOT NULL WHEN MATCHED THEN UPDATE SET t.tmp_id = o.tmp_id")
+        println(s"[fix 후 남은 건] ${count(s"SELECT COUNT(*) FROM $Tbl WHERE $Where AND tmp_id = ''")} 건")
+        // 사후 검수: Oracle 에 키가 있는데 아직 '' 인 row 는 0 · tmp_id 를 뺀 나머지 컬럼은 임시 테이블과 여전히 같다 (MERGE 가 다른 컬럼을 안 건드렸는지)
+        assertZero("fix 미반영", s"SELECT COUNT(*) FROM $Tbl t JOIN ora o ON $JoinOn WHERE $Where AND t.tmp_id = '' AND o.tmp_id IS NOT NULL")
+        val orig = spark.table(Tmp).columns.mkString(", ")
+        assertSame("fix 신규 vs 임시", s"SELECT $orig FROM $Tbl WHERE $Where", s"SELECT $orig FROM $Tmp WHERE $Where")
     }
     spark.stop()
   }
@@ -115,8 +132,9 @@ object RecreateTable {
 - Oracle에는 SELECT만 나간다. `createOrReplaceTempView`는 Spark 세션 안의 이름 등록일 뿐이다
 - Oracle 조회는 `dt` 범위를 `ChunkDays` 단위로 잘라 chunk마다 커넥션 하나로 병렬 조회한다 (동시 커넥션 수 = executor 코어 합계). `dt`가 `YYYYMMDD`에 밀리초까지 붙은 문자열이라 `>=`/`<`로 잘라야 경계가 빠지지 않는다. 7월 이전은 파티션이 없어 chunk마다 같은 구간을 다시 훑으므로 느리지만 결과는 같다
 - Oracle 컬럼명은 대문자로 오지만 Spark SQL은 대소문자를 구분하지 않는다. `tmp_id`가 VARCHAR2가 아니면 `OracleTable`에서 `TO_CHAR(...) AS tmp_id`
-- 실행은 기존 SparkApplication에서 `mainClass: RecreateTable`, `arguments: ["backup", "table_a"]` / `["load", "table_a"]`만 바꾼다. 테이블명은 인자로 받고 임시 테이블은 `<테이블명>_tmp`다 — 다른 테이블도 같은 코드로 처리한다. `restartPolicy`는 `Never`로 (재시도되면 안 된다)
+- 실행은 기존 SparkApplication에서 `mainClass: RecreateTable`, `arguments: ["backup", "table_a"]` / `["load", "table_a"]` / `["fix", "table_a"]`만 바꾼다. 테이블명은 인자로 받고 임시 테이블은 `<테이블명>_tmp`다 — 다른 테이블도 같은 코드로 처리한다. `restartPolicy`는 `Never`로 (재시도되면 안 된다)
 - Oracle 방화벽은 driver·executor 양쪽에 열려 있어야 한다 (JDBC 읽기는 executor에서 실행된다)
+- `fix`의 `MERGE INTO`는 Iceberg SQL 확장이 필요하다 — SparkApplication `sparkConf`에 `spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions`가 있어야 한다 (없으면 `MERGE INTO TABLE is not supported temporarily`). 기본 copy-on-write 라 `''` row 가 든 데이터 파일을 다시 쓴다
 
 ## 실행
 
@@ -163,7 +181,19 @@ SHOW CREATE TABLE iceberg.db.table_a;      -- 'sort-order' = 'sort_a ASC ..., so
 
 검수 실패는 `require` 예외로 driver 가 즉시 죽어 SparkApplication 이 `FAILED` 로 끝난다 — 다음 단계로 넘어가지 않는다 (로컬 확인: exit code 1, `restartPolicy: Never` 라 재시도 없음). `[ora 키 중복]` 은 INSERT 전이라 실패해도 신규 테이블은 비어 있다(snapshot 0). `[Oracle 에 키 없는 row]` 는 `require` 가 없어 수치와 무관하게 INSERT 로 진행한다 — 사람이 보고 판단한다. INSERT는 Iceberg 단일 커밋이라 중간에 실패해도 신규 테이블은 비어 있다. 다시 돌리면 된다. 사후 검수에서 실패하면 데이터는 이미 커밋된 뒤이므로 신규 테이블을 `DROP ... PURGE` 하고 CREATE부터 다시 한다.
 
-### 4. 마무리
+### 4. `fix` — `load` 뒤에 `tmp_id = ''` 를 다시 채울 때 (선택)
+
+`DtFrom`/`DtTo` 를 잘못 잡았거나 다른 Oracle 에서 마저 매핑해야 할 때. 상수(`DtFrom`/`DtTo`/`OracleUrl`/`OracleTable`)를 바꿔 다시 빌드하고 `fix` 로 실행한다. 이미 채워진 row 는 건드리지 않으므로 여러 번 돌려도 된다.
+
+```
+[ora 키 중복] 0 건
+[fix 대상] E 건                                 ← 실행 전 tmp_id = '' 건수
+[fix 후 남은 건] E' 건                          ← 이번 Oracle 로도 못 채운 건수
+[fix 미반영] 0 건                               ← Oracle 에 키가 있는데 '' 로 남은 row. 0 아니면 실패
+[fix 신규 vs 임시] N 건 vs N 건, 차이 0 건      ← MERGE 가 다른 컬럼을 안 건드렸다
+```
+
+### 5. 마무리
 
 ```sql
 -- Trino
