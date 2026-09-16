@@ -659,7 +659,7 @@ num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 
 | 항목 | 값 | 근거 |
 |------|-----|------|
-| `MAX_EXECUTORS` | ⚠️ 미확정 | append 벤치마크에서 32개 이상은 오히려 느려졌다(shuffle 통신, K8S pod 스케줄링 경합, S3 부하 — `tuning/spark-tuning-guide.md` §2.2.3). K8S namespace quota도 확인 필요. **상한에 걸리면 알림을 발생시켜 파티션 재설계 검토 신호로 사용** |
+| `MAX_EXECUTORS` | **36 (2026-09-16 고정)** | 채택된 DA(B안)의 `maxExecutors`와 같은 값. K8S quota는 확인 불가하나 리소스가 넉넉하고 실사용량은 ratio가 정하므로 천장은 무해(설계서 §4.6). 참고로 append 벤치마크에서 32개 이상은 오히려 느려졌다(`tuning/spark-tuning-guide.md` §2.2.3) — Compaction은 82GB에서 24대까지 실측 정상. **상한에 걸리면 알림을 발생시켜 파티션 재설계 검토 신호로 사용** |
 | `MIN_EXECUTORS` | 4 (안) 📘 | 데이터가 적은 시간대에 과도하게 축소되는 것 방지 |
 
 **도입 시점 — 현재는 정적 12가 충분하다**

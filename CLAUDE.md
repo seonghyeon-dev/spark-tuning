@@ -153,7 +153,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **`sort` 전략은 데이터를 2번 읽는다** (정렬 범위 샘플링 + 실제 쓰기). DataFlint `input = output × 2.0`이 정상값
   - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번 사례의 원인은 후자다. alert는 전자만 제안한다
   - **`memory usage` 84~94%는 `spill to disk 0b`와 짝으로 읽는다** — 낭비 없이 맞게 쓰는 중이라는 뜻이며 줄이면 spill이 시작된다
-- **executor 자원 할당 — Dynamic Allocation + ratio 채택 (7회 실측 검증)**: 설계 `pipeline/compaction-executor-sizing-design.md`, 보류된 C안 스켈레톤 `pipeline/examples/compaction_executor_sizing_example.py`
+- **executor 자원 할당 — Dynamic Allocation + ratio 채택 (1번 7회 + 2번 9회 실측 검증)**: 설계 `pipeline/compaction-executor-sizing-design.md`, 보류된 C안 스켈레톤 `pipeline/examples/compaction_executor_sizing_example.py`
   - **확정 설정**: `dynamicAllocation.enabled=true`, **`executorAllocationRatio=0.13`(전 테이블 공통, 2번 테이블에서 재검증)**, **`spark.executor.instances` = `initialExecutors` = `minExecutors` = `ceil(시간당 GB × 0.32)`(1번 12, 2번 8)**, `maxExecutors`=**36 고정**(quota 확인 불가·리소스 넉넉·천장은 무해)
   - **⚠️ `spark.executor.instances`가 남아 있으면 그 값이 시작 대수의 바닥이 된다** (`max(initial, min, instances)`, 반납 없음 → 끝까지 유지). 2번 테이블에서 init 6·8, ratio 0.08~0.13을 어떻게 바꿔도 12대로 돈 원인. 확인은 driver 로그 `Using initial executors = N, max of ...` 줄. 설계서 §4.8
   - **2번 테이블 9회 검증 (2026-09-15~16, 설계서 §5.2)**: `instances` 제거 후 ratio 0.13이 **8대로 수렴** (24GB × 0.32 = 7.7). 12대 대비 duration +27%(1.9분)이나 dcu **−10~16%** — 1번의 16 → 12 축소와 같은 모양. **16g에서 spill 1.6~10.4GiB(시간대별 변동, 시간 비용은 안 보임) → 20g에서 0.** 확정: `instances`=init=min **8**, executor memory **20g**, 나머지 1번과 동일. **확정 설정 그대로 돌린 test9: 1.7분, dcu 0.0711, spill 0, idle 16.8%** (init 8이라 warm-up 없어 test8 1.9분보다 짧음, 1번 idle 16.7%와 동급)
@@ -164,7 +164,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **DAG 미반영** — 4개 테이블 확정 후 일괄 적용 (사용자 결정 2026-09-15)
   - **`initialExecutors` 기본값이 0이라 반드시 명시.** 생략하면 0대에서 시작해 warm-up 20~40초 낭비
   - **ratio 도출**: `desired = 데이터GB × 2.25 × ratio`, 목표 `데이터GB × 0.32` → `ratio = 0.32/2.25 = 0.142`. **양변에서 데이터GB가 소거되므로 ratio는 테이블 크기와 무관 → 공통값 사용 가능**. 실측: 39GB→12대, 82GB→24대
-  - **`initial`/`min`은 테이블별이어야 한다** — 비율이 아니라 절대 개수라 크기에 비례. 기존 `com_num_executor`를 그대로 쓰면 되고 새 튜닝 불필요. 역할 분담: `initial/min`=평소 대수 바닥, `ratio`=많은 시간대에 얼마나 더 부를지
+  - **`instances`/`initial`/`min`은 테이블별이어야 한다** — 비율이 아니라 절대 개수라 크기에 비례. **`ceil(시간당 GB × 0.32)`로 산정하며 기존 `com_num_executor`와 다를 수 있다** (2번: 기존 12 → 8. 12로 두면 바닥이 되어 dcu +10~16%). 역할 분담: `instances/initial/min`=평소 대수 바닥, `ratio`=많은 시간대에 얼마나 더 부를지
   - **`maxExecutors`는 예약이 아니라 천장** — max 36으로 두고 실행해도 실제 24대(실측). 실사용량은 ratio가 정하므로 넉넉히 둬도 자원 선점 없음. **K8S quota 확정이 긴급하지 않은 이유**
   - **반납은 일어나지 않는다.** 공식 문서: *"an executor should not be idle if there are still pending tasks"* — 일감이 725~1,450개 상시 대기라 제거 조건 자체가 성립 안 함. `minExecutors=4`로 낮춰도 12대 유지(실측). 즉 DA의 대표 기능(반납)은 안 쓰고 **요청량 조절만** 사용
   - **유일한 실질적 약점: ratio가 파일 크기에 의존.** 일감 수가 파일 크기로 정해지므로 append 설정이 바뀌면 **에러 없이 조용히 어긋난다**. 재검증 조건 1순위
