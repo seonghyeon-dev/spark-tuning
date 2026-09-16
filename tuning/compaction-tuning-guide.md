@@ -7,8 +7,8 @@
 | 작성 목적 | hourly Compaction Job의 Iceberg 옵션 및 Spark 리소스 설정에 대한 근거 기반 가이드 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
-| 대상 범위 | **hourly Compaction만.** daily Compaction은 별도 (섹션 8.1) |
-| 최종 수정일 | 2026-08-13 |
+| 대상 범위 | **hourly Compaction만.** 1번 테이블 기준으로 튜닝, 2번 테이블 검증 완료(`pipeline/compaction-executor-sizing-design.md` §5.2). daily Compaction은 대상 외 (섹션 8.1) |
+| 최종 수정일 | 2026-09-16 (2번 테이블 검증 결과·테이블별 설정 반영) |
 
 ### 근거 수준 라벨
 
@@ -440,7 +440,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 | 영향 범위 | 파일 73~86개 중 **2개** |
 | 데이터 비중 | 37GB 중 **0.9GB (2.4%)** |
 | 조회 영향 | 무시 가능 |
-| daily Compaction 영향 | `rewrite-all=true`라 어차피 재작성 |
+| daily Compaction 영향 | 해당 없음 — daily DAG은 이 테이블을 돌지 않는다 (섹션 8.1) |
 
 해소하려면 `target-file-size-bytes`를 830MB 이상으로 올려 D를 파일 1개로 만들어야 하는데, 그러면 **모든 파티션의 파일이 830MB가 되어** `iceberg-schema-design-guide.md` §6.5의 512MB 결정을 뒤집는다. 2.4% 데이터를 위해 치를 비용이 아니다.
 
@@ -480,8 +480,8 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 | Spark | `advisory-partition-size` | **삭제** | ✅ | 무효 확정 |
 | Spark | `coalescePartitions.parallelismFirst` | **삭제 가능** | ✅ | 무효 확정 (T8) |
 | 리소스 | `driver cpu` / `memory` | **2** / 4GB | 📘 | 효과는 노이즈 범위, 저렴해서 유지 |
-| 리소스 | `executor cpu` / `memory` | 4 / 16GB | ✅ | spill 0 유지 |
-| 리소스 | `num-executors` | **12** (→ 동적 산정) | ✅ | dcu 최저점. 섹션 4.4, 6 |
+| 리소스 | `executor cpu` / `memory` | 4 / **16GB (1번)·20GB (2번)** | ✅ | spill 0 유지가 기준. 테이블별 판단 — 설계서 §8.2 |
+| 리소스 | `num-executors` | **테이블별** — 1번 12, 2번 8 (`시간당 GB × 0.32`) | ✅ | dcu 최저점. 섹션 4.4, 6. DA에서는 `spark.executor.instances` = `initialExecutors` = `minExecutors`로 넣는다 (설계서 §4.8) |
 | 전략 | rewrite 전략 | `sort` | ✅ | 미적용 시 조회 40% 저하 |
 
 **변경 전후 요약** (baseline → T6)
@@ -638,7 +638,9 @@ num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 | **12** | 37.3GB | **0.32** | **0.00219** | 16.73% | 0b | ✅ **채택** |
 | 8 | 36.6GB | 0.22 | 0.00247 | 15.35% | 0b | dcu 반등, 기각 |
 
-검산: 37.3GB × 0.32 = 11.9 → **12** / 38.5GB → 13 / 42.3GB → 14
+검산: 37.3GB × 0.32 = 11.9 → **12** / 38.5GB → 13 / 42.3GB → 14 / **2번 테이블 24GB → 8 (실측 수렴 8대, 설계서 §5.2)**
+
+> **0.32는 비례식이다.** 위 표에서 "37GB에 12대가 가장 싸다"를 찾았고, 그것을 다른 크기에 옮기기 위해 12 ÷ 37.3 = 0.32("1GB당 0.32대")로 바꿔 둔 것이다. 숫자 자체에 의미는 없다. 몇 가지 크기로 돌려 비용 최저점을 찾고 비례로 옮기는 것은 일반적인 right-sizing 절차지만, **0.32라는 값은 executor 4core·512MB 파일·`sort` 전략이라는 이 job의 조건 전용**이다.
 
 **판정 기준** — `spill to disk = 0b` 유지가 절대 조건이고, 그 안에서 아래 파생 지표로 비교한다.
 
@@ -716,7 +718,7 @@ desired = (데이터GB × 9 ÷ 4) × ratio = 데이터GB × 2.25 × ratio
 
 **조회 횟수**: `compaction_specs`는 DAG run당 1회 실행되고 그 안에서 테이블 수만큼 조회한다. hourly 테이블 4개 × 24시간 = 96회/일.
 
-**daily에 그대로 쓸 수 없다.** `C=0.32`은 hourly 측정값이며, daily는 `rewrite-all` 낭비 의심(섹션 8.1) 확인 후 별도로 계수를 잡아야 한다.
+**daily에 그대로 쓸 수 없다.** `C=0.32`은 hourly 측정값이며, daily는 대상 테이블(`day` 파티션)의 크기·구성을 받은 뒤 별도로 계수를 잡아야 한다(섹션 8.1).
 
 ---
 
@@ -736,12 +738,12 @@ Airflow   : task duration (pod 기동 시간 역산용)
 | 지표 | 의미 | 판정 기준 및 활용 |
 |------|------|-----------------|
 | **idle cores** | 확보한 core 중 유휴 비율 | 20% 이하면 양호. **원인이 2가지이고 처방이 반대다** (아래) |
-| **spill to disk** | 메모리가 넘쳐 디스크에 쓴 양 | **가장 중요한 안전선.** 0이 아니면 메모리 부족. memory나 executor를 줄일 때 반드시 확인 |
+| **spill to disk** | 메모리가 넘쳐 디스크에 쓴 양 | **가장 중요한 안전선.** 0이 아니면 메모리 부족. task 하나가 정렬에 쓸 수 있는 메모리는 `(executor memory − 300MiB) × 0.6 ÷ cores`(16g → 2.4GB, 20g → 3.0GB)이고 이를 넘으면 spill한다. 시간 비용으로 드러나지 않아도 기준 위반 — 16g에서 나면 20g (설계서 §8.2) |
 | **memory usage** | executor 메모리 최고 사용률 | 높은 것이 나쁜 것이 아니다. `spill 0 + 89%`는 낭비 없이 사용 중이라는 뜻. **항상 spill과 짝으로 판정** — 90%↑ & spill 발생 → 증설 / 60%↓ & spill 0 → 감축 여지 |
-| **duration** | Spark 앱 실행 시간 | 데이터 크기가 매번 다르므로 **반드시 `초/GB`로 정규화.** 해상도 0.1분(6초) → 노이즈 ±7% |
-| **dcu** | 리소스 × 시간 기반 비용 대리 지표 | **executor 축소 테스트의 핵심 지표.** duration은 늘어도 dcu가 줄면 축소 성공. duration만 보면 오판한다 |
+| **duration** | Spark 앱 실행 시간 | 데이터 크기가 매번 다르므로 **반드시 `초/GB`로 정규화.** 해상도 0.1분(6초) → 노이즈 ±7%. **executor를 줄이면 늘어나는 것이 정상** — 판정은 dcu로 |
+| **dcu** | 리소스 × 시간 기반 비용 대리 지표 | **executor 축소 테스트의 핵심 지표.** duration은 늘어도 dcu가 줄면 축소 성공. duration만 보면 오판한다. 같은 테이블 안에서는 `dcu/GB`(GB = Compaction 후 파일 합계 = DataFlint `output`), **테이블 사이 비교는 `dcu/100만 row`** — 수직분할 테이블은 row 수가 같고 폭만 다르다 (설계서 §8.3) |
 | **input / output** | 읽은 양 / 쓴 양 | `sort` 전략은 **2.0배**가 정상(샘플링 + 쓰기, 섹션 2.2). 벗어나면 무언가 변한 것 |
-| **shuffle read / write** | shuffle 데이터량 | 데이터 크기의 약 1.4배가 현재 수준. executor 축소 시 executor당 부담 증가를 함께 확인 |
+| **shuffle read / write** | shuffle 데이터량 | 데이터 크기의 **약 1.5배**(1번 1.41, 2번 1.57). task당 몫은 512MB × 1.5 ≈ **0.8GB로 데이터 양과 무관**, executor당 디스크는 약 4.7GB로 일정 (설계서 §8.2) |
 | **task error rate** | task 실패/재시도 비율 | 0이 아니면 OOM 또는 S3 타임아웃. `partial-progress=false`라 실패가 전체 롤백으로 이어져 중요 |
 
 **`idle cores`가 높을 때 — 원인 2가지와 반대되는 처방**
@@ -765,33 +767,24 @@ Airflow   : task duration (pod 기동 시간 역산용)
 
 ## 8. 미확정 및 후속 과제
 
-### 8.1 daily Compaction — rewrite-all 낭비 의심 ⚠️
+### 8.1 daily Compaction — 이 문서의 대상이 아니다
 
-hourly와 daily의 소요시간이 데이터 양에 거의 선형이다.
+daily Compaction DAG의 대상은 **`day` 파티션 테이블들**이며, hourly 테이블 4개와는 다른 테이블이다. 그 테이블들은 튜닝을 진행한 적이 없고 크기·파일 구성도 공유되지 않았다. 이 절에 있던 "888GB에 30~60분, `rewrite-all` 낭비 의심" 서술은 **2026-09-16에 폐기**했다 — 888GB는 hourly 1번 테이블 37GB × 24의 환산값이었고 daily 테이블의 실측이 아니었다. 실제 하루치는 1번 945GB, 2번 576GB다.
 
-```
-hourly:  37GB  → 2.0분 (튜닝 전)
-daily:  888GB  → 30~60분        ← 약 24배 선형
-```
-
-hourly가 매시간 출력을 75개 × 505MB(대부분 384MB 이상)로 정리한다면, daily는 **합칠 small file이 거의 없어 사실상 no-op에 가까워야 한다.** 그런데 데이터 양에 선형으로 소요된다.
-
-**가설**: daily도 `rewrite-all: true`로 888GB 전체를 다시 쓰고 있다. hourly와 달리 daily에서는 `rewrite-all: false`가 큰 이득일 수 있다.
-
-daily 단계에서 최우선으로 확인할 항목이다.
+daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤 별건으로 시작한다. hourly에서 확정한 계수(0.32, ratio 0.13, shuffle 1.5배)는 조건이 다르므로 그대로 쓰지 않는다.
 
 ### 8.2 남은 확인 항목
 
 | 항목 | 내용 | 우선순위 |
 |------|------|---------|
-| `MAX_EXECUTORS` 확정 | K8S namespace quota 확인. append(batch당 약 10 executor)와 동시 실행됨. **산정식 완성의 마지막 조각** | 높음 |
+| ~~`MAX_EXECUTORS` 확정~~ | **36 고정 (2026-09-16).** quota는 확인 불가하나 리소스가 넉넉하고, 실사용량은 ratio가 정하므로 천장은 무해 (설계서 §4.6, §7) | 완료 |
 | 확정 설정 운영 검증 | 여러 시간대에서 `spill 0`, `384MB 미만 파일 ≤ 2개`, DAG 전체 6분대 유지 확인 | 높음 |
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
-| 다른 hourly 테이블 3개 검증 | par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)를 재확인해야 한다 | 중간 |
+| 다른 hourly 테이블 검증 | **2번 완료** — 8대 + 20g 확정 (설계서 §5.2). **3·4번 남음** — 절차와 판정 기준은 설계서 §8.3. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
 
-**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정).
+**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(8회 → C=0.32 재확인, `spark.executor.instances` 규칙 발견).
 
 ### 8.3 재검증 트리거
 
