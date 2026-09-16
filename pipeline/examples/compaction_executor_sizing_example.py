@@ -37,8 +37,8 @@
   `compaction_specs` 안에 들어가므로 그 구조가 먼저 필요하다.
 
 적용 범위
-  **hourly 전용이다.** daily Compaction은 아직 튜닝하지 않았고 `rewrite-all` 낭비
-  의심이 남아 있어(guide §8.1) 계수 C를 그대로 쓸 수 없다.
+  **hourly 전용이다.** daily Compaction은 `day` 파티션 테이블 대상이며 튜닝한 적이
+  없고 크기·구성도 공유되지 않아(guide §8.1) 계수 C를 그대로 쓸 수 없다.
 """
 
 from __future__ import annotations
@@ -239,5 +239,5 @@ def compaction_specs_fragment(params):
 #    5분 주기로 점유하는 몫(batch당 약 10 executor)을 뺀 값으로 맞춘다.
 #
 # ⑤ daily에 그대로 쓰지 말 것
-#    C=0.32은 hourly 측정값이다. daily는 rewrite-all 낭비 의심이 남아 있어
-#    (guide §8.1) 그 확인이 끝난 뒤에 별도로 계수를 잡아야 한다.
+#    C=0.32은 hourly 측정값이다. daily는 대상 테이블(day 파티션)의 크기·구성을
+#    받은 뒤에 별도로 계수를 잡아야 한다 (guide §8.1).
