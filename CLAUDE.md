@@ -168,7 +168,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - 기존 `com_num_executor` 상수는 **fallback으로 유지** (조회 실패·0 반환·비정상 크기 전부). 지우면 Trino 장애가 곧 Compaction 실패가 된다
   - 미확인: Trino `$partitions`의 `partition.ts_hour` 타입, manifest pruning 동작 여부
   - 현재 데이터(36~42GB)에서 산정값이 12~14로 좁아 **정적 12로 운영하며 동적화를 미루는 선택도 가능**. `C=0.32`은 hourly 전용 — daily는 별도 측정 필요
-- **후속 과제 — daily Compaction 점검 (가이드 §8.1, 2026-09-15 전제 재검토)**: 원래 가설은 "hourly가 정리한 뒤라 no-op이어야 하는데 888GB에 30~60분 → `rewrite-all` 낭비". 그런데 **재처리 설계서 §1.1·§6.2는 hourly/daily DAG의 대상 테이블 그룹이 다르다고 기술**한다(daily 그룹 = `day` 파티션 테이블). 그렇다면 888GB는 하루치 append 원본 전체라 선형 소요가 정상이고 `rewrite-all`은 쟁점이 아니다. 37GB × 24 = 888GB로 hourly 테이블 하루치와 정확히 일치하는 점도 실측인지 환산인지 확인 필요. **최우선은 daily DAG의 테이블 Enum 확인**, 그 다음 daily run 1회에서 실행 옵션·실행 전 파일 크기 분포·`rewritten_bytes_count`·dcu 기록(§8.1.4). `rewrite-all=false`의 선별 로직은 Iceberg 1.10.1 소스로 확정(§8.1.2): 크기 범위 밖 파일만 후보 → group이 "2개 이상 AND (≥ `min-input-files` OR 합계 > target)"이면 rewrite. `sort` 전략도 같은 로직이며 `sort_order_id`는 안 본다. 파티션에 지연 small file 1개뿐이면 옵션으로 못 합친다. §3.1의 "`false`면 D 파티션이 `min-input-files`에 걸려 건너뛰어진다"는 서술은 정정(합계 > 512MB로 통과)
+- **후속 과제**: **daily Compaction의 `rewrite-all` 낭비 의심** — hourly가 정리한 뒤라 no-op이어야 하는데 888GB에 30~60분(데이터 양에 선형). daily 단계 최우선 확인 항목
 
 ## 작업 6: FileIO 전환 (S3AFileSystem → S3FileIO) — 전환 완료, 후속 작업 대기
 

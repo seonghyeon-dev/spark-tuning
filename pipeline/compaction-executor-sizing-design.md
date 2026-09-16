@@ -305,6 +305,6 @@ daily Compaction에 이 설계를 그대로 적용할 수 없다.
 
 - ratio 0.13은 hourly의 파일 구성·계수(C=0.32) 기준이다
 - daily는 30~60분 job이라 `executorIdleTimeout` 60초가 전체의 2~3%에 불과해 **반납이 실제로 일어날 수 있다.** 반납이 되면 판단 근거가 달라진다
-- daily는 대상 테이블·`rewrite-all` 전제가 미확인이다 (`compaction-tuning-guide.md` §8.1) — daily DAG이 hourly 테이블을 다시 도는지에 따라 쟁점 자체가 달라진다
+- daily는 `rewrite-all` 낭비 의심이 남아 있다 (`compaction-tuning-guide.md` §8.1)
 
 daily 튜닝 후 별도로 판단한다.

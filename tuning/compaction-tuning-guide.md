@@ -8,7 +8,7 @@
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
 | 대상 범위 | **hourly Compaction만.** daily Compaction은 별도 (섹션 8.1) |
-| 최종 수정일 | 2026-09-15 (§8.1 daily 전제 재검토, §3.1 정정) |
+| 최종 수정일 | 2026-08-13 |
 
 ### 근거 수준 라벨
 
@@ -199,9 +199,7 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 | `max-file-size-ratio` | 1.80 | 922MB 초과 파일도 대상 |
 | `delete-file-threshold` | 매우 큼 | delete file이 많으면 대상 |
 
-**유지 근거**: 입력 파일이 최대 72.3MB로 **703개 전부 384MB 미만**이므로, 조건을 보든 안 보든 처리 대상이 동일하다. 즉 `false`로 바꿔도 I/O 절감 효과가 없다. 얻는 것이 없는데 판정 조건만 늘어나므로 `true`를 유지한다.
-
-> **정정 (2026-09-15, 소스 확인)**: 이전에는 "`false`면 `min-input-files=5`에 걸려 par_a=D가 조용히 건너뛰어진다"고 썼으나, group 판정은 `min-input-files` **또는** `합계 > target-file-size` 중 하나만 만족하면 통과한다(`SizeBasedFileRewritePlanner.java:176-182`). D는 파일 수도 5개를 넘고 합계 0.9GB > 512MB이므로 건너뛰어지지 않는다. 건너뛰는 경우는 "파일 5개 미만이면서 합계 512MB 이하"인 파티션뿐이다. 선별 로직 전체는 섹션 8.1.2에 정리했다.
+**유지 근거**: 입력 파일이 최대 72.3MB로 **703개 전부 384MB 미만**이므로, 조건을 보든 안 보든 처리 대상이 동일하다. 즉 `false`로 바꿔도 I/O 절감 효과가 없다. 반면 `false`는 `min-input-files=5`에 걸려 파일 수가 적은 파티션(par_a=D)이 조용히 건너뛰어질 위험만 추가한다.
 
 > **전제**: 이 판단은 "입력이 전부 small file"에 의존한다. append 설정이 바뀌어 큰 파일이 생기면 재검토가 필요하다.
 
@@ -442,7 +440,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 | 영향 범위 | 파일 73~86개 중 **2개** |
 | 데이터 비중 | 37GB 중 **0.9GB (2.4%)** |
 | 조회 영향 | 무시 가능 |
-| daily Compaction 영향 | daily DAG이 이 테이블을 돈다면 `rewrite-all=true`로 재작성, `false`여도 2개 합계 > 512MB라 합쳐진다(섹션 8.1.2). 단 daily DAG이 hourly 테이블을 도는지 자체가 미확인이다(섹션 8.1.1) |
+| daily Compaction 영향 | `rewrite-all=true`라 어차피 재작성 |
 
 해소하려면 `target-file-size-bytes`를 830MB 이상으로 올려 D를 파일 1개로 만들어야 하는데, 그러면 **모든 파티션의 파일이 830MB가 되어** `iceberg-schema-design-guide.md` §6.5의 512MB 결정을 뒤집는다. 2.4% 데이터를 위해 치를 비용이 아니다.
 
@@ -718,7 +716,7 @@ desired = (데이터GB × 9 ÷ 4) × ratio = 데이터GB × 2.25 × ratio
 
 **조회 횟수**: `compaction_specs`는 DAG run당 1회 실행되고 그 안에서 테이블 수만큼 조회한다. hourly 테이블 4개 × 24시간 = 96회/일.
 
-**daily에 그대로 쓸 수 없다.** `C=0.32`은 hourly 측정값이며, daily는 대상 테이블·`rewrite-all` 전제 확인(섹션 8.1) 후 별도로 계수를 잡아야 한다.
+**daily에 그대로 쓸 수 없다.** `C=0.32`은 hourly 측정값이며, daily는 `rewrite-all` 낭비 의심(섹션 8.1) 확인 후 별도로 계수를 잡아야 한다.
 
 ---
 
@@ -767,7 +765,7 @@ Airflow   : task duration (pod 기동 시간 역산용)
 
 ## 8. 미확정 및 후속 과제
 
-### 8.1 daily Compaction — 점검 계획 ⚠️ (전제 확인이 먼저다)
+### 8.1 daily Compaction — rewrite-all 낭비 의심 ⚠️
 
 hourly와 daily의 소요시간이 데이터 양에 거의 선형이다.
 
@@ -776,74 +774,11 @@ hourly:  37GB  → 2.0분 (튜닝 전)
 daily:  888GB  → 30~60분        ← 약 24배 선형
 ```
 
-이 절은 원래 "hourly가 매시간 정리한 뒤라 daily는 no-op이어야 하는데 선형으로 걸린다 → `rewrite-all=true` 낭비"라는 가설이었다. **그 가설은 daily DAG이 hourly 테이블을 다시 도는 것을 전제한다.** 2026-09-15 점검에서 이 전제가 다른 문서와 충돌하는 것을 확인했다. 아래 순서로 확인한 뒤에야 튜닝에 들어갈 수 있다.
+hourly가 매시간 출력을 75개 × 505MB(대부분 384MB 이상)로 정리한다면, daily는 **합칠 small file이 거의 없어 사실상 no-op에 가까워야 한다.** 그런데 데이터 양에 선형으로 소요된다.
 
-#### 8.1.1 전제 충돌 — daily DAG의 대상 테이블이 무엇인가
+**가설**: daily도 `rewrite-all: true`로 888GB 전체를 다시 쓰고 있다. hourly와 달리 daily에서는 `rewrite-all: false`가 큰 이득일 수 있다.
 
-`pipeline/reprocessing-dag-design.md` §1.1은 테이블 20개 이상을 **첫 파티션 기준으로 hourly 그룹(`hour`)과 daily 그룹(`day`)으로 분류**하고, Compaction DAG은 "각 DAG 내부에서 **소속 테이블** task가 순차 실행"된다고 기술한다. 같은 문서 §6.2는 hourly Compaction과 daily Compaction이 "**대상 테이블 그룹이 달라** Iceberg 충돌이 없고 리소스 경합만 있다"고 명시한다.
-
-이 서술이 맞다면 **daily DAG은 이 문서의 hourly 테이블 4개를 건드리지 않는다.** 888GB는 `day(ts)` 파티션 테이블들의 **하루치 append 원본(전부 small file)** 이고, 그 경우 소요시간이 데이터 양에 선형인 것은 낭비가 아니라 **정상**이다 — hourly의 703개 입력이 전부 384MB 미만이라 `rewrite-all` 값이 결과를 바꾸지 않았던 것(§3.1)과 같은 상황이 daily에서도 성립한다.
-
-두 해석 중 어느 쪽인지는 코드로만 확정된다.
-
-| 확인 항목 | 어디서 | 갈리는 결론 |
-|----------|--------|------------|
-| daily DAG의 테이블 Enum에 hourly 테이블 4개가 포함되는가 | `iceberg.py`의 daily Enum 클래스 | 포함 → 원래 가설 유효. 미포함 → 가설 폐기, 8.1.3으로 |
-| 888GB·30~60분이 어느 테이블(들)의 값인가 | daily DAG run의 Spark UI / DataFlint | 37GB × 24 = 888GB로 **hourly 테이블의 하루치와 정확히 일치**한다. 실측이 아니라 환산값이었을 가능성을 배제해야 한다 |
-| daily 테이블의 파티션 스펙 | `SHOW CREATE TABLE` | `day(ts)` 단독이면 하루 1파티션 = file group 1개(100GB 초과 시 분할) — hourly와 구조가 전혀 다르다 |
-
-#### 8.1.2 `rewrite-all=false`의 실제 동작 (Iceberg 1.10.1 소스 확인 ✅)
-
-가설이 유효한 경우(daily가 hourly 테이블을 다시 도는 경우)에 `rewrite-all=false`가 무엇을 걸러내는지 소스로 확정했다. `sort` 전략도 같은 선별 로직을 쓴다 — `SparkShufflingDataRewritePlanner`가 `BinPackRewriteFilePlanner`를 상속하며 `filterFiles`/`filterFileGroups`를 재정의하지 않는다(`SparkShufflingDataRewritePlanner.java:35`, 재정의는 `compression-factor` 관련 3개뿐). **파일의 `sort_order_id`는 보지 않는다** — 정렬 안 된 파일도 크기만 맞으면 대상에서 빠진다.
-
-선별은 2단계다 (`SizeBasedFileRewritePlanner.java:169-174`).
-
-```
-① 파일 필터  : 크기가 [min-file-size, max-file-size] 밖인 파일만 남긴다
-               (`outsideDesiredFileSizeRange`, :165-167)
-               + delete file 조건 (`BinPackRewriteFilePlanner.java:189-194`, append 전용 테이블은 무관)
-② group 필터 : ①에서 남은 파일을 파티션별로 bin-packing한 뒤, 아래 하나라도 만족하는 group만 rewrite
-               (`BinPackRewriteFilePlanner.java:197-205`, 아래 세 판정은 `SizeBasedFileRewritePlanner.java`)
-               - enoughInputFiles : 파일 2개 이상 AND 파일 수 ≥ min-input-files(5)     (:176-178)
-               - enoughContent    : 파일 2개 이상 AND 합계 > target-file-size(512MB)  (:180-182)
-               - tooMuchContent   : 합계 > max-file-size(922MB)                      (:184-186)
-```
-
-`rewrite-all=true`면 두 단계를 모두 건너뛴다(`:170`, `:173`).
-
-hourly 출력(75개 × 505MB, 384MB 이상)에 이 로직을 적용하면:
-
-| 파일 | ① 파일 필터 | ② group 필터 | 결과 |
-|------|------------|-------------|------|
-| hourly가 만든 505MB 파일 73개 | 범위 안 → **제외** | — | 안 읽는다 |
-| `par_a=D`의 300MB대 2개 (§4.3) | 범위 밖 → 후보 | 2개, 합 0.6~0.8GB > 512MB → enoughContent | **rewrite → 1개로 합쳐진다** |
-| hourly 이후 도착한 지연 데이터 small file | 범위 밖 → 후보 | 파티션당 2개 이상이면 대부분 통과 | rewrite |
-| 파티션에 지연 small file이 **1개뿐** | 범위 밖 → 후보 | `group.size() > 1` 조건에 걸려 전부 false | **그대로 남는다** — 옵션으로 못 바꾼다 |
-
-즉 가설이 맞다면 `false`로 바꿀 때 읽는 양이 888GB에서 **지연 도착분 + D 파티션 수준**으로 줄어든다. 부작용은 하나다: 지연 small file끼리만 정렬해 합치므로, 그 파티션은 hourly 출력과 **sort 범위가 겹치는 파일**을 갖게 된다. `sort_a` 등가 조건이 파일 1개 대신 2개를 여는 정도이며, 지연 데이터 비중이 작으면 무시할 수 있다.
-
-> §3.1의 "`false`는 `min-input-files=5`에 걸려 par_a=D를 건너뛸 위험" 서술은 이 소스 확인으로 **정정**했다. D는 12 batch 이상이 쌓여 파일 5개를 넘고, 넘지 않더라도 합계 0.9GB > 512MB로 enoughContent를 통과한다. 건너뛰는 경우는 "파일 5개 미만 **이면서** 합계 512MB 이하"인 파티션뿐이다.
-
-#### 8.1.3 가설이 폐기될 경우 — daily 테이블 자체의 튜닝
-
-daily DAG이 `day(ts)` 테이블만 돈다면 `rewrite-all`은 쟁점이 아니고, hourly에서 확정한 구조가 그대로 질문이 된다.
-
-- **file group 구조**: `day(ts)` 파티션 하나가 100GB를 넘으면 `max-file-group-size-bytes` 기본값으로도 분할된다(§3.1 100GB 항목의 경고가 현실이 된다). group 하나의 shuffle이 executor local disk에 쌓이므로, 분할 여부보다 **group 하나의 최대 크기와 executor 수의 곱이 ephemeral storage 한도 안인지**가 먼저다
-- **회차 분할**: group 수와 `max-concurrent-file-group-rewrites`의 관계는 §4.1과 동일하게 본다
-- **executor 계수**: `C=0.32`(§6.4)와 ratio 0.13(`compaction-executor-sizing-design.md`)은 hourly 파일 구성 기준이다. daily는 30~60분 job이라 `executorIdleTimeout` 60초로 **반납이 실제로 일어날 수 있어** 판단 근거가 달라진다(설계서 §11)
-- **`dcu/GB` 기준선**: hourly 확정값 2.41초/GB, 0.00219 dcu/GB와 비교해 daily의 초/GB·dcu/GB를 먼저 놓는다. 이 비교가 "daily가 비효율적인가"의 유일한 판정 지표다 — duration 30~60분 자체는 데이터 양 때문일 수 있다
-
-#### 8.1.4 첫 측정에서 기록할 것
-
-전제 확인(8.1.1)과 동시에 daily run 1회에서 아래를 기록하면 8.1.2/8.1.3 어느 쪽이든 바로 판정할 수 있다.
-
-| 항목 | 출처 | 판정 |
-|------|------|------|
-| 실행 옵션 전체 (`strategy`, `rewrite-all`, `target-file-size-bytes`, `max-concurrent-file-group-rewrites`, `max-file-group-size-bytes`) | daily DAG의 SparkApplication 인자 | 현재 값 확정 |
-| 실행 전 파일 크기 분포 — 384MB 미만 / 384~922MB / 922MB 초과 각각의 **개수와 합계 크기** | `.files` (`file_size_in_bytes`), `WHERE partition` 필터 필수 | 384MB 이상이 대부분이면 `rewrite-all=true`가 그만큼을 불필요하게 읽는다. 전부 384MB 미만이면 `rewrite-all` 무관 |
-| `rewritten_data_files_count` / `added_data_files_count` / `rewritten_bytes_count` | `CALL rewrite_data_files` 반환값 (Spark driver 로그) | `rewritten_bytes_count`가 실행 전 총 크기와 같으면 전체 재작성 |
-| file group 수, 회차 수 | driver 로그 `Rewrite Files Ready to be Committed`(`RewriteDataFilesSparkAction.java:218`), Spark UI job 수 ÷ 2 (§2.2) | 회차 분할 여부 |
-| cores·duration·dcu, `spill`, `idle cores`, `input`/`output` 비 | DataFlint (§7.2) | hourly 기준선과 비교. `input = output × 2.0`이면 sort 전략 정상 |
+daily 단계에서 최우선으로 확인할 항목이다.
 
 ### 8.2 남은 확인 항목
 
@@ -911,7 +846,6 @@ daily DAG이 `day(ts)` 테이블만 돈다면 `rewrite-all`은 쟁점이 아니�
 
 - [Iceberg Spark Procedures — rewrite_data_files](https://iceberg.apache.org/docs/latest/spark-procedures/#rewrite_data_files)
 - [Iceberg SizeBasedFileRewriter Javadoc](https://iceberg.apache.org/javadoc/1.4.1/org/apache/iceberg/actions/SizeBasedFileRewriter.html)
-- Iceberg 1.10.1 소스 (섹션 8.1.2의 줄 번호 기준): `core/.../actions/SizeBasedFileRewritePlanner.java`, `core/.../actions/BinPackRewriteFilePlanner.java`, `spark/v3.5/.../spark/actions/SparkShufflingDataRewritePlanner.java`, `spark/v3.5/.../spark/actions/RewriteDataFilesSparkAction.java` (태그 `apache-iceberg-1.10.1`)
 - [Iceberg Maintenance](https://iceberg.apache.org/docs/latest/maintenance/)
 - [Spark 4.1.1 SQL Performance Tuning (AQE)](https://spark.apache.org/docs/4.1.1/sql-performance-tuning.html)
 - [Spark on Kubernetes](https://spark.apache.org/docs/4.1.1/running-on-kubernetes.html)

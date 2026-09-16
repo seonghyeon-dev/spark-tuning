@@ -1716,7 +1716,7 @@ Phase 1이 안정되면 확대한다. 여기서부터는 **대용량 읽기/쓰�
 | 4 | 출력 파일 크기 분포 확인 (`384MB 미만 파일 3개 이상`이 모니터링 기준) |
 | 5 | 이상 없으면 hourly 전체 → daily 확대 |
 
-> Compaction 확대 시점에 `daily Compaction 점검`(작업 5 후속 과제 — daily DAG의 대상 테이블 확인이 먼저다, `compaction-tuning-guide.md` §8.1)을 같이 하면 측정을 한 번에 끝낼 수 있다.
+> Compaction 확대 시점에 `daily Compaction의 rewrite-all 낭비` 확인(작업 5 후속 과제)을 같이 하면 측정을 한 번에 끝낼 수 있다.
 
 ### 5.4 Phase 3 — append DAG
 
