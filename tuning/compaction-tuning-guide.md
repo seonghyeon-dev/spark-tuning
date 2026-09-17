@@ -171,14 +171,14 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 
 **즉 출력 파일 크기를 조절하는 손잡이는 `target-file-size-bytes`이다.** 이 사실이 `advisory-partition-size`가 무효라는 판정의 근거가 된다 (섹션 3.2).
 
-### 2.4 데이터 흐름 — 카드 77묶음 비유
+### 2.4 데이터 흐름 — 카드 76묶음 비유
 
-3번 테이블 test2의 실측(output 38GB, input 76GB, shuffle 58GB)으로 설명한다. 340만 장의 카드를 `sort_a` 순서로 77묶음(파일 77개)으로 나누는 작업이라고 보면 된다.
+3번 테이블 test2의 실측(output 38GB, input 76GB, shuffle 58GB)으로 설명한다. 340만 장의 카드를 `sort_a` 순서로 76묶음(파일 76개)으로 나누는 작업이라고 보면 된다.
 
 | 단계 | 하는 일 | DataFlint 지표 |
 |------|--------|---------------|
-| ① 경계 정하기 | 카드 전체를 한 번 훑어 "1묶음은 여기부터 여기까지, 2묶음은 …" 77개 경계를 정한다. 표본 조사다 | input에 38GB (첫 번째 읽기) |
-| ② 통에 나눠 넣기 = **shuffle write** | 12대의 executor가 카드를 다시 읽으면서 카드마다 "너는 23번 묶음"이라고 번호를 붙여 **자기 executor 디스크의 23번 통**에 넣는다. executor마다 통이 77개씩 생긴다 | input에 38GB 더 (두 번째 읽기), shuffle write 58GB |
+| ① 경계 정하기 | 카드 전체를 한 번 훑어 "1묶음은 여기부터 여기까지, 2묶음은 …" 76개 경계를 정한다. 표본 조사다 | input에 38GB (첫 번째 읽기) |
+| ② 통에 나눠 넣기 = **shuffle write** | 12대의 executor가 카드를 다시 읽으면서 카드마다 "너는 23번 묶음"이라고 번호를 붙여 **자기 executor 디스크의 23번 통**에 넣는다. executor마다 통이 76개씩 생긴다 | input에 38GB 더 (두 번째 읽기), shuffle write 58GB |
 | ③ 통 모으기 = **shuffle read** | 묶음마다 담당 task가 하나씩 떠서 12대 executor 전부에서 "23번 통"을 네트워크로 가져온다 | shuffle read 58GB (넣은 걸 다 가져오므로 write와 같다) |
 | ④ 정렬해서 쓰기 | 가져온 카드를 메모리에서 정렬해 파일 1개(약 512MB)로 쓴다 | output 38GB |
 
@@ -188,7 +188,7 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 
 **shuffle read = write인 이유**: 같은 데이터의 양면이다. 넣은 것을 전부 한 번씩 가져가니 총량이 같다. 달라지는 경우는 task 재시도로 다시 읽었을 때(read가 커짐), 실패로 안 읽은 출력이 있을 때(read가 작아짐) 정도다. 같으면 정상이고, 크게 다르면 그게 이상 신호다.
 
-**shuffle이 38GB가 아니라 58GB인 이유**: parquet 파일은 컬럼 단위로 잘 압축돼 있고, 통에 넣을 때는 row 단위로 담아서 덜 압축된다. 실측 배수는 1번 1.41, 2번 1.57, 3번 1.51이다 (설계서 §8.2).
+**shuffle이 38GB가 아니라 58GB인 이유**: parquet 파일은 컬럼 단위로 잘 압축돼 있고, 통에 넣을 때는 row 단위로 담아서 덜 압축된다. 실측 배수는 1번 1.41, 2번 1.57, 3번 1.51이다 (설계서 §8.2 표).
 
 ---
 
@@ -808,7 +808,7 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
 | 다른 hourly 테이블 검증 | **2번(8대 + 20g)·3번(12대 + 20g) 완료** (설계서 §5.2, §5.3). **4번 남음** — 절차와 판정 기준은 설계서 §8.3. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
 
-**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(8회 → C=0.32 재확인, `spark.executor.instances` 규칙 발견).
+**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(9회 → 8대 + 20g, `spark.executor.instances` 규칙 발견), 3번 테이블 검증(6회 → 12대 + 20g, C=0.32 재확인).
 
 ### 8.3 재검증 트리거
 

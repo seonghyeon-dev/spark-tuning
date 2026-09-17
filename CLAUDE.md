@@ -29,7 +29,7 @@
 - 결과값과 설명은 무조건 한글로 작성
 - 기술 용어는 영어 원어 사용 (Compaction, Bucketing, small file 등 — 한글 음차/번역 금지)
 - Confluence 호환 마크다운 (표, 코드블록, 헤더, 인용블록 등)
-- **설명 방식 (사용자 요청 2026-09-17)**: 결론 먼저, 그다음 **실측 숫자 하나를 잡아 그 숫자로 단계별 설명**. 추상 용어 나열 금지 — 비유(카드 77묶음, 통에 나눠 넣기)와 "왜 그런가"를 한 문장씩. 지표는 무엇의 크기인지(예: dcu/GB의 GB = Compaction 후 파일 합계) 먼저 정의. 상수(0.32 등)는 어디서 나온 숫자인지 유도 과정을 보여 줄 것. 모범: `compaction-tuning-guide.md` §2.4, 설계서 §4.4 "쉽게 말하면", §8.1, §8.4
+- **설명 방식 (사용자 요청 2026-09-17)**: 결론 먼저, 그다음 **실측 숫자 하나를 잡아 그 숫자로 단계별 설명**. 추상 용어 나열 금지 — 비유(카드 76묶음, 통에 나눠 넣기)와 "왜 그런가"를 한 문장씩. 지표는 무엇의 크기인지(예: dcu/GB의 GB = Compaction 후 파일 합계) 먼저 정의. 상수(0.32 등)는 어디서 나온 숫자인지 유도 과정을 보여 줄 것. 모범: `compaction-tuning-guide.md` §2.4, 설계서 §4.4 "쉽게 말하면", §8.1, §8.4
 
 ## 공통 컨텍스트
 
@@ -163,7 +163,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **판정 원칙 (설계서 §8.3)**: 같은 테이블 안에서 spill 0 + dcu 최저. 테이블 사이 dcu/GB는 착시(row 폭), dcu/100만 row는 참고만(컬럼 타입에 따라 row당 비용이 다름 — 1번 0.024, 2번 0.021, 3번 0.031). GB = Compaction 후 파일 합계(DataFlint `output`)
   - **`memoryOverhead` 4g는 미튜닝 (설계서 §8.4)** — heap 바깥(JVM·netty shuffle 버퍼·압축 네이티브) 몫. **pod 점유 = heap + overhead**(3번 20g + 4g = 24g × 12 = 288g). Grafana executor pod working set − heap으로 실측해 축소 검토(사용자 방침: 최적 메모리만 쓴다, 1g면 1g). 테이블별로 다 잴 필요 없음 — shuffle 최대 테이블 1개에서 재서 공통 적용. 줄인 값은 운영 전 1회 검증(`OOMKilled`·`ExecutorLostFailure` 없는지)
   - **DA 동작 (설계서 §4.4 "쉽게 말하면")**: 목표 대수 = ceil((실행 중 + 대기 task) × 0.13 ÷ 4). 1초 backlog 후 1·2·4·8로 증원, 상한 36, 시작 대수 아래로는 안 내려감. **input이 많으면 늘어난다** — 평소 1시간치는 시작 대수 그대로, 재처리 2~3시간치에서만 증원
-  - **Compaction 데이터 흐름 (가이드 §2.4, 카드 77묶음 비유)**: ①경계 정하기(첫 읽기) → ②shuffle write(둘째 읽기, executor 디스크의 묶음별 통) → ③shuffle read(통 모으기, write와 같은 양이 정상) → ④정렬·쓰기. input = output × 2는 ①②가 같은 파일을 각각 읽어서. write가 먼저인 이유는 ③이 ②의 전부를 기다려야 해서
+  - **Compaction 데이터 흐름 (가이드 §2.4, 카드 76묶음 비유)**: ①경계 정하기(첫 읽기) → ②shuffle write(둘째 읽기, executor 디스크의 묶음별 통) → ③shuffle read(통 모으기, write와 같은 양이 정상) → ④정렬·쓰기. input = output × 2는 ①②가 같은 파일을 각각 읽어서. write가 먼저인 이유는 ③이 ②의 전부를 기다려야 해서
   - **shuffle·메모리 산정 규칙 (설계서 §8.2)**: shuffle 총량 ≈ 데이터 × 1.5(실측 1.41·1.57), task당 shuffle ≈ 512MB × 1.5 = 0.8GB로 데이터 양과 무관, executor당 디스크 ≈ 1.5 ÷ 0.32 ≈ 4.7GB 일정. task당 정렬 메모리 = `(executor memory − 300MiB) × 0.6 ÷ cores`(16g 2.4GB, 20g 3.0GB — Spark `tuning.md`·`ExecutionMemoryPool.scala` 1/N 규칙). **2번이 16g에서 spill 나는 이유는 task당 row 수** — 512MB 파일에 7KB row가 7.2만 개(1번 11KB row 4.5만 개). spill은 시간대 데이터 양이 아니라 테이블 row 모양이 정한다
   - **0.32는 비례식이다** — "37GB에 12대가 dcu 최저"를 12 ÷ 37.3으로 환산한 것. 방법(최저점 실측 → 비례 확장)은 일반적, 값은 이 job(4core·512MB·sort) 전용
   - **4번 절차**: `instances`=init=min=`ceil(시간당 GB × 0.32)`, ratio 0.13, max 36, **20g로 바로 1회**(3개 중 2개가 16g에서 spill). 판정: 수렴 대수, spill 0, duration 2분 이내, 384MB 미만 파일 3개 미만 (설계서 §8.3)
