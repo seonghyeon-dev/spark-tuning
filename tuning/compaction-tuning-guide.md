@@ -480,8 +480,9 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 | Spark | `advisory-partition-size` | **삭제** | ✅ | 무효 확정 |
 | Spark | `coalescePartitions.parallelismFirst` | **삭제 가능** | ✅ | 무효 확정 (T8) |
 | 리소스 | `driver cpu` / `memory` | **2** / 4GB | 📘 | 효과는 노이즈 범위, 저렴해서 유지 |
-| 리소스 | `executor cpu` / `memory` | 4 / **16GB (1번)·20GB (2번)** | ✅ | spill 0 유지가 기준. 테이블별 판단 — 설계서 §8.2 |
-| 리소스 | `num-executors` | **테이블별** — 1번 12, 2번 8 (`시간당 GB × 0.32`) | ✅ | dcu 최저점. 섹션 4.4, 6. DA에서는 `spark.executor.instances` = `initialExecutors` = `minExecutors`로 넣는다 (설계서 §4.8) |
+| 리소스 | `executor cpu` / `memory` | 4 / **16GB (1번)·20GB (2·3번)** | ✅ | spill 0이 되는 최소값. 메모리도 dcu에 반영(+5~6%/4g) — 설계서 §8.2, §8.3 |
+| 리소스 | `executor memoryOverhead` | 4g (미튜닝) | ⚠️ | pod 점유 = heap + overhead. 실측 후 축소 검토 — 설계서 §8.4 |
+| 리소스 | `num-executors` | **테이블별** — 1번 12, 2번 8, 3번 12 (`시간당 GB × 0.32`) | ✅ | dcu 최저점. 섹션 4.4, 6. DA에서는 `spark.executor.instances` = `initialExecutors` = `minExecutors`로 넣는다 (설계서 §4.8) |
 | 전략 | rewrite 전략 | `sort` | ✅ | 미적용 시 조회 40% 저하 |
 
 **변경 전후 요약** (baseline → T6)
@@ -655,6 +656,8 @@ num_executors = min(max(num_executors, MIN_EXECUTORS), MAX_EXECUTORS)
 
 `dcu`는 `cores × duration`에 비례한다 (9회 측정 비율 49,000~53,500, ±5%). `duration`보다 해상도가 좋아 주 지표로 적합하다.
 
+> **메모리도 dcu에 들어간다 (2026-09-17 확인).** 위 비례는 executor memory를 16g로 고정했을 때의 관측이다. 2번·3번 테이블에서 duration이 같은 16g ↔ 20g 쌍의 dcu가 일관되게 +5~6%였다. 메모리 증설은 spill을 없애는 데 필요한 만큼만 한다 (설계서 §5.3, §8.3).
+
 **상한·하한**
 
 | 항목 | 값 | 근거 |
@@ -782,7 +785,7 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
-| 다른 hourly 테이블 검증 | **2번 완료** — 8대 + 20g 확정 (설계서 §5.2). **3·4번 남음** — 절차와 판정 기준은 설계서 §8.3. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
+| 다른 hourly 테이블 검증 | **2번(8대 + 20g)·3번(12대 + 20g) 완료** (설계서 §5.2, §5.3). **4번 남음** — 절차와 판정 기준은 설계서 §8.3. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
 
 **완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(8회 → C=0.32 재확인, `spark.executor.instances` 규칙 발견).
 
