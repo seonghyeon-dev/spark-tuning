@@ -321,6 +321,34 @@ test2 입력: 704개 / avg 55.8MB / 38.4GB — 1번(703개, 54MB)과 같은 파�
 
 ---
 
+### 5.4 4번 테이블 (시간당 약 37~39GB) — 2회 측정, 12대 + 20g 확정
+
+측정 대상: 2026-08-12 09~10시 데이터, 2026-09-17 실행. 크기·row 수·입력 파일 구성(723개, avg 54.5MB)이 1번·3번과 같다. 공통 설정: executor 4core, ratio 0.13, `maxExecutors` 36, `memoryOverhead` 4g, driver 2core/4g.
+
+| 회차 | 시간 | 데이터 | 시작 | e.mem | 대수 | duration | dcu | dcu/GB | dcu/100만 row | idle | memory | spill | 파일 |
+|------|------|--------|------|-------|------|----------|-----|--------|--------------|------|--------|-------|------|
+| test1 | 09시 | 38.5GB | 8 | 16g | 8 → 12 | 2.1m | 0.1198 | 0.00311 | 0.0347 | 18.4% | 87.4% | **1.76GiB** | 77개, min 335MB |
+| **test2** | 10시 | 37.2GB | 12 | **20g** | 12 | 1.7m | 0.1042 | 0.00280 | 0.0314 | 20.5% | 94.8% | **0** | 74개, min 401MB |
+
+3번과 같은 결과다. ratio 0.13이 12로 수렴(38 × 0.32 = 12.3), 16g에서 spill, 20g에서 0, row당 비용은 3번(0.030~0.032)과 같은 수준. test2가 운영 형태(12대 시작, 20g) 그대로라 추가 실행 없이 확정한다.
+
+**확정 설정 (4번 테이블)** — 3번과 동일. `instances` = init = min = **12**, executor memory **20g**.
+
+### 5.5 4개 테이블 확정 설정 요약
+
+| 테이블 | 시간당 데이터 | `instances` = init = min | executor memory | dcu/100만 row (확정 설정) | 검증 횟수 |
+|--------|--------------|-------------------------|-----------------|--------------------------|----------|
+| 1번 | 37~40GB | 12 | 16g | 0.0241 | 7회 (섹션 5.1) |
+| 2번 | 23~25GB | 8 | 20g | 0.0206~0.0219 | 9회 (섹션 5.2) |
+| 3번 | 37~40GB | 12 | 20g | 0.0295~0.0324 | 6회 (섹션 5.3) |
+| 4번 | 37~39GB | 12 | 20g | 0.0314 | 2회 (섹션 5.4) |
+
+공통: `dynamicAllocation.enabled=true`, `executorAllocationRatio=0.13`, `maxExecutors=36`, executor 4core, `memoryOverhead` 4g(미튜닝, 섹션 8.4), driver 2core/4g, Iceberg 옵션은 `tuning/compaction-tuning-guide.md` §5.
+
+**idle cores 17~25%는 구조적인 값이다.** 12대 × 4core = 48 slot인데 정렬·쓰기 task는 출력 파일 수만큼(74~77개)이라 첫 회차 48개 뒤 둘째 회차에 26~29개만 남아 slot 19~22개가 논다. 이 구간의 idle이 40%대이고 앞 단계까지 평균 내면 job 전체 17~25%다. 1번 확정값 16.7%도 같은 구조이며, 17~25%의 흔들림은 둘째 회차 꼬리와 duration 반올림(0.1분 = 6%)이다. 3번 test1(8 → 12) 18%와 test2(12 시작) 20%가 같으므로 warm-up과는 무관하다. 줄이려면 slot을 task 수에 맞춰야 하는데 20대(80 slot, 1회차)는 코어가 늘어 dcu가 오르고(1번에서 16대가 +15%), 10대(40 slot, 40 + 37)는 이득이 노이즈 15% 안일 가능성이 커 쫓지 않는다. `tuning/compaction-tuning-guide.md` §7.2의 "20% 이하면 양호"는 DataFlint 경고 기준이지 판정 기준이 아니다.
+
+---
+
 ## 6. C안: 사전 산정 (보류)
 
 Airflow가 Trino로 `.partitions`를 조회해 데이터 양을 파악하고 executor 수를 결정하는 방식이다. 구현 스켈레톤은 `pipeline/examples/compaction_executor_sizing_example.py`에 있다.
@@ -471,10 +499,11 @@ task 하나가 정렬하는 **byte**는 두 테이블이 같지만(0.8GB), **row
 
 **pod가 점유하는 메모리는 두 값의 합이다.** K8s는 컨테이너 전체를 보므로 Spark이 pod의 memory request/limit을 `executor.memory + memoryOverhead`로 잡는다. 3번 테이블은 executor당 20g + 4g = 24g, 12대면 **288g**이다. `memoryOverhead`를 1g로 줄이면 252g다.
 
-4g는 튜닝된 값이 아니다. 필요량을 재는 방법은 두 가지다.
+4g는 튜닝된 값이 아니다. 필요량을 재는 방법은 세 가지다.
 
-1. **실측 (권장)**: Grafana의 executor pod `container_memory_working_set_bytes` 최고값에서 heap 크기를 빼면 실제 non-heap 사용량이다. heap이 94~97%까지 차는 job이라 working set ≈ heap + non-heap이다. 이 값에 여유를 두어 정한다
-2. **시행착오**: 값을 줄여 돌리고 executor pod가 K8s에 죽는지(`OOMKilled`, exit code 137, driver 로그 `ExecutorLostFailure`) 본다. `partial-progress=false`라 executor 하나가 죽으면 job 전체가 실패하므로 운영 전 테스트에서만
+1. **Spark 자체 지표 (권장, Grafana 불필요)**: `spark.executor.processTreeMetrics.enabled=true`를 켜고 돌린 뒤 driver REST API `http://<driver>:4040/api/v1/applications/<app-id>/executors`(종료 후에는 History Server의 같은 경로)에서 executor마다 `peakMemoryMetrics`를 본다. `ProcessTreeJVMRSSMemory`가 executor 프로세스가 실제로 점유한 물리 메모리 최고값(= pod가 쓴 양)이고, `JVMHeapMemory`가 그중 heap 몫이다. **두 값의 차가 heap 바깥에서 실제로 쓴 양**이며 그것이 `memoryOverhead`에 필요한 크기다. 예: RSS 최고 21.2g, heap 20g → 1.2g 사용 → 여유를 두어 1.5~2g. Spark UI Executors 탭의 Peak Memory 열에서도 같은 값을 볼 수 있다
+2. **kubelet 지표 (교차 확인)**: job이 도는 2분 동안 `kubectl top pod -n <namespace> -l spark-role=executor`를 5초 간격으로 돌려 최고값을 본다. Grafana의 `container_memory_working_set_bytes`와 같은 출처다. heap이 94~97%까지 차는 job이라 최고값 − heap ≈ non-heap 사용량이다
+3. **시행착오**: 값을 줄여 돌리고 executor pod가 K8s에 죽는지(`OOMKilled`, exit code 137, driver 로그 `ExecutorLostFailure`) 본다. `partial-progress=false`라 executor 하나가 죽으면 job 전체가 실패하므로 운영 전 테스트에서만
 
 **테이블별로 다 잴 필요는 없다.** non-heap 사용량은 row 모양보다 shuffle 전송량·동시 task 수에 좌우되므로, shuffle이 가장 큰 3번(또는 1번)에서 재고 그 값을 전 테이블에 쓴다. 메모리는 dcu에 반영되므로(섹션 5.3) 여기서 줄인 만큼 비용이 준다.
 
