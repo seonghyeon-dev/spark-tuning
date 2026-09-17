@@ -8,7 +8,7 @@
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
 | 대상 범위 | **hourly Compaction만.** 1번 테이블 기준으로 튜닝, 2·3·4번 검증 완료(`pipeline/compaction-executor-sizing-design.md` §5.5). daily Compaction은 대상 외 (섹션 8.1) |
-| 최종 수정일 | 2026-09-16 (2번 테이블 검증 결과·테이블별 설정 반영) |
+| 최종 수정일 | 2026-09-17 (2·3·4번 테이블 검증 결과·테이블별 설정 반영) |
 
 ### 근거 수준 라벨
 
@@ -808,7 +808,7 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
 | ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 20g (설계서 §5.5). 남은 것은 `memoryOverhead` 실측(설계서 §8.4)과 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
 
-**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(9회 → 8대 + 20g, `spark.executor.instances` 규칙 발견), 3번 테이블 검증(6회 → 12대 + 20g, C=0.32 재확인).
+**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(9회 → 8대 + 20g, `spark.executor.instances` 규칙 발견), 3번 테이블 검증(6회 → 12대 + 20g, C=0.32 재확인), 4번 테이블 검증(2회 → 12대 + 20g).
 
 ### 8.3 재검증 트리거
 

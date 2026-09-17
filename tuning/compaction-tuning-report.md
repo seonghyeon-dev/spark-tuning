@@ -197,7 +197,6 @@
 |------|------|
 | `memoryOverhead` 축소 | 4g는 튜닝된 값이 아님. pod 메모리 = heap + overhead 이므로 실측(Spark `processTreeMetrics`) 후 줄이면 자원 비용 감소. **DAG 반영 전 마지막 항목** |
 | DAG 반영 | 4개 테이블 확정 완료. `memoryOverhead` 확정 후 일괄 적용 |
-| DAG 반영 | 4개 테이블 확정 후 일괄 적용. 현재 미반영 |
 | daily Compaction | 별건. `day` 파티션 테이블 대상이며 크기·구성 미공유 — 이 문서 범위 밖 |
 
 ---
