@@ -21,7 +21,7 @@
 ### 목차
 
 - [1. 개요](#1-개요) — 범위, 대상 테이블, 초기 상태
-- [2. Compaction 동작 원리](#2-compaction-동작-원리) — file group, 출력 파일 수 결정 방식
+- [2. Compaction 동작 원리](#2-compaction-동작-원리) — file group, 출력 파일 수 결정 방식, 데이터 흐름(shuffle)
 - [3. 옵션 및 설정 설명](#3-옵션-및-설정-설명) — Iceberg 옵션, Spark 설정, 리소스, filter
 - [4. 최적화 과정](#4-최적화-과정) — 병목 분석, 테스트 결과 9회, min_size 원인, num-executors 캘리브레이션
 - [5. 확정 설정](#5-확정-설정) — 최종 설정과 근거 요약
@@ -151,7 +151,7 @@ Spark UI에서 file group 하나당 job이 2개 생성된다 (7 group → 14 job
 | 1번째 | **정렬 범위 샘플링** — `repartitionByRange`가 범위 경계를 정하기 위해 전체 데이터를 읽음 | 짧음 (3~9초) |
 | 2번째 | 실제 정렬 + 쓰기 | 김 (16~26초) |
 
-**증거**: DataFlint `input: 74.06GiB` = `output: 37.03GiB × 2`. `sort` 전략은 **데이터를 2번 읽는다.**
+**증거**: DataFlint `input: 74.06GiB` = `output: 37.03GiB × 2`. `sort` 전략은 **데이터를 2번 읽는다.** 흐름 전체는 섹션 2.4.
 
 ### 2.3 출력 파일 수 결정 방식 ✅
 
@@ -170,6 +170,25 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 | 38.3GB | 77 | 76 |
 
 **즉 출력 파일 크기를 조절하는 손잡이는 `target-file-size-bytes`이다.** 이 사실이 `advisory-partition-size`가 무효라는 판정의 근거가 된다 (섹션 3.2).
+
+### 2.4 데이터 흐름 — 카드 77묶음 비유
+
+3번 테이블 test2의 실측(output 38GB, input 76GB, shuffle 58GB)으로 설명한다. 340만 장의 카드를 `sort_a` 순서로 77묶음(파일 77개)으로 나누는 작업이라고 보면 된다.
+
+| 단계 | 하는 일 | DataFlint 지표 |
+|------|--------|---------------|
+| ① 경계 정하기 | 카드 전체를 한 번 훑어 "1묶음은 여기부터 여기까지, 2묶음은 …" 77개 경계를 정한다. 표본 조사다 | input에 38GB (첫 번째 읽기) |
+| ② 통에 나눠 넣기 = **shuffle write** | 12대의 executor가 카드를 다시 읽으면서 카드마다 "너는 23번 묶음"이라고 번호를 붙여 **자기 executor 디스크의 23번 통**에 넣는다. executor마다 통이 77개씩 생긴다 | input에 38GB 더 (두 번째 읽기), shuffle write 58GB |
+| ③ 통 모으기 = **shuffle read** | 묶음마다 담당 task가 하나씩 떠서 12대 executor 전부에서 "23번 통"을 네트워크로 가져온다 | shuffle read 58GB (넣은 걸 다 가져오므로 write와 같다) |
+| ④ 정렬해서 쓰기 | 가져온 카드를 메모리에서 정렬해 파일 1개(약 512MB)로 쓴다 | output 38GB |
+
+**input이 output의 2배인 이유**: ①과 ②가 같은 파일을 각각 한 번씩 읽기 때문이다. 실제 데이터는 38GB인데 파일에서 읽은 양은 76GB다. `sort` 전략의 정상값이며, 벗어나면 무언가 변한 것이다.
+
+**write가 read보다 먼저인 이유**: ③의 담당자는 "23번 카드 전부"가 필요한데, 그것은 ②의 executor들이 **전부** 끝나야 완성된다. 그래서 Spark은 ②가 다 끝날 때까지 통(디스크)에 담아 두고, 그다음에야 ③을 시작한다. 디스크에 남겨 두는 덕분에 ③의 task가 실패해도 ②를 다시 돌리지 않고 다시 읽기만 하면 된다.
+
+**shuffle read = write인 이유**: 같은 데이터의 양면이다. 넣은 것을 전부 한 번씩 가져가니 총량이 같다. 달라지는 경우는 task 재시도로 다시 읽었을 때(read가 커짐), 실패로 안 읽은 출력이 있을 때(read가 작아짐) 정도다. 같으면 정상이고, 크게 다르면 그게 이상 신호다.
+
+**shuffle이 38GB가 아니라 58GB인 이유**: parquet 파일은 컬럼 단위로 잘 압축돼 있고, 통에 넣을 때는 row 단위로 담아서 덜 압축된다. 실측 배수는 1번 1.41, 2번 1.57, 3번 1.51이다 (설계서 §8.2).
 
 ---
 
@@ -206,6 +225,8 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 #### `max-concurrent-file-group-rewrites` = 10 ✅
 
 동시에 처리하는 file group 수. **실제 병렬성 상한이며, 소요시간을 결정하는 핵심 값이다.**
+
+> **쉽게 말하면**: Iceberg는 rewrite할 파일을 파티션 단위로 묶고(file group, 우리 테이블은 1시간치에 par_a 값 수만큼 = 4개), group 하나를 Spark job 하나로 돌린다. 이 옵션은 그 job을 **몇 개까지 동시에 돌리느냐**다. group이 4개면 10으로 두든 100으로 두든 4개만 돌아가므로 높게 잡는 비용은 없고, 재처리 trigger로 2시간치(group 8개)가 한 번에 올 때를 위한 여유다. 3시간치 이상을 한 번에 돌리는 일이 잦아지면 12~16으로 올린다. Spark UI Jobs 탭의 job 제목 `file group N/4`로 group 수를 확인한다.
 
 Iceberg 기본값은 5, 초기 설정은 2다. 2에서 7개 group을 처리하면 `2+2+2+1`로 **4회차**에 나뉜다 (섹션 4.1).
 
@@ -746,7 +767,7 @@ Airflow   : task duration (pod 기동 시간 역산용)
 | **duration** | Spark 앱 실행 시간 | 데이터 크기가 매번 다르므로 **반드시 `초/GB`로 정규화.** 해상도 0.1분(6초) → 노이즈 ±7%. **executor를 줄이면 늘어나는 것이 정상** — 판정은 dcu로 |
 | **dcu** | 리소스 × 시간 기반 비용 대리 지표 | **executor 축소 테스트의 핵심 지표.** duration은 늘어도 dcu가 줄면 축소 성공. duration만 보면 오판한다. 같은 테이블 안에서는 `dcu/GB`(GB = Compaction 후 파일 합계 = DataFlint `output`), **테이블 사이 비교는 `dcu/100만 row`** — 수직분할 테이블은 row 수가 같고 폭만 다르다 (설계서 §8.3) |
 | **input / output** | 읽은 양 / 쓴 양 | `sort` 전략은 **2.0배**가 정상(샘플링 + 쓰기, 섹션 2.2). 벗어나면 무언가 변한 것 |
-| **shuffle read / write** | shuffle 데이터량 | 데이터 크기의 **약 1.5배**(1번 1.41, 2번 1.57). task당 몫은 512MB × 1.5 ≈ **0.8GB로 데이터 양과 무관**, executor당 디스크는 약 4.7GB로 일정 (설계서 §8.2) |
+| **shuffle read / write** | shuffle 데이터량 | 데이터 크기의 **약 1.5배**(1번 1.41, 2번 1.57, 3번 1.51). **read = write가 정상**(같은 데이터의 양면, 섹션 2.4). task당 몫은 512MB × 1.5 ≈ **0.8GB로 데이터 양과 무관**, executor당 디스크는 약 4.7GB로 일정 (설계서 §8.2) |
 | **task error rate** | task 실패/재시도 비율 | 0이 아니면 OOM 또는 S3 타임아웃. `partial-progress=false`라 실패가 전체 롤백으로 이어져 중요 |
 
 **`idle cores`가 높을 때 — 원인 2가지와 반대되는 처방**
