@@ -532,9 +532,9 @@ task 하나가 정렬하는 **byte**는 두 테이블이 같지만(0.8GB), **row
 | `memoryOverhead` | 실행 | 결과 |
 |------------------|------|------|
 | 1g | 1회 | executor pod 사망 → **job 실패** |
-| 2g | 3회 (test5·6·7, heap 18g/20g/20g) | job은 성공했으나 **task error rate 2.4% / 0.9% / 3.1%**, failed stage 1~4건 (`MetadataFetchFailedException`, `internal_error_network`) |
+| 2g | 4회 (최초 1회 + test5·6·7, heap 18g/20g/20g) | job은 성공했으나 **task error rate 2.4% / 0.9% / 3.1%**(test5·6·7), failed stage 1~4건 (`MetadataFetchFailedException`, `internal_error_network`). 최초 1회는 task error를 확인하지 않았다 |
 | **3g** | 2회 (test8·9) | **task error 0%, failed stage 0** |
-| 4g | 이전 테스트 전부 | task error 0% |
+| 4g | 2회 (섹션 5.4 test1·2) | task error 0% |
 
 `MetadataFetchFailedException`은 "shuffle 통을 가지러 갔는데 그 통을 들고 있던 executor가 사라졌다"는 뜻이고, `internal_error_network`는 죽은 executor와의 연결 단절이다. 즉 **2g에서는 시간대에 따라 executor 한두 대가 한도를 넘어 죽고, Spark이 앞 단계를 재실행해 job을 살린 것**이다. 숨은 비용은 재실행만큼의 duration·dcu이고, 진짜 위험은 재실행까지 실패하면 그 시간 Compaction 전체가 실패한다는 것(`partial-progress=false`). 그래서 **job 성공 여부가 아니라 task error rate 0%·executor 유실 0건이 판정 기준**이다. 처음에 "2g 성공"으로 판정했던 것은 job 성공만 보고 task 실패를 안 본 오판이었다(2026-09-18 정정). 확인은 driver 로그 `ExecutorLostFailure ... exit code 137` 또는 `kubectl get pod`의 terminated reason `OOMKilled`.
 
