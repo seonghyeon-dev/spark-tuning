@@ -502,7 +502,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 | Spark | `coalescePartitions.parallelismFirst` | **삭제 가능** | ✅ | 무효 확정 (T8) |
 | 리소스 | `driver cpu` / `memory` | **2** / 4GB | 📘 | 효과는 노이즈 범위, 저렴해서 유지 |
 | 리소스 | `executor cpu` / `memory` | 4 / **16GB (1번)·20GB (2·3·4번)** | ✅ | spill 0이 되는 최소값. 메모리도 dcu에 반영(+5~6%/4g) — 설계서 §8.2, §8.3 |
-| 리소스 | `executor memoryOverhead` | **2g** (4g → 2g) | ✅ | pod 점유 = heap + overhead. 4번에서 1g 실패·2g 성공 — 설계서 §8.4. driver는 기본값 |
+| 리소스 | `executor memoryOverhead` | **3g** (4g → 3g) | ✅ | pod 점유 = heap + overhead. 4번에서 1g job 실패·2g executor 유실(task error 1~3%)·3g 깨끗 — 설계서 §8.4. driver는 기본값 |
 | 리소스 | `num-executors` | **테이블별** — 1번 12, 2번 8, 3번 12, 4번 12 (`시간당 GB × 0.32`) | ✅ | dcu 최저점. 섹션 4.4, 6. DA에서는 `spark.executor.instances` = `initialExecutors` = `minExecutors`로 넣는다 (설계서 §4.8) |
 | 전략 | rewrite 전략 | `sort` | ✅ | 미적용 시 조회 40% 저하 |
 
@@ -768,7 +768,7 @@ Airflow   : task duration (pod 기동 시간 역산용)
 | **dcu** | 리소스 × 시간 기반 비용 대리 지표 | **executor 축소 테스트의 핵심 지표.** duration은 늘어도 dcu가 줄면 축소 성공. duration만 보면 오판한다. 같은 테이블 안에서는 `dcu/GB`(GB = Compaction 후 파일 합계 = DataFlint `output`), **테이블 사이 비교는 `dcu/100만 row`** — 수직분할 테이블은 row 수가 같고 폭만 다르다 (설계서 §8.3) |
 | **input / output** | 읽은 양 / 쓴 양 | `sort` 전략은 **2.0배**가 정상(샘플링 + 쓰기, 섹션 2.2). 벗어나면 무언가 변한 것 |
 | **shuffle read / write** | shuffle 데이터량 | 데이터 크기의 **약 1.5배**(1번 1.41, 2번 1.57, 3번 1.51). **read = write가 정상**(같은 데이터의 양면, 섹션 2.4). task당 몫은 512MB × 1.5 ≈ **0.8GB로 데이터 양과 무관**, executor당 디스크는 약 4.7GB로 일정 (설계서 §8.2) |
-| **task error rate** | task 실패/재시도 비율 | 0이 아니면 OOM 또는 S3 타임아웃. `partial-progress=false`라 실패가 전체 롤백으로 이어져 중요 |
+| **task error rate** | task 실패/재시도 비율 | **0이 아니면 판정 실패.** `MetadataFetchFailedException`·`internal_error_network`는 executor가 죽어 shuffle 통이 사라진 신호이며 `memoryOverhead` 부족이 원인이었다(설계서 §8.4, 2g에서 1~3%). job이 성공해도 재실행 비용이 숨고, 재실행까지 실패하면 `partial-progress=false`라 전체 실패 |
 
 **`idle cores`가 높을 때 — 원인 2가지와 반대되는 처방**
 
@@ -806,7 +806,7 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
-| ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 20g, `memoryOverhead` 2g (설계서 §5.5). 남은 것은 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
+| ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 20g, `memoryOverhead` 3g (설계서 §5.5). 남은 것은 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
 
 **완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(9회 → 8대 + 20g, `spark.executor.instances` 규칙 발견), 3번 테이블 검증(6회 → 12대 + 20g, C=0.32 재확인), 4번 테이블 검증(2회 → 12대 + 20g).
 

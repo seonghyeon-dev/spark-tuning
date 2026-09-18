@@ -157,7 +157,7 @@
 | `executor.instances` / `initialExecutors` / `minExecutors` | **세 값 동일.** 시간당 데이터GB × 0.32 — 1번 12, 2번 8, 3번 12, 4번 12 | **테이블별** |
 | `maxExecutors` | 36 | 공통 |
 | executor memory | 1번 16g, 2·3·4번 20g | **테이블별** |
-| executor `memoryOverhead` | **2g** (4g → 2g. 1g는 실패) | 공통 |
+| executor `memoryOverhead` | **3g** (4g → 3g. 1g는 job 실패, 2g는 executor 유실) | 공통 |
 
 비율(%)은 데이터 크기와 무관하므로 공통이고, 개수(대)는 테이블 크기에 비례하므로 테이블별이다.
 
@@ -195,7 +195,8 @@
 
 | 항목 | 내용 |
 |------|------|
-| DAG 반영 | 4개 테이블 + `memoryOverhead` 2g 확정 완료. 일괄 적용 대기. pod 메모리는 4g 대비 4개 테이블 합계 약 90g 감소 |
+| DAG 반영 | 4개 테이블 + `memoryOverhead` 3g 확정 완료. 일괄 적용 대기. pod 메모리는 4g 대비 4개 테이블 합계 44g 감소 |
+| 3·4번 heap 18g | 4번에서 18g로 spill 0이 1회 확인. 18g + 3g로 2~3회 더 확인 후 결정 (executor당 2g 절감) |
 | daily Compaction | 별건. `day` 파티션 테이블 대상이며 크기·구성 미공유 — 이 문서 범위 밖 |
 
 ---

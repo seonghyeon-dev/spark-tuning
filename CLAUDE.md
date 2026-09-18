@@ -137,7 +137,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **전제**: Iceberg snapshot 보존 3일 > 재처리 조회 범위 2일 유지 필수. maintenance 스케줄 재배치와 Compaction DAG 변경(tables params + mapped task)은 재처리 DAG 배포 전 적용
 - **후속 과제**: daily 계열 maintenance를 DAG 1개의 순차 task로 통합 (시계 기반 간격은 duration이 늘면 조용히 깨짐)
 
-## 작업 5: Compaction 튜닝 (hourly) — 4개 테이블 + memoryOverhead 설정 확정, DAG 일괄 반영 대기
+## 작업 5: Compaction 튜닝 (hourly) — 4개 테이블 + memoryOverhead 3g 확정, DAG 일괄 반영 대기
 
 - **산출물**: `tuning/compaction-tuning-guide.md` (상세), `tuning/compaction-tuning-report.md` (회의 보고용 요약)
 - **상태**: 9회 측정으로 설정 확정. 초/GB **3.24 → 2.41(−26%)**, dcu/GB **0.00416 → 0.00219(−47%)**, idle cores 58%→17%. DAG 전체 10~12분 → 약 6분
@@ -162,8 +162,8 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **4번 테이블 2회 검증 (2026-09-17, 설계서 §5.4)**: 3번과 같은 급·같은 결과. 16g spill 1.76GiB → 20g 0. 확정 12대 + 20g. **idle cores 17~25%는 구조적 값** — 12대(48 slot)에 쓰기 task 74~77개라 둘째 회차에 slot이 남는다. 1번 16.7%와 같은 원인, 판정 기준 아님(DataFlint 경고 20%는 참고). 20대는 dcu 상승, 10대는 이득이 노이즈 안이라 쫓지 않는다
   - **dcu에는 메모리도 들어간다** — duration 같은 16g↔20g 쌍에서 dcu 일관 +5~6% (2번·3번 3쌍). "dcu ∝ cores × duration"은 메모리 고정 시 관측. **메모리는 spill 0이 되는 최소값만**
   - **판정 원칙 (설계서 §8.3)**: 같은 테이블 안에서 spill 0 + dcu 최저. 테이블 사이 dcu/GB는 착시(row 폭), dcu/100만 row는 참고만(컬럼 타입에 따라 row당 비용이 다름 — 1번 0.024, 2번 0.021, 3번 0.031). GB = Compaction 후 파일 합계(DataFlint `output`)
-  - **executor `memoryOverhead` 2g 확정 (2026-09-17, 설계서 §8.4)** — 4번 테이블 시행착오: **1g 실패(pod 사망), 2g 성공**. Spark UI Peak JVM OffHeap는 132~135MiB뿐 → **JVM 지표로는 못 재는 몫(netty direct 버퍼·네이티브 압축·shuffle 파일 page cache)이 대부분**이라 `peakMemoryMetrics`/`ProcessTreeJVMRSSMemory` 방식은 폐기, 시행착오가 유일한 실측. 1.5g는 안 함(여유 0.5g 필요, 이득 6g). **4개 테이블 모두 2g 명시**(기본값 10%는 1번 16g에서 1.6g라 불충분 가능). **고정값 — 동적 조정 불필요**: executor당 shuffle 4.7GB·task 4개·버퍼 크기가 데이터 양과 무관, pod spec이라 실행 중 변경 불가, 실패 비용 큼. 재검토는 cores·target-file-size·shuffle codec·`maxSizeInFlight`·Spark 버전 변경 시(설계서 §9-6). **pod 점유 = heap + overhead** — 1번 18g × 12, 2번 22g × 8, 3·4번 22g × 12, 4g 대비 합계 약 90g 감소. driver `memoryOverhead`는 기본값(10% ≈ 410MB) 유지. **정확히 재려면 Java 지표가 아니라 커널 값**: executor pod의 cgroup `memory.peak`(v1 `memory.max_usage_in_bytes`) 또는 cAdvisor `container_memory_max_usage_bytes` − heap. 역할 비유: heap = 선반, overhead = 복도·하역장, pod 한도 = 둘의 합 — 할당이 아니라 예산 한 줄
-  - **남은 조절 여지는 3·4번 executor memory 18g 하나 (2026-09-18 판단, 설계서 §7)**: 16g에서 spill 0.9~1.8GiB로 작아 18g면 0일 가능성, 성공 시 48g 절감. spill은 job을 안 죽이므로 **DAG 반영 후 운영에서** 2~3시간치 확인. 2번(16g spill 10GiB)·1번(16g spill 0)은 제외. executor 수·core 4·driver·Iceberg 옵션은 더 조절하지 않는다(core 변경은 ratio·0.32 전부 재측정, 대수 변경은 노이즈 안)
+  - **executor `memoryOverhead` 3g 확정 (2026-09-18, 설계서 §8.4)** — 4번 테이블 시행착오 9회: **1g job 실패, 2g는 job 성공했으나 executor 유실(task error 2.4%/0.9%/3.1%, `MetadataFetchFailedException`·`internal_error_network` = shuffle 통 들고 있던 executor 사망 → 앞 단계 재실행), 3g 2회 task error 0**. "2g 성공"은 job 성공만 본 오판이었다(정정). **판정 지표 = spill 0 + dcu 최저 + task error 0% + executor 유실 0** — job 성공 여부로 판정하지 말 것. **메모리 지표로는 못 잰다**: Java 지표(OffHeap 135MiB)는 netty·네이티브·page cache가 빠지고, 커널 지표 `container_memory_max_usage_bytes`는 page cache 때문에 **항상 pod 한도 + 4~7MiB에 붙는다**(5회 전부) → 시행착오 + task error rate가 유일한 실측. **4개 테이블 모두 3g 명시**(기본값 10%는 2g/1.6g라 부족). **고정값 — 동적 조정 불필요**: executor당 shuffle 4.7GB·task 4개·버퍼 크기가 데이터 양과 무관, pod spec이라 실행 중 변경 불가, 실패 비용 큼. 재검토는 cores·target-file-size·shuffle codec·`maxSizeInFlight`·Spark 버전 변경 시(설계서 §9-6). **pod 점유 = heap + overhead** — 1번 19g × 12 = 228g, 2번 23g × 8 = 184g, 3·4번 23g × 12 = 276g, 4g 대비 합계 44g 감소. driver `memoryOverhead`는 기본값(10% ≈ 410MB) 유지. 컨테이너 이름 executor `spark-kubernetes-executor`. 역할 비유: heap = 선반, overhead = 복도·하역장, pod 한도 = 둘의 합 — 할당이 아니라 예산 한 줄
+  - **남은 조절 여지는 3·4번 executor memory 18g 하나 (설계서 §7)**: 4번 test5(18g + 2g)에서 **spill 0 실측 1회**. 18g + 3g = 21g로 2~3시간치 돌려 spill 0·task error 0이면 확정, 48g 절감. spill은 job을 안 죽이므로 DAG 반영 후 운영에서 해도 됨. 2번(16g spill 10GiB)·1번(16g spill 0)은 제외. executor 수·core 4·driver·Iceberg 옵션은 더 조절하지 않는다(core 변경은 ratio·0.32 전부 재측정, 대수 변경은 노이즈 안)
   - **DA 동작 (설계서 §4.4 "쉽게 말하면")**: 목표 대수 = ceil((실행 중 + 대기 task) × 0.13 ÷ 4). 1초 backlog 후 1·2·4·8로 증원, 상한 36, 시작 대수 아래로는 안 내려감. **input이 많으면 늘어난다** — 평소 1시간치는 시작 대수 그대로, 재처리 2~3시간치에서만 증원
   - **Compaction 데이터 흐름 (가이드 §2.4, 카드 76묶음 비유)**: ①경계 정하기(첫 읽기) → ②shuffle write(둘째 읽기, executor 디스크의 묶음별 통) → ③shuffle read(통 모으기, write와 같은 양이 정상) → ④정렬·쓰기. input = output × 2는 ①②가 같은 파일을 각각 읽어서. write가 먼저인 이유는 ③이 ②의 전부를 기다려야 해서
   - **shuffle·메모리 산정 규칙 (설계서 §8.2)**: shuffle 총량 ≈ 데이터 × 1.5(실측 1.41·1.57), task당 shuffle ≈ 512MB × 1.5 = 0.8GB로 데이터 양과 무관, executor당 디스크 ≈ 1.5 ÷ 0.32 ≈ 4.7GB 일정. task당 정렬 메모리 = `(executor memory − 300MiB) × 0.6 ÷ cores`(16g 2.4GB, 20g 3.0GB — Spark `tuning.md`·`ExecutionMemoryPool.scala` 1/N 규칙). **2번이 16g에서 spill 나는 이유는 task당 row 수** — 512MB 파일에 7KB row가 7.2만 개(1번 11KB row 4.5만 개). spill은 시간대 데이터 양이 아니라 테이블 row 모양이 정한다
@@ -184,7 +184,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - 기존 `com_num_executor` 상수는 **fallback으로 유지** (조회 실패·0 반환·비정상 크기 전부). 지우면 Trino 장애가 곧 Compaction 실패가 된다
   - 미확인: Trino `$partitions`의 `partition.ts_hour` 타입, manifest pruning 동작 여부
   - 현재 데이터(36~42GB)에서 산정값이 12~14로 좁아 **정적 12로 운영하며 동적화를 미루는 선택도 가능**. `C=0.32`은 hourly 전용 — daily는 별도 측정 필요
-- **후속 과제**: DAG 일괄 반영(설계서 §5.5 표) → 운영 duration·pod 메모리 확인. daily Compaction은 별건(대상 테이블 크기·구성 공유 후 시작)
+- **후속 과제**: DAG 일괄 반영(설계서 §5.5 표, overhead 3g) → 운영 duration·task error 0 확인 → 3·4번 18g + 3g 검증. daily Compaction은 별건(대상 테이블 크기·구성 공유 후 시작)
 
 ## 작업 6: FileIO 전환 (S3AFileSystem → S3FileIO) — 전환 완료, 후속 작업 대기
 
