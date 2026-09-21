@@ -116,7 +116,7 @@ desired = (순간 일감 ÷ executor당 slot) × ratio
 
 `순간 일감 ≈ 데이터GB × 9`는 실측 역산값이다 (전체 일감의 약 절반이 동시에 큐에 존재).
 
-**목표 대수**(`데이터GB × 0.32`, `compaction-tuning-guide.md` §4.4)와 같게 놓으면:
+**목표 대수**(`데이터GB × 0.32`, `compaction-tuning-guide.md` §6.4)와 같게 놓으면:
 
 ```
 ratio = 0.32 ÷ 2.25 = 0.142  →  실측 검증값 0.13

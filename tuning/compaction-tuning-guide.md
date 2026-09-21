@@ -248,7 +248,7 @@ Iceberg 기본값은 5, 초기 설정은 2다. 2에서 7개 group을 처리하�
 
 30GB와 100GB는 현재 데이터에서 **완전히 동일하게 동작**한다. 파티션 비율이 유동적이므로 여유가 큰 기본값을 쓴다.
 
-> **향후 확인 필요** ⚠️: group 하나의 shuffle 데이터는 executor local disk에 쌓인다. 현재 최대 group 21.4GB → shuffle 약 30GB ÷ 16 executor ≈ 1.9GB/executor. 파티션이 100GB에 근접하면 약 9GB/executor가 되어 K8S emptyDir의 ephemeral storage 한도를 넘을 수 있다. 현재 데이터의 4.7배 규모이므로 당장 문제는 없다.
+> **향후 확인 필요** ⚠️: group 하나의 shuffle 데이터는 executor local disk에 쌓인다. 현재 1시간치 shuffle 약 60GB ÷ 12 executor ≈ 5GB/executor(설계서 §5.5). 파티션이 100GB에 근접하면 약 12GB/executor가 되어 K8S emptyDir의 ephemeral storage 한도를 넘을 수 있다. 현재 데이터의 4.7배 규모이므로 당장 문제는 없다.
 
 #### `partial-progress.enabled` = 기본값 false ✅ 유지
 
@@ -525,7 +525,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 
 ## 6. 동적 리소스 산정
 
-> **자원 할당 방식은 `pipeline/compaction-executor-sizing-design.md`에서 확정했다.** 후보 3개(정적 유지 / Dynamic Allocation / 사전 산정) 중 **Dynamic Allocation + `executorAllocationRatio=0.13`을 채택**했으며 7회 실측으로 검증했다(39GB→12대, 82GB→24대). 이 섹션의 계수 `C=0.32`는 그 ratio 값을 도출하는 근거로 쓰인다. 사전 산정(Trino 조회) 방식은 보류 상태다.
+> **자원 할당 방식은 `pipeline/compaction-executor-sizing-design.md`에서 확정했다.** 후보 3개(정적 유지 / Dynamic Allocation / 사전 산정) 중 **Dynamic Allocation + `executorAllocationRatio=0.13`을 채택**했으며 9회 실측으로 검증했다(39GB→12대, 82GB→24대, 350GB→36대). 이 섹션의 계수 `C=0.32`는 그 ratio 값을 도출하는 근거로 쓰인다. 사전 산정(Trino 조회) 방식은 보류 상태다.
 
 ### 6.1 배경과 동적화 대상 축소
 
@@ -807,9 +807,9 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | hourly executor당 shuffle 약 5GiB(1시간치 shuffle 60GiB ÷ 12대), 권장 10GiB × 노드당 executor 수. 재처리 n시간치는 최악 n × 5GiB. 운영 첫 실행에서 `spark-local-dir-1` 사용량 1회 확인 (설계서 §5.5) | 중간 |
-| ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 18g, `memoryOverhead` 3g (설계서 §5.5). 남은 것은 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
+| ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 18g, `memoryOverhead` 3g (설계서 §5.5). 남은 것은 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(12 − 4)도 함께 확인 | 중간 |
 
-**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(9회 → 8대 + 20g, `spark.executor.instances` 규칙 발견), 3번 테이블 검증(9회 → 12대 + 18g, C=0.32 재확인, 22시간치 재처리 검증), 4번 테이블 검증(14회 → 12대 + 18g, `memoryOverhead` 3g 확정, 6시간치 재처리 검증).
+**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(12회 → 8대 + 20g, `spark.executor.instances` 규칙 발견, 18g는 20시간치 spill로 탈락), 3번 테이블 검증(9회 → 12대 + 18g, C=0.32 재확인, 22시간치 재처리 검증), 4번 테이블 검증(14회 → 12대 + 18g, `memoryOverhead` 3g 확정, 6시간치 재처리 검증).
 
 ### 8.3 재검증 트리거
 
