@@ -154,7 +154,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **`sort` 전략은 데이터를 2번 읽는다** (정렬 범위 샘플링 + 실제 쓰기). DataFlint `input = output × 2.0`이 정상값
   - **DataFlint alert 처방을 그대로 따르면 안 된다.** `idle cores` 원인은 리소스 과다(→executor 축소)와 병렬성 제약(→제약 해제) 두 가지이고, 이번 사례의 원인은 후자다. alert는 전자만 제안한다
   - **`memory usage` 84~94%는 `spill to disk 0b`와 짝으로 읽는다** — 낭비 없이 맞게 쓰는 중이라는 뜻이며 줄이면 spill이 시작된다
-- **executor 자원 할당 — Dynamic Allocation + ratio 채택 (1번 7회 + 2번 9회 + 3번 6회 + 4번 2회 실측 검증)**: 설계 `pipeline/compaction-executor-sizing-design.md`, 보류된 C안 스켈레톤 `pipeline/examples/compaction_executor_sizing_example.py`
+- **executor 자원 할당 — Dynamic Allocation + ratio 채택 (1번 7회 + 2번 9회 + 3번 9회 + 4번 14회 실측 검증)**: 설계 `pipeline/compaction-executor-sizing-design.md`, 보류된 C안 스켈레톤 `pipeline/examples/compaction_executor_sizing_example.py`
   - **확정 설정 (4개 테이블, 설계서 §5.5)**: `dynamicAllocation.enabled=true`, **`executorAllocationRatio=0.13`(전 테이블 공통)**, **`spark.executor.instances` = `initialExecutors` = `minExecutors` = `ceil(시간당 GB × 0.32)`(1번 12, 2번 8, 3번 12, 4번 12)**, executor memory **1번 16g, 2번 20g, 3·4번 18g**, `maxExecutors`=**36 고정**(quota 확인 불가·리소스 넉넉·천장은 무해)
   - **⚠️ `spark.executor.instances`가 남아 있으면 그 값이 시작 대수의 바닥이 된다** (`max(initial, min, instances)`, 반납 없음 → 끝까지 유지). 2번 테이블에서 init 6·8, ratio 0.08~0.13을 어떻게 바꿔도 12대로 돈 원인. 확인은 driver 로그 `Using initial executors = N, max of ...` 줄. 설계서 §4.8
   - **2번 테이블 9회 검증 (2026-09-15~16, 설계서 §5.2)**: `instances` 제거 후 ratio 0.13이 **8대로 수렴** (24GB × 0.32 = 7.7). 12대 대비 duration +27%(1.9분)이나 dcu **−10~16%** — 1번의 16 → 12 축소와 같은 모양. **16g에서 spill 1.6~10.4GiB(시간대별 변동, 시간 비용은 안 보임) → 20g에서 0.** 확정: `instances`=init=min **8**, executor memory **20g**, 나머지 1번과 동일. **확정 설정 그대로 돌린 test9: 1.7분, dcu 0.0711, spill 0, idle 16.8%** (init 8이라 warm-up 없어 test8 1.9분보다 짧음, 1번 idle 16.7%와 동급)
@@ -179,7 +179,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **유일한 실질적 약점: ratio가 파일 크기에 의존.** 일감 수가 파일 크기로 정해지므로 append 설정이 바뀌면 **에러 없이 조용히 어긋난다**. 재검증 조건 1순위
   - **C안(Trino 사전 산정) 보류.** 같은 목적을 B안이 설정 4줄로 달성. `num_executors = clamp(ceil(총 크기GB × 0.32), 4, MAX)`, `.partitions` 범위 조회, naive datetime 변환(2026-08-11 13:00 → 496237), `com_num_executor` fallback 유지 — 필요 시 예시 파일 참조
   - **daily는 판단이 다르다** — 30~60분 job이라 `executorIdleTimeout` 60초가 전체의 2~3%에 불과해 반납이 실제로 일어날 수 있다. ratio 0.13도 hourly 전용. daily 튜닝 후 별도 판단
-  - 미확인: 메모리 97.62%(spill 0인 동안 조치 안 함), 2번 spill의 압축 팽창 요인(row 수 차이는 확정), 3번 row당 비용이 높은 컬럼. ~~`maxExecutors`~~ 36 고정, ~~ratio 0.066 로그~~ `instances` 바닥으로 해소, ~~운영 duration~~ test9 1.7분으로 확인
+  - 미확인: 메모리 사용률 92.6~97.8%(18g에서도 동일, DataFlint under-provisioned alert 포함 — spill 0인 동안 조치 안 함), executor `spark-local-dir-1` 용량·22시간치 사용량 peak(하루치 재처리 전 확인), 천장 아래 31·33대 미도달 원인(비용 영향 없어 보류), 2번 spill의 압축 팽창 요인(row 수 차이는 확정), 3번 row당 비용이 높은 컬럼. ~~`maxExecutors`~~ 36 고정, ~~ratio 0.066 로그~~ `instances` 바닥으로 해소, ~~운영 duration~~ test9 1.7분으로 확인
   - 입력 측정은 **`.files`가 아니라 `.partitions`** (파티션당 1행 집계, `.files`는 컬럼 19개 통계를 전부 끌고 옴). **범위 조회**여야 한다 — 재처리 DAG trigger 시 여러 시간에 걸친다
   - **파티션 값 변환은 naive datetime으로** — `ts`가 `timestamp_ntz`라 timezone을 붙이면 엉뚱한 시간대를 조회한다. `int((dt − 1970-01-01).total_seconds() // 3600)`, 2026-08-11 13:00 → 496237 (Spark UI 실측 일치)
   - 기존 `com_num_executor` 상수는 **fallback으로 유지** (조회 실패·0 반환·비정상 크기 전부). 지우면 Trino 장애가 곧 Compaction 실패가 된다
