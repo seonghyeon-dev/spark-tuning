@@ -8,7 +8,7 @@
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
 | 대상 범위 | **hourly Compaction만.** 1번 테이블 기준으로 튜닝, 2·3·4번 검증 완료(`pipeline/compaction-executor-sizing-design.md` §5.5). daily Compaction은 대상 외 (섹션 8.1) |
-| 최종 수정일 | 2026-09-21 (3·4번 18g 확정, 여러 시간치 재처리 검증, memoryOverhead 설명 정리) |
+| 최종 수정일 | 2026-09-21 (3·4번 18g 확정, 1·2번 재검증, `max-concurrent` 12, 여러 시간치 재처리 검증, memoryOverhead 설명 정리, 남은 여지 판정) |
 
 ### 근거 수준 라벨
 
@@ -222,17 +222,17 @@ group당 출력 파일 수 = ceil(group 크기 ÷ target-file-size-bytes)
 
 > **전제**: 이 판단은 "입력이 전부 small file"에 의존한다. append 설정이 바뀌어 큰 파일이 생기면 재검토가 필요하다.
 
-#### `max-concurrent-file-group-rewrites` = 10 ✅
+#### `max-concurrent-file-group-rewrites` = 12 ✅ (10 → 12, 2026-09-21)
 
 동시에 처리하는 file group 수. **실제 병렬성 상한이며, 소요시간을 결정하는 핵심 값이다.**
 
-> **쉽게 말하면**: Iceberg는 rewrite할 파일을 파티션 단위로 묶고(file group, 우리 테이블은 1시간치에 par_a 값 수만큼 = 4개), group 하나를 Spark job 하나로 돌린다. 이 옵션은 그 job을 **몇 개까지 동시에 돌리느냐**다. group이 4개면 10으로 두든 100으로 두든 4개만 돌아가므로 높게 잡는 비용은 없고, 재처리 trigger로 2시간치(group 8개)가 한 번에 올 때를 위한 여유다. 3시간치 이상을 한 번에 돌리는 일이 잦아지면 12~16으로 올린다. Spark UI Jobs 탭의 job 제목 `file group N/4`로 group 수를 확인한다.
+> **쉽게 말하면**: Iceberg는 rewrite할 파일을 파티션 단위로 묶고(file group, 우리 테이블은 1시간치에 par_a 값 수만큼 = 4개), group 하나를 Spark job 하나로 돌린다. 이 옵션은 그 job을 **몇 개까지 동시에 돌리느냐**다. group이 4개면 10으로 두든 100으로 두든 4개만 돌아가므로 높게 잡는 비용은 없고, 재처리 trigger로 2시간치(group 8개)가 한 번에 올 때를 위한 여유다. 재처리 3시간치(group 12개)를 한 번에 돌리도록 12로 올렸다(2026-09-21). **DA는 동시에 도는 group의 일감만 보고 executor 수를 정하므로, 재처리에서는 이 값이 executor 수의 상한 역할도 한다**(설계서 §5.5). Spark UI Jobs 탭의 job 제목 `file group N/4`로 group 수를 확인한다.
 
 Iceberg 기본값은 5, 초기 설정은 2다. 2에서 7개 group을 처리하면 `2+2+2+1`로 **4회차**에 나뉜다 (섹션 4.1).
 
-**10을 쓰는 근거**: `max-file-group-size-bytes`를 100GB로 두면 group 수는 파티션 수(par_a distinct 값 수 = 4개)와 같아지므로, 기본값 5로도 1회차로 처리된다. 그럼에도 10을 쓰는 이유는 **높게 잡는 비용이 0**이라는 점이다 — group이 4개면 Iceberg는 4개만 실행한다. hourly 테이블 4개의 par_a Cardinality가 다를 수 있고 값이 늘어날 수도 있으므로, 여유를 둔다.
+**12를 쓰는 근거 (10 → 12, 2026-09-21)**: `max-file-group-size-bytes`를 100GB로 두면 group 수는 파티션 수(par_a distinct 값 수 = 4개)와 같아지므로, hourly는 기본값 5로도 1회차로 처리된다. group이 4개면 Iceberg는 4개만 실행하므로 **높게 잡는 비용이 hourly에서는 0**이다. 12로 올린 이유는 재처리 3시간치가 group 12개라 한 번에 돌리기 위해서다(10이면 10개 돌고 2개는 자리 나는 대로 투입). 3시간치 기준 executor 31 → 34대, 2.0 → 약 1.8분, executor당 shuffle 디스크 7 → 8.5GiB, driver 동시 job 12개 — 손실은 이것뿐이다.
 
-> 무한정 높이지는 않는다. group 수가 실제로 커지면 driver가 그만큼의 동시 Spark job을 관리해야 한다. 10은 현재 4개의 2.5배 수준이다.
+> **상한은 16이다.** DA는 동시에 도는 group의 일감만 보므로(설계서 §5.5), 큰 파티션(17GB) 7개가 동시에 돌면 executor는 이미 천장 36대로 꽉 찬다. 그 위로 동시 group을 늘려도 executor가 안 늘어 시간이 안 줄고, 디스크만 group 수에 비례해 는다. 규칙: 재처리 시간 수 × 4, 상한 16. driver가 그만큼의 동시 Spark job을 관리해야 하는 것도 같은 이유다.
 
 #### `max-file-group-size-bytes` = 기본값 100GB ✅
 
@@ -257,6 +257,7 @@ Iceberg 기본값은 5, 초기 설정은 2다. 2에서 7개 group을 처리하�
 **유지 근거**:
 - `true`로 바꾸면 run당 snapshot이 여러 개 생겨(기본 최대 10) snapshot 3일 보존 정책과 재처리 DAG의 batch_id 확인 로직(`.snapshots` 조회, `pipeline/reprocessing-dag-design.md` §4)에 영향을 준다
 - 얻는 것이 없다 — task error rate 0.00%, 소요시간 1~2분
+- **재처리에서도 의미 없다 (2026-09-21)** — `rewrite-all=true`라 재실행하면 커밋된 파티션도 다시 쓴다. 중간에 죽어 절반이 커밋돼 있어도 같은 범위로 다시 돌리면 전부 다시 하므로 재실행 비용이 안 준다. `rewrite-all=false`면 512MB 파일은 빼고 작은 파일만 고르지만, 재처리 파티션(늦게 온 54MB 파일이 512MB 파일과 섞임)에서 작은 것만 정렬해 쓰면 정렬 묶음이 두 벌이 되어 Trino의 데이터 건너뛰기가 나빠진다. 그래서 `rewrite-all=true`가 맞고, `true`인 이상 partial-progress는 의미 없다
 
 > **참고**: `false`이므로 `max-concurrent-file-group-rewrites`를 올려도 **실패 시 손실이 커지지 않는다.** 2개씩 처리할 때도 4회차에서 실패하면 1~3회차 작업이 전부 버려진다.
 
@@ -495,7 +496,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 |------|------|-----|----------|------|
 | Iceberg | `target-file-size-bytes` | 536870912 (512MB) | ✅ | 스키마 설계에서 확정 |
 | Iceberg | `rewrite-all` | true | ✅ | 입력이 전부 small file |
-| Iceberg | `max-concurrent-file-group-rewrites` | **10** | ✅ | −30%. 유일하게 명확한 개선 |
+| Iceberg | `max-concurrent-file-group-rewrites` | **12** (2 → 10 → 12) | ✅ | −30%. 유일하게 명확한 개선. 12는 재처리 3시간치(group 12개) 기준, 상한 16 (섹션 3.1) |
 | Iceberg | `max-file-group-size-bytes` | **기본값 100GB** (설정 제거) | 📘 | 속도는 중립. 정렬 구간 1개 유지 |
 | Iceberg | `partial-progress.enabled` | 기본값 false | 📘 | 변경 이득 없음 |
 | Spark | `advisory-partition-size` | **삭제** | ✅ | 무효 확정 |
@@ -536,7 +537,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 | `executor memory` | 동적 | ❌ 고정 16GB | task 하나의 처리 단위가 512MB로 고정. 데이터가 2배가 되면 task 수가 2배 되고 task 크기는 그대로 → 메모리는 데이터 양과 무관 |
 | `executor cpu` | 동적 | ❌ 고정 4 | 동일 |
 | `driver cpu` / `memory` | 동적 | ❌ 고정 2 / 4GB | file group 수(4개)에 비례하나 변동 폭이 작음 |
-| `max-concurrent-file-group-rewrites` | (계획 외) | ❌ 크게 고정 (10) | group 수보다 크면 남는 값은 사용되지 않음 → 동적화가 무의미 |
+| `max-concurrent-file-group-rewrites` | (계획 외) | ❌ 크게 고정 (12) | group 수보다 크면 남는 값은 사용되지 않음 → 동적화가 무의미 |
 | `max-file-group-size-bytes` | (계획 외) | ❌ 크게 고정 (100GB) | 분할하지 않는 것이 목표 → 크게 두면 충족 |
 
 **동적화 대상이 6개에서 1개로 축소된다.** 나머지 5개는 손댈 필요가 없음이 실측으로 확인되므로 구현·유지보수 범위가 그만큼 줄어든다.
@@ -805,7 +806,7 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 | 확정 설정 운영 검증 | 여러 시간대에서 `spill 0`, `384MB 미만 파일 ≤ 2개`, DAG 전체 6분대 유지 확인 | 높음 |
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
-| executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
+| executor local disk 한도 | hourly executor당 shuffle 약 5GiB(1시간치 shuffle 60GiB ÷ 12대), 권장 10GiB × 노드당 executor 수. 재처리 n시간치는 최악 n × 5GiB. 운영 첫 실행에서 `spark-local-dir-1` 사용량 1회 확인 (설계서 §5.5) | 중간 |
 | ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 18g, `memoryOverhead` 3g (설계서 §5.5). 남은 것은 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
 
 **완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(9회 → 8대 + 20g, `spark.executor.instances` 규칙 발견), 3번 테이블 검증(9회 → 12대 + 18g, C=0.32 재확인, 22시간치 재처리 검증), 4번 테이블 검증(14회 → 12대 + 18g, `memoryOverhead` 3g 확정, 6시간치 재처리 검증).
@@ -822,7 +823,7 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
    → shuffle 패턴과 file group 구성이 달라진다
 
 3. par_a Cardinality 증가
-   → file group 수가 늘어 max-concurrent-file-group-rewrites 여유(현재 10 − 4)를 재확인해야 한다
+   → file group 수가 늘어 max-concurrent-file-group-rewrites 여유(현재 12 − 4)를 재확인해야 한다
 
 4. 최대 파티션 크기가 100GB에 근접
    → max-file-group-size-bytes 분할이 재발하고 executor local disk 한도에 걸린다
@@ -841,6 +842,34 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 ```
 
 ---
+
+### 8.4 더 튜닝할 여지 — 판정 (2026-09-21)
+
+잴 수 있는 손잡이는 다 쟀다. 남은 후보는 기대 이득이 5~10%로 노이즈 기준선 15% 아래이거나, 바꾸면 ratio·0.32를 전부 재측정해야 하는 것들이다.
+
+| 손잡이 | 무엇 | 기대 이득 | 판정 |
+|---|---|---|---|
+| `spark.memory.fraction` 0.6 → 0.8 | heap 중 정렬에 쓸 수 있는 비율. 캐시가 0인 job이라 올릴 수 있다 | 16g + 0.8이면 task당 3.2GB(20g + 0.6의 3.0GB 이상) → 2번 16g 가능 | **보류.** 위험은 남은 20%로 Parquet 쓰기 버퍼가 모자라면 executor가 죽는 것. 보통은 0.6 그대로 둔다. 하려면 2번 16g + 0.8로 2~3회 |
+| `target-file-size-bytes` 512MB | 묶음 크기 = task 크기·파일 수·Trino split 수 | 256MB면 메모리 절반·파일 2배 | **안 건드린다.** 읽기 성능 테스트가 512MB 기준 |
+| executor core 4 | | JVM 고정비 분산 | **안 한다.** 이득이 노이즈 안이고 ratio·0.32 재측정 |
+| shuffle codec lz4 → zstd | shuffle 임시 파일 −20~30%, CPU 증가. `write.parquet.compression-codec=zstd`(결과 파일)와 무관 | 디스크·네트워크 절감 | **안 한다.** CPU가 병목이라 dcu 증가 |
+| `maxExecutors` 36 | 재처리 속도 천장 | 72면 재처리 시간 절반, 비용 동일 | 재처리 속도가 문제 될 때 |
+
+**설정으로 못 없애는 비용 둘** — `sort` 전략 자체에서 나온다. ①데이터를 두 번 읽는다(input = output × 2, 정렬 경계 샘플링) ②shuffle이 데이터의 1.5배. `binpack`으로 바꾸면 둘 다 사라지지만 조회가 40% 느려진다(`read-performance-test.md` §5.4). 조회 성능의 값이다.
+
+**보통 하는 것과 우리가 더한 것**
+
+| 보통 | 우리 |
+|---|---|
+| executor 크기 하나 정해 고정 | 16·12·8 훑어 비용 최저점 |
+| 파일 512MB, 동시 group 수 설정 | 같음 |
+| duration이 창 안에 들면 끝 | **duration 대신 비용(dcu)**, 노이즈 기준선 15% |
+| Spark UI에서 spill 한 번 봄 | 테이블마다 spill 0인 최소 메모리 |
+| overhead 기본값 또는 넉넉히 | task error rate로 executor 유실 검출 → 3g |
+| DA 안 씀 | ratio로 요청량 조절, `instances`=init=min 규칙 |
+| 1시간치만 | 22시간치까지 |
+
+목표가 "60분 창 안에 가장 싸게"라 비용을 기준으로 잡은 것이 맞다(2분 걸리는 job의 시간을 줄일 이유가 없다). 목표가 "최대한 빨리"였다면 16대가 답이었다. 비용 −47%는 동시 group 10 + executor 12에서 났고 이후 40회는 5~13%씩 더 짜낸 것이며, 그 과정에서 `spark.executor.instances` 바닥과 executor 유실을 발견한 것이 비용과 무관한 소득이다.
 
 ## 9. 용어집
 
