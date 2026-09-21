@@ -8,7 +8,7 @@
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
 | 대상 범위 | **hourly Compaction만.** 1번 테이블 기준으로 튜닝, 2·3·4번 검증 완료(`pipeline/compaction-executor-sizing-design.md` §5.5). daily Compaction은 대상 외 (섹션 8.1) |
-| 최종 수정일 | 2026-09-17 (2·3·4번 테이블 검증 결과·테이블별 설정 반영) |
+| 최종 수정일 | 2026-09-21 (3·4번 18g 확정, 여러 시간치 재처리 검증, memoryOverhead 설명 정리) |
 
 ### 근거 수준 라벨
 
@@ -501,7 +501,7 @@ D = 830MB → ceil(830 ÷ 512) = 2개 → 415.0MB씩   (정상)
 | Spark | `advisory-partition-size` | **삭제** | ✅ | 무효 확정 |
 | Spark | `coalescePartitions.parallelismFirst` | **삭제 가능** | ✅ | 무효 확정 (T8) |
 | 리소스 | `driver cpu` / `memory` | **2** / 4GB | 📘 | 효과는 노이즈 범위, 저렴해서 유지 |
-| 리소스 | `executor cpu` / `memory` | 4 / **16GB (1번)·20GB (2·3·4번)** | ✅ | spill 0이 되는 최소값. 메모리도 dcu에 반영(+5~6%/4g) — 설계서 §8.2, §8.3 |
+| 리소스 | `executor cpu` / `memory` | 4 / **16GB (1번)·20GB (2번)·18GB (3·4번)** | ✅ | spill 0이 되는 최소값. 메모리도 dcu에 반영(+5~6%/4g) — 설계서 §8.2, §8.3 |
 | 리소스 | `executor memoryOverhead` | **3g** (4g → 3g) | ✅ | pod 점유 = heap + overhead. 4번에서 1g job 실패·2g executor 유실(task error 1~3%)·3g 깨끗 — 설계서 §8.4. driver는 기본값 |
 | 리소스 | `num-executors` | **테이블별** — 1번 12, 2번 8, 3번 12, 4번 12 (`시간당 GB × 0.32`) | ✅ | dcu 최저점. 섹션 4.4, 6. DA에서는 `spark.executor.instances` = `initialExecutors` = `minExecutors`로 넣는다 (설계서 §4.8) |
 | 전략 | rewrite 전략 | `sort` | ✅ | 미적용 시 조회 40% 저하 |
@@ -762,8 +762,8 @@ Airflow   : task duration (pod 기동 시간 역산용)
 | 지표 | 의미 | 판정 기준 및 활용 |
 |------|------|-----------------|
 | **idle cores** | 확보한 core 중 유휴 비율 | DataFlint 경고 기준은 20%이나 **판정 기준이 아니다.** 12대(48 slot)에 쓰기 task 74~77개라 둘째 회차에 slot이 남는 구조적 값으로 17~25%가 정상(설계서 §5.5). **원인이 2가지이고 처방이 반대다** (아래) |
-| **spill to disk** | 메모리가 넘쳐 디스크에 쓴 양 | **가장 중요한 안전선.** 0이 아니면 메모리 부족. task 하나가 정렬에 쓸 수 있는 메모리는 `(executor memory − 300MiB) × 0.6 ÷ cores`(16g → 2.4GB, 20g → 3.0GB)이고 이를 넘으면 spill한다. 시간 비용으로 드러나지 않아도 기준 위반 — 16g에서 나면 20g (설계서 §8.2) |
-| **memory usage** | executor 메모리 최고 사용률 | 높은 것이 나쁜 것이 아니다. `spill 0 + 89%`는 낭비 없이 사용 중이라는 뜻. **항상 spill과 짝으로 판정** — 90%↑ & spill 발생 → 증설 / 60%↓ & spill 0 → 감축 여지 |
+| **spill to disk** | 메모리가 넘쳐 디스크에 쓴 양 | **가장 중요한 안전선.** 0이 아니면 메모리 부족. task 하나가 정렬에 쓸 수 있는 메모리는 `(executor memory − 300MiB) × 0.6 ÷ cores`(16g → 2.4GB, 18g → 2.7GB, 20g → 3.0GB)이고 이를 넘으면 spill한다. 시간 비용으로 드러나지 않아도 기준 위반 — 16g에서 나면 20g (설계서 §8.2) |
+| **memory usage** | executor 메모리 최고 사용률 | 높은 것이 나쁜 것이 아니다. `spill 0 + 89%`는 낭비 없이 사용 중이라는 뜻. **항상 spill과 짝으로 판정** — 90%↑ & spill 발생 → 증설 / 60%↓ & spill 0 → 감축 여지. DataFlint "Executor memory under-provisioned" alert도 이 %만 보고 뜬다(95% 언저리) — spill 0이면 무시(설계서 §5.4) |
 | **duration** | Spark 앱 실행 시간 | 데이터 크기가 매번 다르므로 **반드시 `초/GB`로 정규화.** 해상도 0.1분(6초) → 노이즈 ±7%. **executor를 줄이면 늘어나는 것이 정상** — 판정은 dcu로 |
 | **dcu** | 리소스 × 시간 기반 비용 대리 지표 | **executor 축소 테스트의 핵심 지표.** duration은 늘어도 dcu가 줄면 축소 성공. duration만 보면 오판한다. 같은 테이블 안에서는 `dcu/GB`(GB = Compaction 후 파일 합계 = DataFlint `output`), **테이블 사이 비교는 `dcu/100만 row`** — 수직분할 테이블은 row 수가 같고 폭만 다르다 (설계서 §8.3) |
 | **input / output** | 읽은 양 / 쓴 양 | `sort` 전략은 **2.0배**가 정상(샘플링 + 쓰기, 섹션 2.2). 벗어나면 무언가 변한 것 |
@@ -806,9 +806,9 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | 파티션이 커질 때 shuffle 저장 공간 (섹션 3.1) | 낮음 |
-| ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 20g, `memoryOverhead` 3g (설계서 §5.5). 남은 것은 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
+| ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 18g, `memoryOverhead` 3g (설계서 §5.5). 남은 것은 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(10 − 4)도 함께 확인 | 중간 |
 
-**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(9회 → 8대 + 20g, `spark.executor.instances` 규칙 발견), 3번 테이블 검증(6회 → 12대 + 20g, C=0.32 재확인), 4번 테이블 검증(2회 → 12대 + 20g).
+**완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(9회 → 8대 + 20g, `spark.executor.instances` 규칙 발견), 3번 테이블 검증(9회 → 12대 + 18g, C=0.32 재확인, 22시간치 재처리 검증), 4번 테이블 검증(14회 → 12대 + 18g, `memoryOverhead` 3g 확정, 6시간치 재처리 검증).
 
 ### 8.3 재검증 트리거
 
