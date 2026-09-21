@@ -5,8 +5,8 @@
 | 대상 | hourly Compaction DAG |
 | 목적 | 데이터 증가·시간대별 편차에 맞춰 executor 수를 자동 조절 |
 | 전제 | 튜닝 결과 확정 (`tuning/compaction-tuning-guide.md`) |
-| 결론 | **Spark Dynamic Allocation + `executorAllocationRatio` 채택.** 1번 7회 + 2번 9회 + 3번 6회 + 4번 2회 실측 검증(섹션 5.1~5.4, 요약 5.5). **`spark.executor.instances` = `initialExecutors` = `minExecutors` 필수** (섹션 4.8) |
-| 진행 | **4개 테이블 + `memoryOverhead` 3g 확정 (2026-09-18). DAG 일괄 반영 대기** — 최종 설정은 섹션 5.5. 2g는 executor 유실(task error 1~3%)로 폐기 |
+| 결론 | **Spark Dynamic Allocation + `executorAllocationRatio` 채택.** 1번 9회 + 2번 12회 + 3번 9회 + 4번 14회 실측 검증(섹션 5.1~5.4, 요약 5.5). **`spark.executor.instances` = `initialExecutors` = `minExecutors` 필수** (섹션 4.8) |
+| 진행 | **4개 테이블 heap·`memoryOverhead` 전부 확정 (2026-09-21, 3·4번 18g + 3g). DAG 일괄 반영 대기** — 최종 설정은 섹션 5.5. 여러 시간치 재처리(1번 9시간치, 2번 20시간치, 3번 22시간치, 4번 6시간치)도 같은 설정으로 task error 0 확인, executor 수 수렴 원인(동시 파티션 수) 확정, `max-concurrent-file-group-rewrites` 10 → 12(섹션 5.5) |
 
 ---
 
@@ -116,7 +116,7 @@ desired = (순간 일감 ÷ executor당 slot) × ratio
 
 `순간 일감 ≈ 데이터GB × 9`는 실측 역산값이다 (전체 일감의 약 절반이 동시에 큐에 존재).
 
-**목표 대수**(`데이터GB × 0.32`, `compaction-tuning-guide.md` §4.4)와 같게 놓으면:
+**목표 대수**(`데이터GB × 0.32`, `compaction-tuning-guide.md` §6.4)와 같게 놓으면:
 
 ```
 ratio = 0.32 ÷ 2.25 = 0.142  →  실측 검증값 0.13
@@ -204,7 +204,7 @@ DA를 켜도 `spark.executor.instances`가 남아 있으면 **그 값이 시작 
 
 ## 5. 실측 결과
 
-### 5.1 1번 테이블 (하루 945GB, 시간당 약 39GB)
+### 5.1 1번 테이블 (하루 945GB, 시간당 약 39GB) — 9회 측정, 12대 + 16g 확정
 
 측정 대상: 2026-08-12 ~ 08-13. `output`이 실제 데이터 크기다.
 
@@ -234,7 +234,16 @@ DA를 켜도 `spark.executor.instances`가 남아 있으면 **그 값이 시작 
 
 **2시간 실행의 한계**: 입력이 이미 compaction된 데이터(505MB 파일)라 실제 데이터 증가 상황과 파일 구성이 다르다. 실제 증가 시에도 desired는 25대로 계산되어 **대수 결정 동작은 동일**하나, 소요시간은 더 걸린다.
 
-### 5.2 2번 테이블 (하루 576GB, 시간당 약 24GB) — 9회 측정, 8대 + 20g 확정
+**16g + `memoryOverhead` 3g 최종 검증 (test2·3, 2026-09-21)** — 1번은 처음부터 16g에서 spill 0이었고, overhead 3g(섹션 8.4)를 1번에서도 확인한 것이다. 데이터 = DataFlint input ÷ 2.
+
+| 회차 | 처리량 | 데이터 | 대수 | duration | dcu | dcu/1시간치 | dcu/GB | shuffle ÷ 데이터 | idle | spill | task error |
+|------|--------|--------|------|----------|-----|------------|--------|-----------------|------|-------|-----------|
+| test2 | 1시간 | 40.9GiB | 12 → 13 | 1.4m | 0.0874 | 0.0874 | 0.00214 | 1.41 | 19.5% | 0 | 0 |
+| test3 | 9시간 | 349.6GiB | 12 → 36 | 4.0m | 0.6508 | 0.0723 | 0.00186 | 1.41 | 11.1% | 0 | 0 |
+
+**16g + 3g 확정.** dcu/GB 0.00214는 정적 12대 기준값 0.00219와 같다. 9시간치는 천장 36대에서 4.0분(1시간치당 0.44분), dcu/1시간치는 17% 싸다. 이로써 `memoryOverhead` 3g는 4개 테이블 전부에서 실측됐다.
+
+### 5.2 2번 테이블 (하루 576GB, 시간당 약 24GB) — 12회 측정, 8대 + 20g 확정
 
 측정 대상: 2026-08-12 10~16시 데이터, 2026-09-15 ~ 09-16 실행. 1번과 같은 원천을 수직분할한 테이블이라 **시간당 row 수는 1번과 같고(약 340만) row 폭만 좁다.** 공통 설정: executor 4core, ratio 0.13(test4·5 제외), `maxExecutors` 36, driver 2core/4g.
 
@@ -283,6 +292,18 @@ init을 6으로 낮춰도, ratio를 0.08로 낮춰도 12대였다. ratio 0.08·0
 
 `instances` = init = min = 8로 시작하니 6 → 8 warm-up이 사라져 duration이 1.9 → **1.7분**으로 줄었다. dcu 0.0711(test8 대비 −5%, 노이즈 안), spill 0, idle cores 16.8%로 **1번 테이블 확정값(16.7%)과 같은 수준**이다. dcu/100만 row 0.0206은 9회 중 최저다. 이 설정으로 fix한다.
 
+**18g 검증 (test10~12, 2026-09-21) — 20g 유지**
+
+3·4번이 18g로 확정된 뒤(섹션 5.3·5.4) 2번도 18g가 되는지 봤다. `memoryOverhead`는 3g.
+
+| 회차 | 처리량 | heap | 데이터 | 대수 | duration | dcu | dcu/1시간치 | shuffle ÷ 데이터 | idle | spill |
+|------|--------|------|--------|------|----------|-----|------------|-----------------|------|-------|
+| test10 | 1시간 | 18g | 24.5GiB | 8 | 1.7m | 0.0672 | 0.0672 | 1.58 | 13.2% | 0 |
+| test11 | 1시간 | 16g | 24.2GiB | 8 | 1.9m | 0.0720 | 0.0720 | 1.58 | 21.2% | **6.28GiB** |
+| test12 | 20시간 | 18g | 479.8GiB | 8 → 23 | 10.9m | 1.25 | 0.0625 | 1.58 | 3.6% | **936MiB** |
+
+**20g 유지.** 18g는 1시간치 1회에서 0이었지만 20시간치(20개 시간대를 전부 훑는 더 엄한 시험)에서 936MiB가 났다. 데이터의 0.2%라 시간 비용은 없지만(10.9분 = 1시간치당 0.55분, 규칙대로) 운영에서도 어떤 시간대엔 18g가 spill을 낸다는 뜻이고, 판정 규칙은 "spill 0인 최소값"이다(섹션 8.3). 2번은 row가 좁아(7KB) 512MB 묶음에 row가 7.2만 개라 task당 정렬 메모리가 4개 테이블 중 가장 크다 — 필요량이 18g(2.66GB)와 20g(3.0GB) 사이에 있다. 18g로 가면 절감이 2g × 8 = 16g뿐이라 규칙에 예외를 만들 값이 아니다. test10(18g + 3g) dcu 0.0672가 test9(20g + 4g) 0.0711보다 5.5% 낮은 것은 메모리 몫이다(섹션 5.3 "dcu에는 메모리도 들어간다"). 23대에서 멈춘 이유는 섹션 5.5.
+
 **확정 설정 (2번 테이블)** — 1번과 다른 것만
 
 | 설정 | 1번 | 2번 |
@@ -290,13 +311,13 @@ init을 6으로 낮춰도, ratio를 0.08로 낮춰도 12대였다. ratio 0.08·0
 | `spark.executor.instances` = `initialExecutors` = `minExecutors` | 12 | **8** |
 | executor memory | 16g | **20g** |
 
-ratio 0.13, `maxExecutors` 36, executor 4core, `memoryOverhead` 4g, driver 2core/4g, Iceberg 옵션은 전부 동일하다.
+ratio 0.13, `maxExecutors` 36, executor 4core, `memoryOverhead` 3g(섹션 8.4), driver 2core/4g, Iceberg 옵션은 전부 동일하다.
 
 ---
 
-### 5.3 3번 테이블 (시간당 약 37~40GB) — 6회 측정, 12대 + 20g 확정
+### 5.3 3번 테이블 (시간당 약 37~40GB) — 9회 측정, 12대 + 18g 확정
 
-측정 대상: 2026-08-12 09~14시 데이터, 2026-09-16 ~ 09-17 실행. 크기·row 수·row 폭(약 11.5KB)이 1번과 거의 같다. 공통 설정: executor 4core, ratio 0.13, `maxExecutors` 36, `memoryOverhead` 4g, driver 2core/4g. test1·2는 `instances` = init = min = 8, test3~6은 12.
+측정 대상: 2026-08-12 09~14시 데이터, 2026-09-16 ~ 09-17 실행. 크기·row 수·row 폭(약 11.5KB)이 1번과 거의 같다. 공통 설정: executor 4core, ratio 0.13, `maxExecutors` 36, `memoryOverhead` 4g(test7~9는 3g), driver 2core/4g. test1·2는 `instances` = init = min = 8, test3~6은 12.
 
 | 회차 | 시간 | 데이터 | 시작 | e.mem | 대수 | duration | dcu | dcu/GB | dcu/100만 row | idle | memory | spill | 파일 |
 |------|------|--------|------|-------|------|----------|-----|--------|--------------|------|--------|-------|------|
@@ -311,54 +332,124 @@ test2 입력: 704개 / avg 55.8MB / 38.4GB — 1번(703개, 54MB)과 같은 파�
 
 **대수**: 8로 시작한 두 번 모두 ratio 0.13이 12로 올렸고, 산정식 39 × 0.32 = 12.5도 12~13이다. 2번(8)·3번(12) 두 테이블에서 ratio 0.13이 각각 다른 값으로 수렴했으므로 **공통 ratio는 확정**이다. 운영값 `instances` = init = min = **12**.
 
-**메모리**: 16g에서 두 번 다 spill(899MiB, 1.77GiB), 20g에서 네 번 다 0. **20g 확정.** 20g의 dcu 비용은 test4 대비 +5.5%다.
+**메모리**: 16g에서 두 번 다 spill(899MiB, 1.77GiB), 20g에서 네 번 다 0. 20g의 dcu 비용은 test4 대비 +5.5%다. 이어서 **18g + `memoryOverhead` 3g**로 3회 더 돌렸다(2026-09-20~21, test7~9). 4번 test5에서 18g가 spill 0이었던 신호(섹션 8.4)를 3번에서 확인한 것이다.
+
+**18g + 3g 검증 (test7~9)** — 데이터 = DataFlint input ÷ 2 (sort 전략은 데이터를 2번 읽는다, `tuning/compaction-tuning-guide.md` §2.4)
+
+| 회차 | 처리량 | 데이터 | 대수 | duration | dcu | dcu/1시간치 | dcu/GB | shuffle ÷ 데이터 | idle | spill | task error |
+|------|--------|--------|------|----------|-----|------------|--------|-----------------|------|-------|-----------|
+| test7 | 1시간 | 39.4GiB | 12 | 1.6m | 0.0936 | 0.0936 | 0.00238 | 1.52 | 15.2% | 0 | 0 |
+| test8 | 2시간 | 80.3GiB | 12 → 24 | 1.8m | 0.1959 | 0.0980 | 0.00244 | 1.51 | 20.4% | 0 | 0 |
+| **test9** | **22시간** | **875.5GiB** | 12 → 36 | 10.4m | 1.77 | 0.0805 | 0.00202 | 1.51 | 3.8% | **0** | **0** |
+
+**18g 확정.** 1시간치뿐 아니라 22시간치(하루 거의 전부, 천장 36대)에서도 spill 0·task error 0이다. 22시간치가 같은 메모리로 되는 이유는 섹션 5.5 "여러 시간치 재처리"에 정리했다. 16g와의 차이는 task당 정렬 메모리 2.4GB → 2.66GB(`(18g − 300MiB) × 0.6 ÷ 4`)로 10%뿐인데 spill이 0이 됐으므로, 3번 task의 실제 필요량은 2.4~2.66GB 사이다.
 
 **dcu에는 메모리도 들어간다.** duration이 같은 16g ↔ 20g 쌍에서 dcu가 일관되게 +5~6%였다(2번 test5→6, test7→8, 3번 test4→test3·6). `tuning/compaction-tuning-guide.md` §6.4의 "dcu는 cores × duration에 비례"는 메모리를 16g로 고정했을 때의 관측이며, 메모리를 25% 올리면 그 몫의 비용이 붙는다. 따라서 **메모리 증설은 spill을 없애는 데 필요한 만큼만** 한다.
 
 **dcu/100만 row가 1번보다 30% 높다 — 테이블 성질이다.** 4회 일관(0.0295~0.0324 vs 1번 0.0241)이라 노이즈가 아니다. parquet 폭은 1번과 같은데 16g에서 spill이 나고(1번은 7회 0) shuffle ÷ output도 1.51로 1번(1.41)보다 크다. 같은 byte를 메모리에 올렸을 때 더 커지는 컬럼 구성이라는 뜻이며, 정렬·직렬화 비용이 그만큼 붙는다. 설정으로 줄이는 값이 아니다. 판정 기준은 섹션 8.3에서 정정했다.
 
-**확정 설정 (3번 테이블)** — 1번과 다른 것은 executor memory **20g**뿐. `instances` = init = min = 12는 1번과 같다.
+**확정 설정 (3번 테이블)** — 1번과 다른 것은 executor memory **18g**뿐. `instances` = init = min = 12는 1번과 같다.
 
 ---
 
-### 5.4 4번 테이블 (시간당 약 37~39GB) — 2회 측정, 12대 + 20g 확정
+### 5.4 4번 테이블 (시간당 약 37~39GB) — 14회 측정, 12대 + 18g 확정
 
-측정 대상: 2026-08-12 09~10시 데이터, 2026-09-17 실행. 크기·row 수·입력 파일 구성(723개, avg 54.5MB)이 1번·3번과 같다. 공통 설정: executor 4core, ratio 0.13, `maxExecutors` 36, `memoryOverhead` 4g, driver 2core/4g.
+측정 대상: 2026-08-12 09~10시 데이터, 2026-09-17 실행. 크기·row 수·입력 파일 구성(723개, avg 54.5MB)이 1번·3번과 같다. 공통 설정(test1·2): executor 4core, ratio 0.13, `maxExecutors` 36, `memoryOverhead` 4g, driver 2core/4g. test3~9는 `memoryOverhead` 시행착오(섹션 8.4), test10~14는 18g + 3g 검증(아래).
 
 | 회차 | 시간 | 데이터 | 시작 | e.mem | 대수 | duration | dcu | dcu/GB | dcu/100만 row | idle | memory | spill | 파일 |
 |------|------|--------|------|-------|------|----------|-----|--------|--------------|------|--------|-------|------|
 | test1 | 09시 | 38.5GB | 8 | 16g | 8 → 12 | 2.1m | 0.1198 | 0.00311 | 0.0347 | 18.4% | 87.4% | **1.76GiB** | 77개, min 335MB |
 | **test2** | 10시 | 37.2GB | 12 | **20g** | 12 | 1.7m | 0.1042 | 0.00280 | 0.0314 | 20.5% | 94.8% | **0** | 74개, min 401MB |
 
-3번과 같은 결과다. ratio 0.13이 12로 수렴(38 × 0.32 = 12.3), 16g에서 spill, 20g에서 0, row당 비용은 3번(0.030~0.032)과 같은 수준. test2가 운영 형태(12대 시작, 20g) 그대로라 추가 실행 없이 확정한다.
+3번과 같은 결과다. ratio 0.13이 12로 수렴(38 × 0.32 = 12.3), 16g에서 spill, 20g에서 0, row당 비용은 3번(0.030~0.032)과 같은 수준.
 
-**확정 설정 (4번 테이블)** — 3번과 동일. `instances` = init = min = **12**, executor memory **20g**.
+**18g + 3g 검증 (test10~14, 2026-09-18~21)** — `memoryOverhead` 시행착오(test3~9, 섹션 8.4) 중 test5(18g + 2g)에서 spill 0이 나와 18g를 검증했다. 처리량을 1시간치에서 6시간치까지 늘렸다.
+
+| 회차 | 처리량 | 데이터 | 공식 목표 | 대수 | duration | dcu | dcu/1시간치 | dcu/GB | shuffle ÷ 데이터 | idle | memory | spill | task error |
+|------|--------|--------|----------|------|----------|-----|------------|--------|-----------------|------|--------|-------|-----------|
+| test10 | 1시간 | 39.4GiB | 11.5 → 바닥 12 | 12 | 1.9m | 0.1077 | 0.1077 | 0.00273 | 1.54 | 19.0% | 92.6% | 0 | 0 |
+| test11 | 2시간 | 78.1GiB | 22.8 → 23 | 12 → 24 | 2.0m | 0.2165 | 0.1083 | 0.00277 | 1.54 | 19.1% | 97.7% | 0 | 0 |
+| test12 | 3시간 | 114.0GiB | 33.3 → 34 | 12 → 31 | 2.0m | 0.2777 | 0.0926 | 0.00244 | 1.54 | 17.4% | 95.2% | 0 | 0 |
+| test13 | 5시간 | 197.8GiB | 57.9 → 천장 36 | 12 → 36 | 2.7m | 0.4510 | 0.0902 | 0.00228 | 1.55 | 13.3% | 97.8% | 0 | 0 |
+| test14 | 6시간 | 231.6GiB | 67.7 → 천장 36 | 12 → 33 | 3.1m | 0.4888 | 0.0815 | 0.00211 | 1.54 | 9.0% | 미기록 | 0 | 0 |
+
+공식 목표 = 데이터GiB × 9(task/GB) × 0.13 ÷ 4 = 데이터GiB × 0.29 (섹션 4.4). 데이터 = DataFlint input ÷ 2.
+
+**18g 확정.** 5회 전부 spill 0·task error 0. 4번 task의 필요량도 3번과 같이 2.4~2.66GB 사이다.
+
+**DataFlint "Executor memory under-provisioned" alert는 무시한다.** test11~13에서 떴다. 이 alert는 executor의 peak 메모리 사용률 %가 DataFlint 기준선을 넘었다는 뜻이고, test10(92.6%)에는 안 뜨고 test12(95.2%)부터 떴으므로 기준선은 92.6~95.2% 사이다. Java는 heap이 찰 때까지 GC를 미루므로 데이터만 충분하면 필요량과 무관하게 90% 후반까지 찬다 — 20g일 때도 97.6%였다(섹션 10). 부족의 신호는 사용률이 아니라 spill이고, 그것이 0이다.
+
+**확정 설정 (4번 테이블)** — 3번과 동일. `instances` = init = min = **12**, executor memory **18g**, `memoryOverhead` 3g.
 
 ### 5.5 4개 테이블 확정 설정 요약
 
 | 테이블 | 시간당 데이터 | `instances` = init = min | executor memory | dcu/100만 row (확정 설정) | 검증 횟수 |
 |--------|--------------|-------------------------|-----------------|--------------------------|----------|
-| 1번 | 37~40GB | 12 | 16g | 0.0241 | 7회 (섹션 5.1) |
-| 2번 | 23~25GB | 8 | 20g | 0.0206~0.0219 | 9회 (섹션 5.2) |
-| 3번 | 37~40GB | 12 | 20g | 0.0295~0.0324 | 6회 (섹션 5.3) |
-| 4번 | 37~39GB | 12 | 20g | 0.0314 | 2회 (섹션 5.4) |
+| 1번 | 37~40GB | 12 | 16g | 0.0241 | 9회 (섹션 5.1) |
+| 2번 | 23~25GB | 8 | 20g | 0.0206~0.0219 | 12회 (섹션 5.2) |
+| 3번 | 37~40GB | 12 | 18g | 0.0295~0.0324 (20g 측정) | 9회 (섹션 5.3) |
+| 4번 | 37~39GB | 12 | 18g | 0.0314 (20g 측정) | 14회 (섹션 5.4) |
 
 공통: `dynamicAllocation.enabled=true`, `executorAllocationRatio=0.13`, `maxExecutors=36`, executor 4core, **executor `memoryOverhead` 3g**(4개 테이블 명시, 섹션 8.4), driver 2core/4g(`memoryOverhead` 기본값), Iceberg 옵션은 `tuning/compaction-tuning-guide.md` §5.
 
-**DAG 반영용 최종 설정 (2026-09-18)**
+**DAG 반영용 최종 설정 (2026-09-21)**
 
 | 테이블 | `instances` = init = min | executor memory | executor `memoryOverhead` | pod 메모리 합계 |
 |--------|-------------------------|-----------------|--------------------------|----------------|
 | 1번 | 12 | 16g | 3g | 19g × 12 = 228g |
 | 2번 | 8 | 20g | 3g | 23g × 8 = 184g |
-| 3번 | 12 | 20g | 3g | 23g × 12 = 276g |
-| 4번 | 12 | 20g | 3g | 23g × 12 = 276g |
+| 3번 | 12 | 18g | 3g | 21g × 12 = 252g |
+| 4번 | 12 | 18g | 3g | 21g × 12 = 252g |
 
-`memoryOverhead` 4g → 3g로 4개 합계 44g가 줄었다. 2g는 executor 유실이 나서 쓰지 않는다(섹션 8.4).
+4개 합계 916g. 2026-09-18 표(3·4번 20g, 964g) 대비 48g 감소. `memoryOverhead` 2g는 executor 유실이 나서 쓰지 않는다(섹션 8.4).
 
 **판정 지표에 task error rate·executor 유실을 포함한다.** job 성공만 보면 executor가 죽고 재실행된 것을 놓친다(`memoryOverhead` 2g 사례). DataFlint `task error rate` 0%, failed stage 0건이 spill 0과 함께 필수 조건이다.
 
 **idle cores 17~25%는 구조적인 값이다.** 12대 × 4core = 48 slot인데 정렬·쓰기 task는 출력 파일 수만큼(74~77개)이라 첫 회차 48개 뒤 둘째 회차에 26~29개만 남아 slot 19~22개가 논다. 이 구간의 idle이 40%대이고 앞 단계까지 평균 내면 job 전체 17~25%다. 1번 확정값 16.7%도 같은 구조이며, 17~25%의 흔들림은 둘째 회차 꼬리와 duration 반올림(0.1분 = 6%)이다. 3번 test1(8 → 12) 18%와 test2(12 시작) 20%가 같으므로 warm-up과는 무관하다. 줄이려면 slot을 task 수에 맞춰야 하는데 20대(80 slot, 1회차)는 코어가 늘어 dcu가 오르고(1번에서 16대가 +15%), 10대(40 slot, 40 + 37)는 이득이 노이즈 15% 안일 가능성이 커 쫓지 않는다. `tuning/compaction-tuning-guide.md` §7.2의 "20% 이하면 양호"는 DataFlint 경고 기준이지 판정 기준이 아니다.
+
+**여러 시간치 재처리에서도 메모리 설정은 그대로다 (3번 22시간치·4번 6시간치 실측, 2026-09-21)**
+
+3번 test9는 22시간치 875GiB를 36대·18g + 3g로 10.4분에 처리했고 spill 0·task error 0이었다. 1시간치와 같은 메모리로 22배의 데이터가 되는 이유는 **Spark가 데이터를 한 번에 메모리에 올리지 않기 때문**이다. `tuning/compaction-tuning-guide.md` §2.4의 카드 묶음으로 말하면:
+
+| | 1시간치 (test7) | 22시간치 (test9) | 비고 |
+|---|---|---|---|
+| 데이터 | 39.4GiB | 875.5GiB | 22배 |
+| 묶음(쓰기 task) 수 | 약 77개 | 약 1,750개 | 22배 — 512MB로 자르므로 **개수만** 는다 |
+| 묶음 1개 크기 | 512MB | 512MB | 같다 |
+| executor가 동시에 드는 묶음 | 4개 (task 4개) | 4개 | 같다 → **heap 필요량 같다** |
+| executor가 동시에 주고받는 조각 | task 4개분 | task 4개분 | 같다 → **overhead 필요량 같다** |
+| executor 디스크의 shuffle 통 | 60GiB ÷ 12 = 5GiB | 동시에 도는 파티션 10~12개분 (아래) | 총량이 아니라 **동시 파티션 수**가 정한다 |
+| duration | 1.6m | 10.4m | 묶음 수 ÷ slot 수 |
+
+heap은 "지금 정렬 중인 묶음 4개"만 담고, overhead는 "지금 네트워크로 오가는 조각"만 담는다. 나머지 묶음은 S3의 parquet와 executor 디스크의 shuffle 통에 있다. 데이터가 늘면 그 통이 커지고 회차가 늘 뿐이다.
+
+**비용은 클수록 싸진다.** dcu/1시간치가 1시간 0.094~0.108 → 22시간 0.081로 25% 내려갔다(4번 6시간치도 0.082). 계획·warm-up·마지막 회차의 빈 slot 같은 고정 비용이 묻히기 때문이며, idle cores도 19% → 3.8%로 떨어진다. 재처리 DAG가 여러 시간을 한 번에 trigger하는 것은 시간별로 도는 것보다 싸다.
+
+**duration은 천장 36대에서 1시간치당 약 0.5분이다.** test9 10.4 ÷ 22 = 0.47, test14 3.1 ÷ 6 = 0.52. 재처리 범위가 n시간이면 약 0.5n분으로 잡으면 된다(3시간치까지는 대수가 비례해 늘어 2분 안팎, 그 위는 천장이라 비례 증가).
+
+**executor 디스크(`spark-local-dir-1`)는 hourly 기준 executor당 약 5GiB다.** shuffle 통은 executor 디스크에 쓰이고, 1시간치 shuffle 60GiB ÷ 12대 = 5GiB(1번 4.8, 2번 4.8, 3·4번 5.0). **권장 10GiB × 노드당 executor 수.** 재처리로 n시간치를 한 번에 돌리면 최악 n × 5GiB(끝난 파티션의 통을 driver GC 전까지 안 지울 때)이고, 동시 파티션 12개분(약 6~7GiB)에 그칠 수도 있다 — 22시간치(test9)가 현 디스크로 성공했으니 지금 용량은 충분하며, 정확한 값은 운영 첫 실행에서 executor pod의 `spark-local-dir-1` 사용량을 한 번 보면 된다(섹션 10). 디스크가 차면 shuffle write가 `No space left on device`로 task 실패 → 재시도 → job 실패다(executor가 죽는 게 아니라 task가 죽는다). 참고로 `memoryOverhead` 2g 실험에서 OOMKilled로 죽은 executor는 종료 훅이 안 돌아 자기 디렉터리를 못 지우므로, hostPath에 `spark-*`·`blockmgr-*` 잔여 디렉터리가 남아 있을 수 있다.
+
+**job 하나의 K8s 메모리 = driver.memory + driver `memoryOverhead` + (executor.memory + executor `memoryOverhead`) × executor 수.** Spark on K8s는 request = limit로 낸다. executor 수는 평소 = 시작 대수(12), 재처리 = 아래 수렴값(2번 23, 나머지 36)으로 두 값을 잡는다 — 3번 재처리 peak는 4g + 0.4g + 21g × 36 = 760g. `spark.memory.offHeap.size`·pyspark memory는 안 쓰므로 더할 것 없고, 디스크는 이 식에 없다.
+
+**executor 수는 총 데이터가 아니라 "동시에 돌고 있는 파티션들의 데이터 합"으로 정해진다 (2026-09-21 원인 확정).** 4번 3시간치 31대·6시간치 33대, 2번 20시간치 **23대**(공식 140 → 천장 36인데)가 천장에 못 미친 이유다. 2번의 23 = 8 + 1 + 2 + 4 + 8, DA 증원이 4단계에서 멈춘 수다.
+
+1. Compaction은 파티션(시간 1개 × `par_a` 값 1개 = file group)마다 별도 Spark job을 띄우고, **`max-concurrent-file-group-rewrites`개까지만 동시에** 돌린다. 1시간치는 파티션 4개라 전부 동시에 돌고, 22시간치는 88개를 10개씩 돌린다
+2. DA의 목표 대수는 **지금 돌고 있는 stage의 task 수**로 계산한다(섹션 4.4). job 전체가 아니다
+3. 그러니 DA 눈에는 늘 "동시 파티션 10개분"만 보인다. 1번 튜닝에서 39GB에 12대가 최적이었으니 **GB당 0.3대**, 이걸 동시에 도는 데이터에 곱한 것이 대수이고 최대 36이다
+
+| 처리량 | 파티션 수 | 동시에 도는 파티션 | 그 데이터 합 | 대수 = 합 × 0.3 | 실측 (4번) |
+|---|---|---|---|---|---|
+| 1시간 | 4 | 4 (전부) | 39GB | 12 | 12 |
+| 2시간 | 8 | 8 (전부) | 78GB | 23 | 24 |
+| 3시간 | 12 | 10 | 약 95GB (작은 A·D 포함) | 28 | 31 |
+| 5시간 | 20 | 10 | 약 170GB (큰 B·C 위주) | 49 → 천장 36 | 36 |
+| 6시간 | 24 | 10 | 약 150GB | 45 → 천장 36 | 33 |
+
+3시간과 5시간이 다른 이유는 파티션 크기가 다 달라서다(B·C 각 17GB, A 5GB, D 0.4GB). 작은 A·D는 몇 초 만에 끝나 자리를 비우고 오래 걸리는 B·C가 10자리를 채우므로, 오래 돌수록 동시 10개가 큰 것들로 차서 36에 닿는다. 2번은 파티션이 작아(B·C 각 10.5GB) 10개 = 60~80GB → 23대에서 멈춘다. 확인은 Spark UI Jobs 탭에서 동시 실행 job이 설정값을 안 넘는 것 하나면 된다.
+
+**이것이 "22시간치를 executor 12 × 22대 없이 처리하는 이유"다.** 12대·18g는 "1시간에 다 처리하려고" 정한 값이 아니라 **파티션 1개(약 17GB)를 512MB 묶음으로 나눠 정렬할 때 비용이 가장 싼 값**이다. 파티션 크기는 시간당 데이터로 한정돼 있고, 22시간치라고 파티션이 커지는 게 아니라 개수가 88개로 늘 뿐이다. 그래서 88개를 10개씩 순서대로 돌리면 시간만 22배 가까이 늘고(1.6분 → 10.4분) 메모리·대수는 그대로다.
+
+**`max-concurrent-file-group-rewrites` 10 → 12 (2026-09-21).** 재처리 3시간치가 파티션 12개라 한 번에 돌리는 값으로 맞췄다. hourly는 4개라 무관하고, 3시간치는 동시 데이터 95 → 114GB로 대수 31 → 34, 2.0분 → 약 1.8분, executor당 shuffle 디스크 7 → 8.5GiB, driver 동시 job 10 → 12개 — 손실은 이것뿐이다. **상한은 16.** 36 ÷ 0.3 = 120GB, 즉 큰 파티션 7개(17 × 7 = 119GB)가 동시에 돌면 executor는 이미 36대로 꽉 차고, 그 위로는 동시 파티션을 늘려도 executor가 안 늘어 시간이 안 줄며 디스크만 파티션 수에 비례해 는다. 규칙: **재처리 시간 수 × 4, 상한 16.** 2번만 파티션이 작아 23대에서 멈추는데, 2번 재처리를 빠르게 하려면 15로 올리면 36대가 된다(20시간치 10.9분 → 약 7분, 비용 동일). 재처리 속도의 진짜 손잡이는 이 값이 아니라 `maxExecutors` 36이다 — 72로 올리고 동시 파티션도 20으로 올리면 시간 절반, 비용 동일. 재처리 속도가 문제 될 때 올린다.
 
 ---
 
@@ -389,23 +480,27 @@ C안 상세(산정 위치 대안 비교, 조회 경로 대안 비교, 실패 모
 | **hourly Compaction** | **B안 적용** (섹션 4.7 설정 + 섹션 4.8 규칙) |
 | `spark.executor.instances` / `initialExecutors` / `minExecutors` | **세 값 동일.** 테이블별 `시간당 데이터GB × 0.32`. 1번 12, 2번 8, 3번 12, 4번 12 (섹션 5.5) |
 | `executorAllocationRatio` | 전 테이블 **0.13** (2번 8대·3번 12대로 각각 수렴 — 재검증 완료) |
-| `maxExecutors` | **36 고정.** K8S quota는 확인 불가하나 리소스가 넉넉하고, 실사용량은 ratio가 정하므로 천장은 넉넉히 둬도 무해(섹션 4.6). 3시간치(약 110GB)까지 덮는다 |
-| executor memory | 테이블별. spill이 0이 되는 최소값 (섹션 8.2). 1번 16g, 2·3·4번 20g. **메모리도 dcu에 반영되므로(+5~6%/4g) 필요한 만큼만** |
+| `maxExecutors` | **36 고정.** K8S quota는 확인 불가하나 리소스가 넉넉하고, 실사용량은 ratio가 정하므로 천장은 넉넉히 둬도 무해(섹션 4.6). 3시간치(약 110GB)까지는 공식대로 늘고 그 위는 천장. 천장에서도 22시간치가 10.4분에 끝난다(섹션 5.5) |
+| executor memory | 테이블별. spill이 0이 되는 최소값 (섹션 8.2). 1번 16g, 2번 20g, 3·4번 18g. **메모리도 dcu에 반영되므로(+5~6%/4g) 필요한 만큼만** |
 | executor `memoryOverhead` | **3g, 4개 테이블 명시.** 4번에서 1g job 실패·2g executor 유실(task error 1~3%)·3g 깨끗(섹션 8.4). 고정값 — 데이터 양과 무관 |
 | driver `memoryOverhead` | 기본값(heap의 10%, 약 410MB) 유지 |
-| 적용 시점 | **DAG 미반영.** 4개 테이블 + `memoryOverhead` 확정 완료(2026-09-17) — 섹션 5.5 표로 일괄 적용 |
+| 적용 시점 | **DAG 미반영.** 4개 테이블 heap·`memoryOverhead` 확정 완료(2026-09-21, 3·4번 18g 포함) — 섹션 5.5 표로 일괄 적용 |
 | C안 (사전 산정) | 보류. 예시 파일은 유지 |
 
-**더 조절할 여지가 있는가 (2026-09-18 판단)**
+**더 조절할 여지가 있는가 (2026-09-21 판단)**
 
 | 항목 | 판단 | 남은 여지 |
 |------|------|----------|
 | executor 수 | 1번에서 16·12·8 실측으로 12가 비용 최저, 2·3·4번은 ratio가 그 비율대로 수렴. 확정 | 3·4번 10대는 이득이 있어도 노이즈 15% 안이라 측정으로 구분 불가. 안 한다 |
 | executor core 4 | 한 번도 안 바꿈. 2나 8로 바꾸면 ratio 0.13·계수 0.32가 전부 무효가 되어 10회 이상 재측정 | 4가 통상 최적점. 손대지 않는다 |
-| executor memory | 4g 단위로 spill 0인 최소값 | **유일하게 남은 여지.** 4번 test5(18g)에서 spill 0이 1회 확인됐다. **18g + 3g = 21g**로 3·4번을 2~3시간치 돌려 spill 0·task error 0이면 18g 확정(executor당 2g, 24대 48g 절감). spill은 job을 죽이지 않고 DataFlint에 숫자로만 나타나므로 DAG 반영 후 운영에서 해도 된다. 2번은 16g에서 10GiB까지 났으므로 제외, 1번은 16g에서 이미 0 |
+| executor memory | 2g 단위로 spill 0인 최소값. 1번 16g, 2번 20g, 3·4번 18g | **없음 (2026-09-21 확정).** 18g + 3g = 21g로 3번 1·2·22시간치, 4번 1~6시간치를 돌려 spill 0·task error 0(섹션 5.3·5.4). 두 테이블 합계 48g 절감. 2번은 16g에서 10GiB까지 났으므로 20g 유지, 1번은 16g에서 이미 0. 17g는 이득 12g에 시행착오 비용이 더 크다 |
 | `memoryOverhead` 3g | 1g job 실패·2g executor 유실·3g 깨끗 | 없음 |
 | driver 2core/4g + 기본 overhead | 효과가 노이즈 안 | 없음 |
-| Iceberg 옵션 | 1번에서 확정 | 없음 |
+| Iceberg 옵션 | 1번에서 확정. `max-concurrent-file-group-rewrites`만 10 → 12 (재처리 3시간치 = 파티션 12개, 섹션 5.5) | 없음 |
+| `spark.memory.fraction` 0.6 → 0.8 | heap 중 정렬에 쓸 수 있는 비율. Compaction은 캐시가 0이라 올릴 수 있다. 16g + 0.8이면 task당 정렬 메모리 (16,384 − 300) × 0.8 ÷ 4 = 3.2GB로 20g + 0.6의 3.0GB보다 크다 → 2번 16g 가능성, pod 합계 −32g 이상 | **보류 (2026-09-21).** 위험은 남은 20%로 Parquet 쓰기 버퍼(task당 200~300MB)가 모자라면 executor가 Java OOM으로 죽는 것. 보통은 기본값 0.6 그대로 둔다. 하려면 2번 16g + 0.8로 2~3회 |
+| shuffle 압축 codec (lz4 → zstd) | shuffle 임시 파일이 20~30% 작아지는 대신 CPU 증가. 테이블의 `write.parquet.compression-codec=zstd`(S3 결과 파일 압축)와는 **무관** | **안 한다.** 디스크(executor당 5GiB)·네트워크가 병목이 아니고 CPU가 병목(idle cores 17%)이라 dcu가 는다 |
+| `partial-progress.enabled` | 파티션 몇 개마다 중간 commit | **false 유지.** `rewrite-all=true`라 재실행하면 커밋된 파티션도 다시 쓰므로 재실행 비용을 안 줄이고 snapshot만 는다. `rewrite-all=false`는 재처리(늦게 온 데이터가 섞인 파티션)에서 작은 파일만 골라 써 정렬 묶음이 두 벌이 되므로 못 쓴다 |
+| `target-file-size-bytes` 512MB | 묶음 크기 = task 크기·파일 수·Trino split 수 | **안 건드린다.** 읽기 성능 테스트가 512MB 기준이라 바꾸면 스키마 설계부터 재검증 |
 
 ---
 
@@ -418,7 +513,7 @@ C안 상세(산정 위치 대안 비교, 조회 경로 대안 비교, 실패 모
 | `executorAllocationRatio` | **비율(%)** | ❌ 공통 (0.13) |
 | `spark.executor.instances` / `initialExecutors` / `minExecutors` | **개수(대)** | ✅ 테이블별, 세 값 동일 |
 | `maxExecutors` | 개수(대) | 공통 (36) |
-| executor memory | 크기 | ✅ 테이블별 (16g 또는 20g) |
+| executor memory | 크기 | ✅ 테이블별 (16g·18g·20g) |
 
 **ratio가 공통인 이유**: 데이터가 작으면 Spark이 요청하려는 대수도 작아지므로, 같은 비율을 곱해도 알아서 작은 값이 나온다. 단 이것은 입력 파일 크기가 같은 테이블끼리 성립한다(섹션 4.5). hourly 4개는 append 설정이 같아 파일 구성이 같고, 2번 테이블에서 확인했다(GB당 20개 vs 19개).
 
@@ -491,7 +586,7 @@ task 하나가 정렬하는 **byte**는 두 테이블이 같지만(0.8GB), **row
 
 **4g 단위는 core 4개와 무관하다.** 16 → 20은 "25% 올려 보자"고 고른 폭일 뿐이며 18g든 22g든 된다. core 4개가 들어가는 자리는 위 식의 "÷ 4" 하나다.
 
-**절차**: 새 테이블은 16g로 1회 돌려 spill이 나면 20g, 그래도 나면 24g. Spark UI task별 `Peak Execution Memory`를 받아 두면 실제 필요량이 바로 나와 이후 테이블은 계산으로 정할 수 있다.
+**절차**: 새 테이블은 18g로 1회 돌려 spill이 나면 20g, 그래도 나면 24g(섹션 8.3). Spark UI task별 `Peak Execution Memory`를 받아 두면 실제 필요량이 바로 나와 이후 테이블은 계산으로 정할 수 있다.
 
 ### 8.3 판정 — 테이블 안에서는 dcu, 테이블 사이는 dcu/100만 row를 참고만
 
@@ -499,12 +594,12 @@ task 하나가 정렬하는 **byte**는 두 테이블이 같지만(0.8GB), **row
 
 **테이블 사이 비교는 참고 지표다.** hourly 4개는 같은 원천을 수직분할한 테이블이라 시간당 row 수가 같고 컬럼 폭만 다르다. dcu를 GB로 나누면 row가 좁은 테이블이 비효율적으로 **보이고**(2번 8대: dcu/GB는 1번 +35%, dcu/100만 row는 −9~14%), row로 나누면 그 착시는 사라진다. 그러나 row로 나눠도 **컬럼 타입이 다르면 row당 비용이 다르다** — 3번은 parquet 폭이 1번과 같은데 dcu/100만 row가 30% 높고, 그 원인(메모리 팽창·spill 성향)은 설정으로 바꿀 수 없다. 즉 dcu/100만 row가 1번과 다르다는 것만으로 "설정이 틀렸다"고 판정하지 않는다.
 
-| 테이블 | 대수 | 메모리 | dcu/100만 row (확정 설정) |
-|--------|------|--------|--------------------------|
+| 테이블 | 대수 | 메모리 | dcu/100만 row |
+|--------|------|--------|---------------|
 | 1번 | 12 | 16g | 0.0241 |
 | 2번 | 8 | 20g | 0.0206~0.0219 |
-| 3번 | 12 | 20g | 0.0295~0.0324 |
-| 4번 | 12 | 20g | 0.0314 |
+| 3번 | 12 | 18g | 0.0295~0.0324 (20g 측정) |
+| 4번 | 12 | 18g | 0.0314 (20g 측정) |
 
 **다른 테이블 확인 항목** (테이블당 1~2회 실행)
 
@@ -517,15 +612,39 @@ task 하나가 정렬하는 **byte**는 두 테이블이 같지만(0.8GB), **row
 | duration | 2분 이내 (DAG 전체 12분 창) | — |
 | 출력 파일 | avg 500MB대, **384MB 미만 파일 3개 미만** | `tuning/compaction-tuning-guide.md` §4.3 |
 
-**새 hourly 테이블 절차** (4번까지 적용 완료): `instances` = init = min = `ceil(시간당 GB × 0.32)`, ratio 0.13, max 36. 4개 중 3개가 16g에서 spill이 났으므로 **20g로 바로 시작**해 1회. spill 0이면 확정, 나면 24g.
+**새 hourly 테이블 절차** (4번까지 적용 완료): `instances` = init = min = `ceil(시간당 GB × 0.32)`, ratio 0.13, max 36. 4개 중 3개가 16g에서 spill이 났고 그 중 둘(3·4번)은 18g로 충분했으므로 **18g + `memoryOverhead` 3g로 시작**해 1회. spill 0이면 확정, 나면 20g.
 
 ### 8.4 `memoryOverhead` — 3g 확정 (실측 2026-09-17~18)
 
-`spark.executor.memory`(heap)는 Spark 코드가 객체를 만들고 정렬하는 공간이고, `memoryOverhead`는 **heap 바깥**에서 쓰는 메모리다 — JVM 자체 몫(스레드 스택·클래스 메타데이터·JIT 코드), shuffle 전송용 netty direct 버퍼, 압축 라이브러리의 네이티브 버퍼, 그리고 executor가 로컬 디스크에 쓰는 shuffle 파일(executor당 약 4.7GB)의 page cache. Spark 기본값은 heap의 10%(최소 384MB)이며 튜닝 전 설정은 4g였다.
+executor pod 하나의 메모리 한도 = `spark.executor.memory`(heap) + `memoryOverhead`. 3·4번이면 18g + 3g = **21g**다.
 
-**`memoryOverhead`의 역할 — 예산 한 줄이다.** executor pod를 건물로 보면 `executor.memory` 20g는 **선반**(Java가 row·정렬 버퍼를 올려 두는 곳, Java가 관리), `memoryOverhead` 3g는 **복도와 하역장**(netty 전송 버퍼, 압축 작업 버퍼, shuffle 파일 page cache — 운영체제와 라이브러리가 씀), 건물 전체 면적 = 선반 + 복도 = 23g가 K8s에 신고하는 pod 한도다. 이 설정은 무언가를 할당하지 않는다. Spark이 heap에 더해 pod 한도로 제출하는 값일 뿐이며, 복도가 실제 사용량보다 좁으면 건물 전체가 한도를 넘어 K8s가 pod를 죽이고, 넓으면 예약만 하고 안 쓴다.
+| | heap (`spark.executor.memory` 18g) | overhead (`memoryOverhead` 3g) |
+|---|---|---|
+| 무엇 | Spark가 **데이터 row를 올려놓고 정렬하는 공간** | Java 프로그램이 **데이터 말고 돌아가는 데 쓰는 메모리 전부** |
+| 부족하면 | 디스크로 내려보낸다(**spill**). 느려지지만 죽지 않는다 | pod가 한도를 넘어 K8s가 executor를 죽인다(**OOMKilled**) |
+| 지표 | DataFlint `spill` | DataFlint `task error rate`, driver 로그 `exit code 137` |
 
-**pod가 점유하는 메모리는 두 값의 합이다.** 3번 테이블은 4g일 때 executor당 24g × 12 = 288g이었고, 3g로 확정한 뒤에는 23g × 12 = **276g**다.
+이 설정은 무언가를 할당하지 않는다. Spark가 heap에 더해 pod 한도로 제출하는 값일 뿐이고, 실제 사용량보다 작으면 pod가 죽고 크면 예약만 하고 안 쓴다. Spark 기본값은 heap의 10%(최소 384MB), 튜닝 전 설정은 4g였다.
+
+**overhead가 실제로 쓰이는 곳 — 네 가지**
+
+1. **executor 간 통신 버퍼 (가장 크고, 유일하게 변동하는 항목).** shuffle 단계에서 executor들이 서로 데이터 조각을 주고받는데, 네트워크로 보내고 받는 조각을 잠시 담아 두는 버퍼가 heap 바깥에 있다. 받는 쪽은 task 1개당 최대 48MB(`spark.reducer.maxSizeInFlight`)를 미리 당겨 오므로 task 4개면 약 200MB이고, 보내는 쪽은 **요청해 오는 executor 수만큼** 버퍼가 열린다 — 36대가 동시에 달려들면 한 executor에 보내기 버퍼가 몰린다. 2g에서 executor 유실이 난 시점이 shuffle read 중이었고 오류가 `MetadataFetchFailedException`·`internal_error_network`였던 것이 이 항목이 넘쳤다는 증거다
+2. **Java 프로그램 자체가 돌아가는 데 필요한 메모리 (거의 고정).** 프로그램 코드를 올려 두는 공간(100~300MB), 스레드 하나마다 딸린 작은 작업 공간(100개 이상 × 약 1MB), 메모리 청소(GC)를 위한 장부(heap의 몇 %). **Spark 기본값 10%는 이 항목만 보고 잡은 값**이다
+3. **압축·해제 작업 공간.** shuffle 조각은 디스크에 압축해서 쓰고 읽을 때 풀며, Parquet 파일을 쓸 때도 압축한다. 이 작업은 Java 바깥의 C 라이브러리가 하고 그 작업 공간이 overhead다. 하나하나는 작지만 task 4개 × 동시에 여는 파일 수만큼 열린다
+4. **반대로, overhead에 절대 안 들어가는 것.** 데이터 row 자체, 정렬 중인 데이터, 디스크에 쓴 shuffle 파일. row는 heap, shuffle 파일은 디스크다. 이것이 **데이터 양이 늘어도 overhead가 안 늘어나는 이유**다 — 1은 "동시에 오가는 조각 수", 2·3은 "task 수·스레드 수"로 크기가 정해지고 셋 다 데이터 총량과 무관하다. 3번 22시간치 875GiB·36대에서도 3g로 task error 0(섹션 5.3)
+
+**왜 10%(1.8g)가 아니라 3g인가 — 필요량이 heap 크기를 따라가지 않는다.** 10% 규칙은 항목 2(heap이 크면 GC 장부도 조금 커진다)에서 나온 경험칙이고, 공식 문서도 "executor 크기에 따라 커지는 경향, 보통 6~10%"라고 적는다. 우리 job은 그 위에 항목 1이 얹혀 있고, 그것은 heap과 무관하다. 실측이 그대로다 — heap을 20g에서 18g로 **줄였는데도** 2g에서 똑같이 executor를 잃었다:
+
+| overhead | heap | 결과 |
+|----------|------|------|
+| 1g | 20g | job 실패 |
+| 2g | **18g** (test5) | job 성공, executor 유실(task error 2.4%) |
+| 2g | 20g (test6·7) | job 성공, executor 유실(task error 0.9%·3.1%) |
+| 3g | 18g·20g | task error 0 |
+
+즉 우리 job의 필요량은 heap과 무관한 **2g 조금 넘는 고정값**이고, 10% 규칙이 그 값을 덮으려면 heap이 30g는 돼야 한다. 2.5g는 재지 않았다 — 절감 0.5g × 12 = 6g이고 틀리면 운영에서 executor 유실이 난다.
+
+**pod가 점유하는 메모리는 두 값의 합이다.** 3번 테이블은 20g + 4g일 때 executor당 24g × 12 = 288g이었고, 18g + 3g로 확정한 뒤에는 21g × 12 = **252g**다.
 
 **실측 — 4번 테이블, 시행착오 9회**
 
@@ -533,10 +652,20 @@ task 하나가 정렬하는 **byte**는 두 테이블이 같지만(0.8GB), **row
 |------------------|------|------|
 | 1g | 1회 | executor pod 사망 → **job 실패** |
 | 2g | 4회 (최초 1회 + test5·6·7, heap 18g/20g/20g) | job은 성공했으나 **task error rate 2.4% / 0.9% / 3.1%**(test5·6·7), failed stage 1~4건 (`MetadataFetchFailedException`, `internal_error_network`). 최초 1회는 task error를 확인하지 않았다 |
-| **3g** | 2회 (test8·9) | **task error 0%, failed stage 0** |
+| **3g** | 2회 (test8·9) + 18g 검증 8회 (4번 test10~14, 3번 test7~9 — 최대 36대·22시간치) | **전부 task error 0%, failed stage 0** |
 | 4g | 2회 (섹션 5.4 test1·2) | task error 0% |
 
-`MetadataFetchFailedException`은 "shuffle 통을 가지러 갔는데 그 통을 들고 있던 executor가 사라졌다"는 뜻이고, `internal_error_network`는 죽은 executor와의 연결 단절이다. 즉 **2g에서는 시간대에 따라 executor 한두 대가 한도를 넘어 죽고, Spark이 앞 단계를 재실행해 job을 살린 것**이다. 숨은 비용은 재실행만큼의 duration·dcu이고, 진짜 위험은 재실행까지 실패하면 그 시간 Compaction 전체가 실패한다는 것(`partial-progress=false`). 그래서 **job 성공 여부가 아니라 task error rate 0%·executor 유실 0건이 판정 기준**이다. 처음에 "2g 성공"으로 판정했던 것은 job 성공만 보고 task 실패를 안 본 오판이었다(2026-09-18 정정). 확인은 driver 로그 `ExecutorLostFailure ... exit code 137` 또는 `kubectl get pod`의 terminated reason `OOMKilled`.
+`MetadataFetchFailedException`은 "shuffle 통을 가지러 갔는데 그 통을 들고 있던 executor가 사라졌다"는 뜻이고, `internal_error_network`는 죽은 executor와의 연결 단절이다. 즉 **2g에서는 시간대에 따라 executor 한두 대가 한도를 넘어 죽고, Spark이 앞 단계를 재실행해 job을 살린 것**이다. 숨은 비용은 재실행만큼의 duration·dcu이고, 진짜 위험은 재실행까지 실패하면 그 시간 Compaction 전체가 실패한다는 것(`partial-progress=false`). 그래서 **job 성공 여부가 아니라 task error rate 0%·executor 유실 0건이 판정 기준**이다. 처음에 "2g 성공"으로 판정했던 것은 job 성공만 보고 task 실패를 안 본 오판이었다(2026-09-18 정정). 확인은 driver 로그 또는 pod 상태다:
+
+```
+# driver 로그
+ExecutorLostFailure (executor 7 exited caused by one of the running tasks)
+Reason: The executor with id 7 exited with exit code 137
+# kubectl describe pod <executor-pod>
+Last State: Terminated   Reason: OOMKilled   Exit Code: 137
+```
+
+137 = 메모리 한도 초과로 강제 종료. heap 부족(spill)은 이 줄이 절대 안 나온다 — "spill은 느려지고, overhead 부족은 죽는다"로 둘을 가른다.
 
 **메모리 지표로는 필요량을 못 잰다 — 두 가지 이유**
 
@@ -545,17 +674,17 @@ task 하나가 정렬하는 **byte**는 두 테이블이 같지만(0.8GB), **row
 
 따라서 **값을 바꿔 돌려 보고 task error rate·executor 유실로 판정하는 시행착오가 유일한 실측 방법**이다. `partial-progress=false`라 운영 전 테스트에서만 한다. 컨테이너 이름은 executor `spark-kubernetes-executor`, driver `spark-kubernetes-driver`.
 
-**4개 테이블 모두 3g를 명시한다.** 기본값(heap의 10%)은 20g면 2g, 16g면 1.6g로 둘 다 부족하다. 테이블별로 다 잴 필요는 없다 — non-heap 사용량은 row 모양이 아니라 shuffle 전송량·동시 task 수·로컬 shuffle 파일 크기에 좌우되고, 이것들은 4개 테이블에서 같다(executor당 shuffle 약 4.7GB, task 4개).
+**4개 테이블 모두 3g를 명시한다.** 기본값(heap의 10%)은 20g면 2g, 18g면 1.8g, 16g면 1.6g로 전부 부족하다. 테이블별로 다 잴 필요는 없다 — non-heap 사용량은 row 모양이 아니라 shuffle 전송량·동시 task 수·로컬 shuffle 파일 크기에 좌우되고, 이것들은 4개 테이블에서 같다(executor당 shuffle 약 4.7GB, task 4개).
 
 **고정값으로 두는 이유 — 동적 조정 불필요**
 
-1. **필요량이 데이터 양을 따라 늘지 않는다.** executor 하나의 shuffle 몫은 ratio 산정 덕에 데이터가 늘어도 약 4.7GB로 일정하다(섹션 8.2). 동시 task 4개, 버퍼 크기(`spark.reducer.maxSizeInFlight` 등)도 설정값으로 고정이다
+1. **필요량이 데이터 양을 따라 늘지 않는다.** executor 하나의 shuffle 몫은 ratio 산정 덕에 데이터가 늘어도 약 4.7GB로 일정하다(섹션 8.2). 동시 task 4개, 버퍼 크기(`spark.reducer.maxSizeInFlight` 등)도 설정값으로 고정이다. **실측: 3번 22시간치(875GiB, 36대)·4번 6시간치(232GiB, 33대)에서 3g로 task error 0**(섹션 5.3·5.4)
 2. **바꿀 수단이 없다.** pod spec에 박히는 값이라 실행 중에는 못 바꾸고, DA가 executor를 더 부를 때도 같은 spec이다
 3. **실패 비용이 크다.** 모자라면 executor가 죽고 재실행이 나며, 재실행도 실패하면 job이 실패한다. 이런 값은 여유를 둔 고정값이 맞고, 재검토는 섹션 9의 조건이 바뀔 때만 한다
 
 **driver `memoryOverhead`**: `spark.driver.memoryOverhead`, 기본값 heap의 10%(최소 384MB) → driver 4g면 약 410MB, pod 4.4g. Compaction에서 driver는 파일 700개를 group 4개로 나누고, job 4개를 띄워 결과를 받고, commit하는 일만 한다 — shuffle 파일도 데이터도 없어 복도에 들어갈 것은 JVM 자체 몫 150MB 정도다. 줄여 봐야 pod 1개에서 200MB이고 실패하면 job 전체가 죽으므로 **기본값이 최선이다.**
 
-**heap 18g 신호 (test5)**: overhead 2g라 executor 유실은 있었지만 **spill은 0**이었다. 섹션 7의 "3·4번 18g" 여지가 실측으로 뒷받침된다. 18g + 3g = 21g로 2~3시간치를 돌려 spill 0·task error 0이면 3·4번은 그것으로 확정할 수 있다(20g + 3g = 23g 대비 executor당 2g 절감).
+**heap 18g 확정 (2026-09-21)**: test5(18g + 2g)에서 spill 0이었던 신호를 18g + 3g로 3번 3회(1·2·22시간치)·4번 5회(1~6시간치) 돌려 spill 0·task error 0을 확인했다(섹션 5.3·5.4). 3·4번은 21g pod로 확정 — 20g + 3g 대비 executor당 2g, 두 테이블 합계 48g 절감.
 
 ---
 
@@ -593,9 +722,12 @@ task 하나가 정렬하는 **byte**는 두 테이블이 같지만(0.8GB), **row
 |------|------|
 | `maxExecutors` 확정값 | **36으로 고정 (2026-09-16).** K8S namespace quota는 확인할 수 없으나 리소스가 넉넉하고, 실사용량은 ratio가 통제하므로 천장은 넉넉히 둬도 무해하다(섹션 4.6) |
 | ~~ratio 0.066에서의 요청 로그~~ | **해소 (2026-09-16).** 12대가 이미 떠 있는데 `desired total 5~6`이 찍힌 것은 `spark.executor.instances` 12가 시작 대수의 바닥이었기 때문이다(섹션 4.8). DA의 계산은 정확했고 내릴 수단이 없었을 뿐이다 |
-| 메모리 97.62% | 7회 중 최고값이며 DataFlint가 `executor.memory` 19.2g를 권고한다. **spill이 0인 동안은 조치하지 않는다** — Spark의 정렬은 가용 메모리를 최대한 쓰다가 부족하면 디스크로 넘기므로, 90%대는 한계 임박이 아니라 정상 동작이다. 감시 기준은 `spill ≠ 0` |
+| 메모리 97.62% | 7회 중 최고값이며 DataFlint가 `executor.memory` 19.2g를 권고한다. **spill이 0인 동안은 조치하지 않는다** — Spark의 정렬은 가용 메모리를 최대한 쓰다가 부족하면 디스크로 넘기므로, 90%대는 한계 임박이 아니라 정상 동작이다. 감시 기준은 `spill ≠ 0`. 18g에서도 92.6~97.8%(4번 test10~13)이고 DataFlint "Executor memory under-provisioned" alert가 그 사이(92.6~95.2%)부터 뜬다 — 같은 이유로 무시(섹션 5.4) |
 | ~~다른 hourly 테이블~~ | **4개 전부 완료 (섹션 5.5)** |
 | ~~`memoryOverhead` 필요량~~ | **3g 확정 (2026-09-18).** 4번에서 1g job 실패, 2g는 job 성공했으나 executor 유실(task error 1~3%), 3g 2회 깨끗. Java 지표(OffHeap 135MiB)도 커널 지표(`container_memory_max_usage_bytes`, 항상 한도에 붙음)도 필요량을 못 재므로 task error rate로 판정 (섹션 8.4) |
+| executor 로컬 디스크 사용량 | hourly 예상 executor당 5GiB(권장 10GiB × 노드당 executor 수). 재처리 n시간치는 n × 5GiB와 동시 파티션 12개분(6~7GiB) 사이 — 22시간치가 현 디스크로 성공했으므로 용량은 충분. 운영 첫 실행에서 `spark-local-dir-1` 사용량 1회 확인(섹션 5.5) |
+| ~~천장 아래 미도달 (31·33대)~~ | **해소 (2026-09-21).** DA는 동시에 도는 파티션(`max-concurrent-file-group-rewrites`개)의 일감만 보므로 대수는 총 데이터가 아니라 동시 파티션의 데이터 합 × 0.3이다. 2번 20시간치 23대도 같은 원리(섹션 5.5) |
+| `spark.memory.fraction` 0.8 | 보류. 2번 16g 가능성(섹션 7). 시간 될 때 2~3회 |
 | 3번 row당 비용이 높은 원인 | 메모리 팽창·spill 성향으로 보아 컬럼 타입 차이. 어느 컬럼인지는 미확인 — 설정과 무관하므로 우선순위 낮음 |
 | 2번 테이블 spill의 압축 요인 | task당 row 수 차이는 확정, 컬럼 타입에 따른 압축 해제 팽창은 미확인(섹션 8.2). Spark UI `Peak Execution Memory`로 확인 가능 |
 | ~~운영 적용 후 duration~~ | **해소.** 확정 설정(init 8)으로 돌린 test9가 1.7분 — warm-up이 빠져 test8(init 6) 1.9분보다 짧다. 예상과 일치 |

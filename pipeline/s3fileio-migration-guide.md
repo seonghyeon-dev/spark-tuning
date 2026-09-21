@@ -2051,7 +2051,7 @@ Trino가 같은 테이블을 조회한다. v2 테이블에 새 기능을 켜지 
 |-------------|-------------|
 | Compaction `dcu/GB` | 0.00219 |
 | Compaction `초/GB` | 2.41 |
-| `max-concurrent-file-group-rewrites` | 10 |
+| `max-concurrent-file-group-rewrites` | 12 |
 | `num-executors` | 12 (C=0.32 동적 산정식 포함) |
 | append Job 벤치마크 | `spark-tuning-guide.md` |
 
