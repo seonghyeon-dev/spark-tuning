@@ -5,7 +5,7 @@
 | 목적 | 하루 동안 시각별로 실제 동시에 떠 있는 core·memory를 그리기 위해, job별 **Duration**과 **Start Offset**을 최근 100회 실측으로 구한다 |
 | 대상 | append·Compaction·maintenance 등 Spark pod를 띄우는 task 전부 |
 | 방법 | Airflow 3.x REST API v2 (권장, Python) 또는 메타데이터 DB SQL — 두 결과는 같다 |
-| 검증 | Airflow 3.2.2 OpenAPI 명세로 endpoint·파라미터·응답 필드 확인. 가짜 Airflow API 서버와 PostgreSQL 16에 같은 데이터를 넣고 두 방법의 결과가 일치함을 확인 (2026-09-28) |
+| 검증 | Airflow 3.2.2 OpenAPI 명세로 endpoint·파라미터·응답 필드 확인. 운영과 같은 구조의 DAG(append 2종, Compaction mapped task, maintenance 3종)를 가짜 Airflow API 서버와 PostgreSQL 16에 넣고 두 방법의 결과가 일치함을 확인 (2026-09-28) |
 
 ---
 
@@ -53,14 +53,22 @@ DB에도 붙을 수 있으면 둘 다 쓸 수 있다. **정기적으로 다시 �
 
 ## 3. DAG 구조별 집계 대상
 
-Spark pod를 띄우는 task만 센다. `get_jobs`·`update_success`·`update_failure`는 Airflow worker 안에서 도는 Python task라 클러스터 core·memory를 쓰지 않으므로 뺀다.
+Spark pod를 띄우는 task만 센다. 아래 task는 Spark job이 아니므로 뺀다.
+
+- append의 `get_jobs`·`update_success`·`update_failure`: Airflow worker 안에서 도는 Python task라 클러스터 core·memory를 쓰지 않는다
+- `iceberg_delete_expired_data`의 `validate_target_dt`·`del_expired_data`: Spark job은 `del_expired_snapshots`뿐이다. `del_expired_data`도 Spark job이면 `TASK_NAMES`에 넣으면 된다(operator 이름에 `Spark`가 있으면 자동으로 잡힌다)
 
 | DAG 종류 | 집계하는 task_id | 엑셀 대상(target) 표시 |
 |---|---|---|
 | 수직분할 4개 테이블 append (DAG 1개, 테이블별 병렬) | `<테이블명>.append_data` | TaskGroup 이름 = **테이블명** |
 | 그 외 테이블 append (테이블별 DAG) | `convert_files.append_data` | **dag_id** (DAG 하나가 테이블 하나) |
 | hourly·daily Compaction | `compaction` (mapped task) | map index 이름 = **테이블명** |
-| maintenance (expire·orphan·manifests 등) | operator 이름에 `Spark`가 든 task 전부 | dag_id |
+| rewrite manifests (`iceberg_rewrite_manifest`) | `<번호>_<테이블명>` (예: `1_table_a` ~ `25_...`) | 번호를 뗀 **테이블명** |
+| orphan 파일 삭제 (`iceberg_delete_orphan_files`) | `<번호>_<테이블명>` | 번호를 뗀 **테이블명** |
+| 만료 데이터·snapshot 삭제 (`iceberg_delete_expired_data`) | `<번호>_<테이블명>.del_expired_snapshots` | TaskGroup 이름에서 번호를 뗀 **테이블명** |
+| 위 규칙에 안 걸리는 Spark task | operator 이름에 `Spark`가 든 task | dag_id |
+
+> **번호가 붙은 task는 번호 순서대로 Start Offset이 쌓인다.** rewrite manifests·orphan 삭제·만료 데이터 삭제 DAG는 테이블 task가 `1_`, `2_` … `25_` 순서로 돈다. 순차 실행이면 Compaction처럼 뒤 번호일수록 Start Offset이 커지고, 병렬이면 전부 비슷하게 나온다. 어느 쪽이든 실측값 그대로 그래프에 들어간다.
 
 > **mapped task의 테이블명.** Compaction은 테이블마다 같은 task를 복제해 돌리는 mapped task라 task_id가 `compaction` 하나다. 각 복제본은 `map_index` 번호(0, 1, 2, 3)로 구분되고, `map_index_template`을 설정했다면 그 번호 대신 테이블명(`rendered_map_index`)이 기록된다. 설정하지 않았다면 target 열에 0·1·2·3이 나오며, 순서는 `expand`에 넘긴 테이블 목록 순서다.
 
@@ -85,8 +93,9 @@ python job_durations.py
 | 설정 | 기본값 | 언제 바꾸나 |
 |------|--------|------------|
 | `N_RUNS` | 100 | 평균 낼 최근 실행 횟수 |
-| `TASK_NAMES` | `append_data`, `compaction` | 집계할 task 이름(점 뒤 부분). maintenance task가 Spark operator가 아니면 이름을 추가 |
-| `MATCH_SPARK_OPERATOR` | `True` | operator 이름에 `Spark`가 든 task를 자동 포함. maintenance job 이름을 몰라도 잡힌다 |
+| `TASK_NAMES` | `append_data`, `compaction`, `del_expired_snapshots` | 집계할 task 이름(점 뒤 부분). 새 Spark task가 생기면 이름을 추가 |
+| `NUMBERED_TASK` | `^\d+_` | `번호_테이블명` 형태 task를 잡는 규칙 (rewrite manifests·orphan 삭제). 대상 이름에서 번호를 뗀다 |
+| `MATCH_SPARK_OPERATOR` | `True` | operator 이름에 `Spark`가 든 task를 자동 포함. 위 두 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치 |
 | `DAG_ID_PREFIX` | `None` (전체) | 특정 DAG만 볼 때 dag_id 접두어 |
 | `GENERIC_GROUPS` | `convert_files` | 테이블명이 아닌 TaskGroup 이름. 이 그룹이면 target을 dag_id로 표시 |
 | `VERIFY` | `True` | 사내 인증서를 쓰면 CA 파일 경로 |
@@ -103,6 +112,7 @@ python job_durations.py
 """
 import csv
 import os
+import re
 import statistics
 from collections import defaultdict
 from datetime import datetime
@@ -119,7 +129,12 @@ OUTPUT = "job_durations.csv"
 VERIFY = True                   # 사내 CA면 인증서 경로 문자열로 (예: "/etc/ssl/certs/ca.pem")
 
 # 집계 대상 task — task_id의 마지막 부분(점 뒤) 기준
-TASK_NAMES = {"append_data", "compaction"}
+#   append_data           : append (수직분할 4개 DAG·테이블별 DAG)
+#   compaction            : hourly·daily Compaction (mapped task)
+#   del_expired_snapshots : iceberg_delete_expired_data 의 snapshot 삭제 Spark job
+TASK_NAMES = {"append_data", "compaction", "del_expired_snapshots"}
+# "번호_테이블명" 형태의 task (iceberg_rewrite_manifest·iceberg_delete_orphan_files, 예: 1_table_a)
+NUMBERED_TASK = re.compile(r"^\d+_")
 # operator 이름에 "Spark"가 들어간 task도 자동 포함 (maintenance job 이름을 몰라도 잡힌다)
 MATCH_SPARK_OPERATOR = True
 # 특정 DAG만 볼 때 접두어 (None이면 전체 DAG)
@@ -171,7 +186,7 @@ def target_tasks(dag_id):
     for t in get(f"/dags/{dag_id}/tasks")["tasks"]:
         name = t["task_id"].rsplit(".", 1)[-1]
         is_spark = MATCH_SPARK_OPERATOR and "Spark" in (t.get("operator_name") or "")
-        if name in TASK_NAMES or is_spark:
+        if name in TASK_NAMES or NUMBERED_TASK.match(name) or is_spark:
             picked.append((t["task_id"], bool(t.get("is_mapped"))))
     return picked
 
@@ -197,12 +212,16 @@ def recent_runs(dag_id, task_id, is_mapped):
 
 
 def target_of(dag_id, task_id, key):
-    if key is not None:                       # mapped (Compaction): 테이블명
+    if key is not None:                        # mapped (Compaction): 테이블명
         return key
-    group = task_id.rsplit(".", 1)[0] if "." in task_id else ""
-    if group and group not in GENERIC_GROUPS:  # 수직분할 4개 DAG: 테이블명 TaskGroup
-        return group
-    return dag_id                              # 테이블별 DAG: dag_id가 곧 테이블
+    if "." in task_id:                         # TaskGroup 안의 task
+        group = task_id.rsplit(".", 1)[0]
+        if group in GENERIC_GROUPS:            # 테이블별 append DAG: dag_id가 곧 테이블
+            return dag_id
+        return NUMBERED_TASK.sub("", group)    # 수직분할 append: 테이블명 / delete_expired_data: "3_table_a" → table_a
+    if NUMBERED_TASK.match(task_id):           # rewrite_manifest·delete_orphan_files: "3_table_a" → table_a
+        return NUMBERED_TASK.sub("", task_id)
+    return dag_id
 
 
 def to_min(seconds):
@@ -265,7 +284,10 @@ dag_id,task_id,target,cron,runs,Duration (min),Duration median (min),Duration ma
 append_vertical,table_a.append_data,table_a,*/5 * * * *,100,3.0,3.0,3.0,0.3,2026-09-28T00:00:00Z
 compaction_hourly,compaction,table_1,45 * * * *,100,1.5,1.5,1.5,0.3,2026-09-28T00:45:00Z
 compaction_hourly,compaction,table_2,45 * * * *,100,1.8,1.8,1.8,1.9,2026-09-28T00:45:00Z
-expire_snapshots,expire,expire_snapshots,0 3 * * *,40,8.0,8.0,8.0,0.1,2026-09-28T03:00:00Z
+iceberg_delete_expired_data,1_table_a.del_expired_snapshots,table_a,0 3 * * *,60,1.5,1.5,1.5,1.3,2026-09-28T03:00:00Z
+iceberg_delete_expired_data,2_table_b.del_expired_snapshots,table_b,0 3 * * *,60,1.5,1.5,1.5,4.1,2026-09-28T03:00:00Z
+iceberg_rewrite_manifest,1_table_a,table_a,0 6 */3 * *,60,0.8,0.8,0.8,0.1,2026-09-28T06:00:00Z
+iceberg_rewrite_manifest,2_table_b,table_b,0 6 */3 * *,60,0.8,0.8,0.8,1.0,2026-09-28T06:00:00Z
 ```
 
 | 열 | 뜻 |
@@ -279,7 +301,7 @@ expire_snapshots,expire,expire_snapshots,0 3 * * *,40,8.0,8.0,8.0,0.1,2026-09-28
 
 ## 5. SQL (메타데이터 DB 직접) — PostgreSQL
 
-위 스크립트와 같은 결과를 쿼리 한 번으로 낸다. 대상 task는 `LIKE` 조건에 직접 적는다 — maintenance task를 넣으려면 그 이름을 `OR ti.task_id LIKE '%<이름>'`으로 추가한다.
+위 스크립트와 같은 결과를 쿼리 한 번으로 낸다. 대상 task는 `WHERE`의 task 조건에 직접 적는다. SQL은 operator 이름을 모르므로 `MATCH_SPARK_OPERATOR`에 해당하는 자동 포함은 없다 — 새 Spark task는 `OR ti.task_id LIKE '%<이름>'`으로 추가한다.
 
 ```sql
 -- Airflow 3.x 메타데이터 DB (PostgreSQL) — Spark job의 최근 100회 Duration·Start Offset
@@ -300,14 +322,19 @@ WITH recent AS (
     AND dr.run_type = 'scheduled'           -- 재처리·수동 trigger 제외
     AND ti.duration IS NOT NULL
     AND ti.start_date IS NOT NULL
-    AND (ti.task_id LIKE '%append_data'     -- 집계 대상 task (maintenance task 이름은 여기에 추가)
-         OR ti.task_id LIKE '%compaction')
+    AND (ti.task_id LIKE '%append_data'               -- append
+         OR ti.task_id LIKE '%compaction'                -- hourly·daily Compaction (mapped)
+         OR ti.task_id LIKE '%del_expired_snapshots'     -- iceberg_delete_expired_data 의 snapshot 삭제
+         OR ti.task_id ~ '^[0-9]+_[^.]*$')              -- rewrite_manifest·delete_orphan_files: "번호_테이블명"
 )
 SELECT dag_id,
        task_id,
-       CASE WHEN map_key IS NOT NULL THEN map_key
-            WHEN task_id LIKE 'convert_files.%' OR task_id NOT LIKE '%.%' THEN dag_id
-            ELSE split_part(task_id, '.', 1) END                          AS target,
+       CASE WHEN map_key IS NOT NULL THEN map_key                        -- Compaction: 테이블명
+            WHEN task_id LIKE 'convert_files.%' THEN dag_id                -- 테이블별 append DAG
+            WHEN task_id LIKE '%.%'                                        -- TaskGroup: 번호 떼고 테이블명
+                 THEN regexp_replace(split_part(task_id, '.', 1), '^[0-9]+_', '')
+            WHEN task_id ~ '^[0-9]+_' THEN regexp_replace(task_id, '^[0-9]+_', '')
+            ELSE dag_id END                                                AS target,
        COUNT(*)                                                          AS runs,
        ROUND(AVG(duration)::numeric / 60, 1)                             AS "Duration (min)",
        ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration))::numeric / 60, 1)
@@ -320,7 +347,7 @@ GROUP BY dag_id, task_id, map_key
 ORDER BY dag_id, "Start Offset (min)";
 ```
 
-MySQL이면 `PERCENTILE_CONT` 줄(중앙값)과 `::numeric`·`::text`를 빼고, `split_part`를 `SUBSTRING_INDEX(task_id, '.', 1)`로 바꾼다.
+MySQL 8이면 `PERCENTILE_CONT` 줄(중앙값)과 `::numeric`·`::text`를 빼고, `split_part`를 `SUBSTRING_INDEX(task_id, '.', 1)`로, `~ '...'`를 `REGEXP '...'`로 바꾼다(`regexp_replace`는 MySQL 8에도 있다).
 
 ---
 
