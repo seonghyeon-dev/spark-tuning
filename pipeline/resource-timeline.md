@@ -15,8 +15,8 @@
 
 | 시트 | 뜻 | 스크립트가 찾는 방법 |
 |---|---|---|
-| **as-is** | 튜닝 전 설정·실행 시간 | 시트 이름에 `as-is`가 들어 있으면 (대소문자·기호 무시: `AS-IS`, `asis`, `as_is` 모두) |
-| **to-be** | 튜닝 후 설정·실행 시간 | 시트 이름에 `to-be`가 들어 있으면 (`TO-BE`, `tobe` …) |
+| **AS-IS** | 튜닝 전 설정·실행 시간 | 시트 이름에 `as-is`가 들어 있으면 (대소문자·기호 무시: `AS-IS`, `asis`, `as_is` 모두) |
+| **TO-BE** | 튜닝 후 설정·실행 시간 | 시트 이름에 `to-be`가 들어 있으면 (`TO-BE`, `tobe` …) |
 
 이름이 다르면 스크립트 상단 `SHEET_ASIS`·`SHEET_TOBE`에 시트 이름을 넣는다.
 
@@ -35,6 +35,19 @@
 
 - K·L이 수식이어도 된다. 엑셀에 **저장된 계산값**을 읽는다 (엑셀에서 한 번 저장된 파일이면 값이 들어 있다)
 - 제목 행·빈 행·메모 행은 알아서 건너뛴다. **N열(Duration)과 K열(토탈 cpu)이 둘 다 숫자인 행만** job으로 본다
+
+### 1.1 M~S가 비어 있는 행 — 안 돌린 job·삭제한 job
+
+app name(C열)은 있는데 Duration(N열)이 비어 있는 행은 **그 시트의 계산에서 빠지고, "실행 기록 없어 뺀 행" 목록에 찍힌다** (실행 화면과 요약 시트 맨 아래).
+
+| 경우 | 처리 | 비교 결과 |
+|---|---|---|
+| 의도적으로 안 돌림 (AS-IS·TO-BE 둘 다 빈칸) | 두 시트 모두에서 빠짐 | 어디에도 안 나옴 → 전후 차이 0 |
+| TO-BE에서 삭제 (AS-IS에만 값) | AS-IS에만 들어감 | `job별 비교`에 TO-BE 칸이 비고, **AS-IS 사용량 전부가 감소**로 잡힌다. 예: daily compaction 한 테이블(하루 1회 × 12.5분 × 50코어 = 625코어·분)을 TO-BE에서 비우면 차이 −625 |
+| TO-BE에서 새로 생김 (TO-BE에만 값) | TO-BE에만 들어감 | TO-BE 사용량 전부가 증가로 잡힌다 |
+
+- 목록은 **붙여넣다 빠뜨린 행**을 찾는 용도다. 목록에 있는 행이 모두 일부러 비운 행인지 한 번 확인한다
+- Duration은 있는데 K열(토탈 cpu)이 빈 행도 같은 목록에 이유와 함께 나온다
 - **to-be 시트의 Duration**: 튜닝이 운영에 반영되기 전이면 테스트에서 잰 값(예: Compaction 튜닝 실측)을 넣는다. 반영 후에는 `job_durations.py`로 다시 뽑아 교체한다
 - app name이 두 시트에서 다르면 `job별 비교` 시트에서 짝이 안 맞아 두 줄로 나뉜다 — 같은 job은 같은 이름으로 적는다
 
@@ -52,8 +65,8 @@ python resource_timeline.py 작업엑셀.xlsx 20260928     # 기준일 지정
 실행 화면 예 (예시 데이터):
 
 ```text
-as-is: 시트 'as-is' job 32개, 제외 0개
-to-be: 시트 'to-be' job 32개, 제외 0개
+as-is: 시트 'AS-IS' job 32개, 실행 기록 없어 뺀 행 0개, 제외 0개
+to-be: 시트 'TO-BE' job 32개, 실행 기록 없어 뺀 행 0개, 제외 0개
 cron 시간대: KST (latest_run 36건 중 36건이 KST 기준 cron과 일치) / 기준일 2026-09-28
 as-is: 최대 동시 CPU 147.0코어 / 메모리 597.6GB, 하루 42,605코어·분 (단순 합산 667.0코어 / 2,217.2GB)
 to-be: 최대 동시 CPU 132.0코어 / 메모리 568.0GB, 하루 33,684코어·분 (단순 합산 591.0코어 / 2,006.8GB)
@@ -64,7 +77,7 @@ to-be: 최대 동시 CPU 132.0코어 / 메모리 568.0GB, 하루 33,684코어·�
 
 | 시트 | 내용 |
 |---|---|
-| **요약** | 비교 표(CPU·메모리 각각: 단순 합산 / 실제 최대 / 최대 시각 / 하루 평균 / 하루 총 사용량 — as-is, to-be, 차이, 변화율)와 그래프 4개: ①시각별 동시 CPU as-is vs to-be 선 그래프 ②같은 메모리 ③종류별 하루 CPU 사용량 막대(as-is 회색, to-be 파랑) ④같은 메모리 |
+| **요약** | 실행 기록 없어 뺀 행 수(맨 아래에 목록), 비교 표(CPU·메모리 각각: 단순 합산 / 실제 최대 / 최대 시각 / 하루 평균 / 하루 총 사용량 — as-is, to-be, 차이, 변화율)와 그래프 4개: ①시각별 동시 CPU as-is vs to-be 선 그래프 ②같은 메모리 ③종류별 하루 CPU 사용량 막대(as-is 회색, to-be 파랑) ④같은 메모리 |
 | **종류별 누적 그래프** | job 종류별로 쌓은 면적 그래프 — as-is CPU, to-be CPU, as-is 메모리, to-be 메모리. **위아래 두 그래프의 세로축 눈금을 같게** 맞춰서 높이를 눈으로 바로 비교할 수 있다 |
 | as-is 시각별 / to-be 시각별 | 5분 칸 = 1행(288행). 칸마다 종류별 CPU·메모리와 합계(`SUM` 수식). 그래프의 원본 데이터 |
 | as-is job별 / to-be job별 | job마다 종류·cron·하루 실행 횟수·Start Offset·Duration·총 CPU·총 메모리와 `CPU·분 / 일`(= 횟수 × Duration × CPU, 수식), 기능 요약 |
@@ -358,7 +371,24 @@ def read_jobs(ws):
             if len(vals) > col(COL_DURATION) and to_number(vals[col(COL_DURATION)]) is not None
             and to_number(vals[col(COL_TOTAL_CPU)]) is not None]
     if not data:
-        raise SystemExit(f"{COL_DURATION}열(Duration)과 {COL_TOTAL_CPU}열(토탈 cpu)에 숫자가 있는 행이 없다 — 열 설정을 확인")
+        raise SystemExit(f"{COL_DURATION}열(Duration)과 {COL_TOTAL_CPU}열(토탈 cpu)에 숫자가 있는 행이 없다 — 열 설정을 확인. "
+                         f"{COL_TOTAL_CPU}열이 수식이면 엑셀에서 열어 저장한 파일이어야 계산값이 읽힌다")
+    # 실행 기록 없어 뺀 행: app name은 있는데 Duration이 비었거나, Duration은 있는데 토탈 cpu가 빈 행
+    # (의도적으로 안 돌린 job·to-be에서 삭제한 job — 붙여넣다 빠뜨린 행도 여기 나오므로 목록으로 확인한다)
+    in_data = {rn for rn, _ in data}
+    cell = lambda vals, letter: vals[col(letter)] if len(vals) > col(letter) else None
+    no_run = []
+    for rn, vals in rows:
+        name = cell(vals, COL_NAME)
+        if rn in in_data or not isinstance(name, str) or not name.strip():
+            continue
+        dur = cell(vals, COL_DURATION)
+        if dur is None or (isinstance(dur, str) and not dur.strip()):
+            no_run.append((rn, str(cell(vals, COL_GROUP) or "").strip(), name.strip(),
+                           f"{COL_RUNS}~{COL_LATEST}열(Duration) 비어 있음"))
+        elif to_number(dur) is not None:
+            no_run.append((rn, str(cell(vals, COL_GROUP) or "").strip(), name.strip(),
+                           f"{COL_TOTAL_CPU}열(토탈 cpu) 비어 있음"))
 
     jobs, skipped = [], []
     for rn, vals in data:
@@ -385,7 +415,7 @@ def read_jobs(ws):
         job["group"] = normalize_group(get(COL_GROUP)) if get(COL_GROUP) else classify(
             name, job["cron_text"] if job["cron"] else ("0 * * * *" if job["every"] <= 60 else "0 0 * * *"))
         jobs.append(job)
-    return jobs, skipped
+    return jobs, skipped, no_run
 
 
 NICE_INTERVALS = [1, 2, 3, 5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440, 2880, 4320, 10080]
@@ -793,6 +823,8 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
         ("cron 시간대", cron_tz, tz_reason),
         ("Duration 기준", {COL_DUR_AVG: "평균", COL_DUR_MEDIAN: "중앙값", COL_DUR_MAX: "최댓값"}.get(COL_DURATION, COL_DURATION),
          "스크립트 상단 COL_DURATION으로 바꾼다"),
+        ("실행 기록 없어 뺀 행", f"as-is {len(sides['as-is']['no_run'])}개 · to-be {len(sides['to-be']['no_run'])}개",
+         "Duration이 빈 행(안 돌린 job·삭제한 job). 목록은 이 시트 맨 아래 — 붙여넣다 빠뜨린 행이 없는지 확인"),
     ]
     for i, (k, v, note) in enumerate(info, start=3):
         s.cell(row=i, column=1, value=k).font = Font(name=FONT, bold=True, size=10)
@@ -846,6 +878,22 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
                 f"A{anchor + 57}")
     r2 = anchor + 76
     for side in SIDES:
+        nr = sides[side]["no_run"]
+        s.cell(row=r2, column=1, value=f"{side} ('{sides[side]['sheet']}' 시트) — 실행 기록 없어 뺀 행 {len(nr)}개"
+               ).font = Font(name=FONT, bold=True, size=11)
+        if nr:
+            for c, h in enumerate(["작업 시트 행", "종류", "app name", "이유"], 1):
+                s.cell(row=r2 + 1, column=c, value=h)
+            style_header(s, r2 + 1, 4)
+            for i, (rn, group, name, why) in enumerate(nr, start=r2 + 2):
+                s.cell(row=i, column=1, value=rn)
+                s.cell(row=i, column=2, value=group or None)
+                s.cell(row=i, column=3, value=name)
+                s.cell(row=i, column=4, value=why)
+            r2 += len(nr) + 3
+        else:
+            r2 += 2
+    for side in SIDES:
         sk = sides[side]["skipped"]
         if sk:
             s.cell(row=r2, column=1, value=f"{side} 계산에서 뺀 행 — {len(sk)}개").font = Font(name=FONT, bold=True, size=11)
@@ -894,11 +942,13 @@ def main():
     names = find_sheets(wb)
     sides = {}
     for side in SIDES:
-        jobs, skipped = read_jobs(wb[names[side]])
+        jobs, skipped, no_run = read_jobs(wb[names[side]])
         guessed = sum(1 for j in jobs if j["every"])
-        print(f"{side}: 시트 '{names[side]}' job {len(jobs)}개, 제외 {len(skipped)}개"
+        print(f"{side}: 시트 '{names[side]}' job {len(jobs)}개, 실행 기록 없어 뺀 행 {len(no_run)}개, 제외 {len(skipped)}개"
               + (f", cron 없어 간격 추정 {guessed}개" if guessed else ""))
-        sides[side] = {"sheet": names[side], "jobs": jobs, "skipped": skipped}
+        for rn, group, name, why in no_run:
+            print(f"    - {rn}행 {name} ({group or '종류 없음'}) — {why}")
+        sides[side] = {"sheet": names[side], "jobs": jobs, "skipped": skipped, "no_run": no_run}
     cron_tz, reason = detect_cron_tz(sides["as-is"]["jobs"] + sides["to-be"]["jobs"])
     print(f"cron 시간대: {cron_tz} ({reason}) / 기준일 {day}")
     groups = order_groups(sides["as-is"]["jobs"] + sides["to-be"]["jobs"])
