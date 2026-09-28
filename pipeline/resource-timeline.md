@@ -16,7 +16,7 @@
 | 열 | 내용 | 스크립트가 쓰나 |
 |---|---|---|
 | **A** | **job_type** (`job_durations.csv`의 `job_type` 값: `append`, `summary`, `hourly compaction`, `daily compaction`, `expired snapshot`, `delete orphan`, `rewrite manifest`, `other`) | ✅ 그래프에서 쌓는 종류 |
-| **B** | **cron** | ✅ 비어 있거나 cron 식이 아니면 그 행만 실행 간격을 추정 (§3.4) |
+| **B** | **cron** | ✅ trigger로만 도는 테이블은 **부모 DAG의 cron**을 적는다 (§3.4). 비어 있거나 cron 식이 아니면 그 행만 실행 간격을 추정 |
 | **C** | **app name** | ✅ 결과 표의 이름 |
 | D~J | 드라이버 cpu, 드라이버 메모리, 드라이버 메모리 오버헤드, 익스큐터 cpu, 익스큐터 메모리, 익스큐터 메모리 오버헤드, 익스큐터 개수 | ❌ (K·L을 만드는 재료) |
 | **K** | **토탈 cpu** (코어) | ✅ |
@@ -43,7 +43,7 @@ python resource_timeline.py 작업엑셀.xlsx 리소스 20260928   # 기준일 �
 실행 화면 예 (예시 데이터):
 
 ```text
-시트 '리소스': job 32개, 제외 0개 / cron 없어 간격 추정 1개
+시트 '리소스': job 32개, 제외 0개
 cron 시간대: KST (latest_run 18건 중 18건이 KST 기준 cron과 일치) / 기준일 2026-09-28
 최대 동시 CPU 132.0코어 / 메모리 568.0GB (단순 합산 591.0코어 / 2,006.8GB)
 → 작업엑셀_리소스시각화.xlsx
@@ -89,7 +89,7 @@ hourly compaction은 테이블을 순서대로 돈다. 1번이 47:36에 끝나�
 
 B열(cron)이 비어 있거나 cron 식이 아니면 그 행만 `(latest_run − oldest_run) ÷ (runs − 1)`로 간격을 구한다. 예: 최근 100회가 99시간에 걸쳐 있으면 99시간 ÷ 99 = 60분 → 매시 실행, 시작 분은 latest_run의 분. 실패한 실행이 빠져 조금 길게 나오므로 가까운 정규 간격(5·10·15·30·60분, 1·2·3일 등)으로 맞춘다. `job별 실행` 시트의 cron 칸에 `60분마다 (추정)`으로 표시된다.
 
-- cron 없이 다른 DAG의 trigger로만 도는 테이블(집계 스크립트의 `TRIGGER_TABLES`)이 이 경우다. 예시의 `append_table_t`: 100회가 8시간 15분(495분)에 걸쳐 있어 495 ÷ 99 = 5분 → `5분마다 (추정)`, 시작은 latest_run 09:56 기준 매 :01·:06·…
+- **trigger로만 도는 테이블은 추정 대신 B열에 부모 cron을 적는 것이 정확하다.** 집계 스크립트에 부모를 지정하면(`TRIGGER_TABLES`) Start Offset이 "부모 cron 시각 → 이 테이블 실제 시작"으로 나오므로, B열 `*/5 * * * *` + 그 Offset이면 부모가 도는 5분마다, 부모가 끝나는 자리에 그려진다 ([집계 문서](airflow-job-duration.md) §4.4). 추정으로 그리면 간격은 5분으로 맞지만 시작 자리를 latest_run 한 번에 맞추므로 덜 정확하다
 - 3일마다 도는 job은 cron(`*/3`, 매달 1일 기준)과 추정(최근 실행 + 3일 간격)이 월말에 어긋날 수 있다. cron이 있는 job은 B열에 적어 둔다
 
 ### 3.5 cron 시간대 판단
@@ -101,7 +101,7 @@ Airflow cron은 UTC로 적었을 수도, KST로 적었을 수도 있다. 스크�
 | 지표 | CPU | 뜻 |
 |---|---|---|
 | 설정값 단순 합산 | 591코어 | 32개 job의 토탈 cpu를 전부 더한 값 |
-| 실제 최대 동시 사용량 | 132코어 | 01:46 — daily compaction 3번째 테이블(01:45:36~) + hourly compaction 1번(01:45:30~01:47:36) + append 8개(trigger 테이블 01:46:42~ 포함) = 50 + 50 + 32 |
+| 실제 최대 동시 사용량 | 132코어 | 01:50 — daily compaction 3번째 테이블(01:45:36~) + hourly compaction 3번(01:49:48~) + cron append 7개(01:50:12~) + trigger 테이블(01:45 부모가 trigger, 01:48:06~01:50:36) = 50 + 50 + 29 + 3 |
 | 최대 ÷ 단순 합산 | 22% | 단순 합산의 5분의 1 정도만 실제로 동시에 필요 |
 
 최대 순간은 **daily compaction(01:00~) 구간에 매시 45분 hourly compaction이 겹칠 때**다. 이런 겹침이 그래프에서 봉우리로 보인다.

@@ -118,7 +118,7 @@ python job_durations.py 20260921 20260922            # 기간 지정 (아래 표
 | `TASK_PREFIXES` | `summary_` | 이 접두어로 시작하는 task를 집계. 대상 이름은 접두어를 뗀 alias |
 | `NUMBERED_TASK` | `^\d+_` | `번호_테이블명` 형태 task를 잡는 규칙 (rewrite manifests·orphan 삭제). 대상 이름에서 번호를 뗀다 |
 | `MATCH_SPARK_OPERATOR` | `True` | operator 이름에 `Spark`가 든 task를 자동 포함. 위 두 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치 |
-| `TRIGGER_TABLES` | `[]` | **trigger로만 도는 테이블**의 테이블명 또는 dag_id. 여기 넣은 테이블은 실행 종류를 가리지 않고 성공 실행을 전부 센다 (§4.4). 예) `["table_t"]` |
+| `TRIGGER_TABLES` | `{}` | **trigger로만 도는 테이블** → `{테이블명 또는 dag_id: trigger하는 부모 dag_id}`. 실행 종류를 가리지 않고 성공 실행을 전부 세고, Start Offset을 부모 cron 시각 기준으로 잰다 (§4.4). 예) `{"table_t": "append_vertical"}` |
 | `DAG_ID_PREFIX` | `None` (전체) | 특정 DAG만 볼 때 dag_id 접두어 |
 | `GENERIC_GROUPS` | `convert_files` | 테이블명이 아닌 TaskGroup 이름. 이 그룹이면 target을 dag_id로 표시 |
 | `VERIFY` | `True` | 사내 인증서를 쓰면 CA 파일 경로 |
@@ -171,9 +171,13 @@ TASK_PREFIXES = ("summary_",)
 NUMBERED_TASK = re.compile(r"^\d+_")
 # operator 이름에 "Spark"가 들어간 task도 자동 포함 (위 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치)
 MATCH_SPARK_OPERATOR = True
-# trigger로만 도는 테이블 — 여기 넣은 테이블은 실행 종류를 가리지 않고 성공 실행을 전부 집계한다.
-# 나머지 job은 cron으로 돈 실행(scheduled)만 센다. 테이블명 또는 dag_id를 넣는다. 예) ["table_t"]
-TRIGGER_TABLES = []
+# trigger로만 도는 테이블 (schedule=None, 다른 DAG가 끝나면 trigger) → {테이블명 또는 dag_id: trigger하는 부모 dag_id}
+#   - 이 테이블은 실행 종류를 가리지 않고 성공 실행을 전부 센다 (나머지 job은 cron으로 돈 실행만)
+#   - Start Offset은 자기 trigger 시각이 아니라 "부모 DAG의 cron 시각 → 이 테이블 실제 시작"으로 잰다
+#     → 엑셀 cron 칸에 부모 cron을 적으면 부모와 같은 주기·같은 자리에 그려진다
+#   - 부모를 모르면 None: Offset은 자기 trigger 시각 기준
+#   예) {"table_t": "append_vertical"}
+TRIGGER_TABLES = {}
 # 특정 DAG만 볼 때 접두어 (None이면 전체 DAG)
 DAG_ID_PREFIX = None
 # 이 TaskGroup 이름은 테이블명이 아니다 → 대상(target)을 dag_id로 표시
@@ -270,8 +274,40 @@ def name_in(name, dag_id, task_id):
     return re.search(rf"(^|[._]){re.escape(name)}($|[._])", f"{dag_id}.{task_id}") is not None
 
 
-def is_trigger_table(dag_id, task_id):
-    return any(name_in(t, dag_id, task_id) for t in TRIGGER_TABLES)
+def trigger_entry(dag_id, task_id):
+    """TRIGGER_TABLES에 걸리면 (True, 부모 dag_id), 아니면 (False, None)."""
+    for t, parent in TRIGGER_TABLES.items():
+        if name_in(t, dag_id, task_id):
+            return True, parent
+    return False, None
+
+
+def parent_runs(parent, tis):
+    """부모 DAG의 cron 실행(scheduled) — (예정 시각, 종료 시각). 이 테이블 실행 기간 + 앞 1시간만 가져온다."""
+    times = [parse_time(ti["run_after"]) for ti in tis]
+    fmt = lambda t: t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = {"run_type": "scheduled", "order_by": "-run_after", "limit": 100,
+              "run_after_gte": fmt(min(times) - timedelta(hours=1)), "run_after_lte": fmt(max(times))}
+    runs = []
+    for page_no in range(MAX_PAGES * 10):
+        page = get(f"/dags/{parent}/dagRuns", offset=page_no * 100, **params)["dag_runs"]
+        runs += [(parse_time(r["run_after"]), parse_time(r["end_date"])) for r in page if r.get("end_date")]
+        if len(page) < 100:
+            break
+    return runs
+
+
+def offset_from_parent(ti, runs):
+    """이 실행을 trigger한 부모 실행 = 예정 시각이 trigger 시각 이전이고, 종료 시각이 trigger 시각에 가장 가까운 실행
+    (부모의 마지막 task가 trigger하므로 부모가 끝나는 시각 ≈ trigger 시각).
+    부모가 5분을 넘겨 다음 실행과 겹쳐도 '직전에 시작한 실행'이 아니라 '방금 끝난 실행'을 고른다.
+    반환: 부모 cron 시각 → 실제 시작(초). 못 찾으면 None."""
+    trig = parse_time(ti["run_after"])
+    cands = [(abs((end - trig).total_seconds()), ra) for ra, end in runs
+             if ra <= trig and trig - ra <= timedelta(hours=1)]
+    if not cands:
+        return None
+    return (parse_time(ti["start_date"]) - min(cands)[1]).total_seconds()
 
 
 def collect_runs(dag_id, task_id, is_mapped, period, all_runs=False):
@@ -373,19 +409,31 @@ def main():
         print(f"기간 지정 없음: job별 최근 {N_RUNS}회")
     login()
     rows = []
-    for dag_id, cron in list_dags():
+    dags = list_dags()
+    cron_of = dict(dags)
+    for dag_id, cron in dags:
         for task_id, is_mapped in target_tasks(dag_id):
-            all_runs = is_trigger_table(dag_id, task_id)
+            all_runs, parent = trigger_entry(dag_id, task_id)
             for key, tis in collect_runs(dag_id, task_id, is_mapped, period, all_runs).items():
                 durations = [ti["duration"] for ti in tis]
                 offsets = [(parse_time(ti["start_date"]) - parse_time(ti["run_after"])).total_seconds()
                            for ti in tis]
+                row_cron, note = cron, "  (trigger 실행 포함)" if all_runs else ""
+                if parent:
+                    runs = parent_runs(parent, tis)
+                    from_parent = [offset_from_parent(ti, runs) for ti in tis]
+                    paired = [o for o in from_parent if o is not None]
+                    if paired:                 # 부모 cron 시각 기준 Offset, cron도 부모 것
+                        offsets, row_cron = paired, cron_of.get(parent, "")
+                        note = f"  (trigger 실행, Offset·cron = 부모 {parent} 기준, 짝 {len(paired)}/{len(tis)})"
+                    else:
+                        note = f"  ⚠ 부모 {parent}의 실행을 못 찾아 Offset은 자기 trigger 시각 기준"
                 rows.append({
                     "job_type": job_type_of(dag_id, task_id, cron),
                     "dag_id": dag_id,
                     "task_id": task_id,
                     "target": target_of(dag_id, task_id, key),
-                    "cron": cron,
+                    "cron": row_cron,
                     "runs": len(tis),
                     "Duration (min)": to_min(statistics.mean(durations)),
                     "Duration median (min)": to_min(statistics.median(durations)),
@@ -397,7 +445,7 @@ def main():
                 r = rows[-1]
                 print(f"{r['job_type']:18s} {dag_id:34s} {r['target']:20s} runs={len(tis):4d} "
                       f"dur={r['Duration (min)']:5.1f} offset={r['Start Offset (min)']:5.1f}"
-                      + ("  (trigger 실행 포함)" if all_runs else ""))
+                      + note)
     if not rows:
         raise SystemExit("집계 대상이 없다 — 기간·TASK_NAMES·DAG_ID_PREFIX를 확인")
     for t in TRIGGER_TABLES:
@@ -420,11 +468,29 @@ if __name__ == "__main__":
 | 필터 | 이유 |
 |------|------|
 | `run_id_prefix_pattern=scheduled` | **cron으로 돈 실행만.** 재처리 DAG가 trigger한 Compaction(20시간치면 10분 이상)은 run_id가 `manual__`로 시작해 빠진다. 이게 섞이면 평균이 튄다 |
-| 단, `TRIGGER_TABLES`의 테이블은 이 필터를 끈다 | cron 없이 다른 DAG의 trigger로만 도는 테이블은 실행이 전부 `manual__` 등이라 위 필터에 전부 걸려 **CSV에서 통째로 빠진다**. 이 테이블만 실행 종류를 가리지 않는다. 이름은 dag_id·task_id 안에 단어로 들어 있어야 걸린다(앞뒤가 끝이나 `.`·`_` — `table_1`을 넣어도 `table_10`은 안 걸린다). 걸린 행은 실행 화면에 `(trigger 실행 포함)`이 붙고, 아무 행에도 안 걸린 이름은 경고가 뜬다. cron이 없으니 CSV의 cron 칸은 비고, 시각화 스크립트가 실행 간격을 추정한다 ([시각화 문서](resource-timeline.md) §3.4). Start Offset은 trigger된 시각 → 실제 시작이다 |
+| 단, `TRIGGER_TABLES`의 테이블은 이 필터를 끈다 | cron 없이(schedule=None) 다른 DAG의 trigger로만 도는 테이블은 실행이 전부 `manual__` 등이라 위 필터에 전부 걸려 **CSV에서 통째로 빠진다**. 이 테이블만 실행 종류를 가리지 않는다. 이름은 dag_id·task_id 안에 단어로 들어 있어야 걸린다(앞뒤가 끝이나 `.`·`_` — `table_1`을 넣어도 `table_10`은 안 걸린다). 아무 행에도 안 걸린 이름은 경고가 뜬다 |
 | `state=success` | 실패한 실행은 중간에 끊겨 duration이 짧게 잡힌다 |
 | `order_by=-run_after` | 최신순. 앞에서부터 N회만 쓴다 |
 | mapped task는 테이블별로 N회 | 한 DAG 실행에 테이블 4개가 있으므로 페이지를 넘기며 테이블마다 100회를 채운다 |
 | `run_after_gte`·`run_after_lt` (기간을 줬을 때만) | cron 예정 시각이 그 기간 안인 실행만. 이때는 100회 제한 없이 전부 쓴다 |
+
+#### trigger 테이블의 Start Offset — 부모 cron 시각 기준
+
+수직분할 4개 append DAG(부모, `*/5`)가 정상으로 끝나면 trigger 테이블 DAG를 trigger한다. 그래서 trigger 테이블은 **5분마다 돌지만 정확히 :00·:05에 시작하지 않고, 부모가 끝나는 시각에 따라 매번 조금씩 다른 때 시작**한다.
+
+자기 실행의 예정 시각(`run_after`)은 trigger된 순간이라 거기서 잰 Offset은 0.7분처럼 작게만 나오고, 그래프에서 "언제 시작하는지"를 알 수 없다. 그래서 부모를 지정하면 **부모의 cron 시각 → 이 테이블의 실제 시작**으로 잰다.
+
+| 예 (가짜 서버 실측) | 값 |
+|---|---|
+| 부모 cron 시각 | 00:00:00 |
+| 부모 끝남 = trigger | 00:03:55 (부모 task가 3.5분 걸림) |
+| trigger 테이블 실제 시작 | 00:04:35 |
+| **Start Offset** | **4.6분 (275초)** — 자기 trigger 시각 기준이면 0.7분 |
+
+- **어느 부모 실행이 trigger했나**: 예정 시각이 trigger 시각보다 이전(1시간 안)이고, **종료 시각이 trigger 시각에 가장 가까운** 부모 실행이다(부모의 마지막 task가 trigger하므로 부모가 끝나는 때 ≈ trigger 시각). 부모가 한 번 7분 걸려 다음 실행(5분 뒤 시작)과 겹쳐도, "방금 시작한 다음 실행"이 아니라 "방금 끝난 그 실행"과 짝지어진다 — 가짜 서버에서 부모가 7분 걸린 11회가 8.1분(485초)으로, 나머지 89회가 4.6분으로 잡혀 평균 5.0분
+- CSV의 cron 칸에는 **부모의 cron**이 들어간다. 작업 시트 B열에도 부모 cron(`*/5 * * * *`)을 적는다 → 시각화가 부모와 같은 5분 주기로, 부모 cron + Offset 자리에 그린다
+- 부모가 실패하면 trigger가 없으므로 그 5분은 비지만, 평균 모양에는 거의 영향이 없다
+- 실행 화면에 `(trigger 실행, Offset·cron = 부모 … 기준, 짝 100/100)`이 붙는다. 부모 실행을 하나도 못 찾으면 경고와 함께 자기 trigger 시각 기준으로 잰다
 
 ### 4.5 출력 형식
 
@@ -478,25 +544,30 @@ rewrite manifest,iceberg_rewrite_manifests,10_echo,echo,0 6 */3 * *,60,0.8,0.8,0
 
 **기간 지정**은 맨 위 `params`의 `NULL` 두 개를 바꾼다. 비워 두면 job별 최근 100회, 채우면 그 기간 전부다. `period_to`는 **포함하지 않는 끝 시각**이다. 9/21~9/22 하루 단위면 `'2026-09-23 00:00:00+09'`, 9/21 09:00~18:59면 `'2026-09-21 19:00:00+09'`, 9/21 09:30~18:30이면 `'2026-09-21 18:31:00+09'`로 적는다.
 
-**trigger로만 도는 테이블**은 `params`의 `trigger_tables`에 넣는다(예: `ARRAY['table_t']`). Python의 `TRIGGER_TABLES`와 같은 규칙이다 (§4.4).
+**trigger로만 도는 테이블**은 `trigger_map`에 `(테이블명 또는 dag_id, 부모 dag_id)`로 넣는다(예: `VALUES ('table_t', 'append_vertical')`). Python의 `TRIGGER_TABLES`와 같은 규칙이다 (§4.4). 부모 실행의 종료 시각은 `dag_run.end_date`를 쓴다.
 
 ```sql
 -- Airflow 3.x 메타데이터 DB (PostgreSQL) — Spark job의 Duration·Start Offset
 -- 기간 지정: 아래 params의 NULL 두 개를 바꾼다. 비워 두면 job별 최근 100회
--- trigger로만 도는 테이블: trigger_tables에 테이블명 또는 dag_id를 넣는다 → 그 테이블은 실행 종류를 가리지 않고 집계
+-- trigger로만 도는 테이블: trigger_map에 (테이블명 또는 dag_id, trigger하는 부모 dag_id)를 넣는다
+--   → 실행 종류를 가리지 않고 집계, Start Offset은 부모 cron 시각 기준, cron 칸은 부모 cron
 WITH params AS (
   SELECT NULL::timestamptz AS period_from,   -- 예) TIMESTAMPTZ '2026-09-21 00:00:00+09'
-         NULL::timestamptz AS period_to,     -- 예) TIMESTAMPTZ '2026-09-23 00:00:00+09'  (종료일 다음 날 0시)
-         ARRAY[]::text[]   AS trigger_tables -- 예) ARRAY['table_t']
+         NULL::timestamptz AS period_to      -- 예) TIMESTAMPTZ '2026-09-23 00:00:00+09'  (종료일 다음 날 0시)
+),
+trigger_map(name, parent_dag) AS (
+  VALUES (NULL::text, NULL::text)            -- 예) ('table_t', 'append_vertical')
 ),
 recent AS (
   SELECT ti.dag_id,
          ti.task_id,
-         COALESCE(d.timetable_summary, '')                                AS cron,
+         COALESCE(CASE WHEN tm.parent_dag IS NOT NULL THEN pd.timetable_summary
+                       ELSE d.timetable_summary END, '')                 AS cron,
          COALESCE(ti.rendered_map_index,                                  -- mapped: 테이블명
                   CASE WHEN ti.map_index >= 0 THEN ti.map_index::text END) AS map_key,
          ti.duration,                                                     -- 초
          EXTRACT(EPOCH FROM ti.start_date - dr.run_after) AS offset_sec,  -- cron 시각 → 실제 시작
+         EXTRACT(EPOCH FROM ti.start_date - par.run_after) AS parent_offset_sec,  -- trigger 테이블: 부모 cron 시각 → 실제 시작
          dr.run_after,
          ROW_NUMBER() OVER (
            PARTITION BY ti.dag_id, ti.task_id,
@@ -505,11 +576,19 @@ recent AS (
   FROM task_instance ti
   JOIN dag_run dr ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id
   LEFT JOIN dag d ON d.dag_id = ti.dag_id
+  LEFT JOIN trigger_map tm ON ti.dag_id || '.' || ti.task_id ~ ('(^|[._])' || tm.name || '($|[._])')
+  LEFT JOIN dag pd ON pd.dag_id = tm.parent_dag
+  LEFT JOIN LATERAL (                       -- 이 실행을 trigger한 부모 실행: trigger 시각 이전 1시간 안에 시작했고
+    SELECT pr.run_after                     -- 종료 시각이 trigger 시각에 가장 가까운 것 (부모가 끝나며 trigger)
+    FROM dag_run pr
+    WHERE pr.dag_id = tm.parent_dag AND pr.run_type = 'scheduled' AND pr.end_date IS NOT NULL
+      AND pr.run_after <= dr.run_after AND pr.run_after > dr.run_after - INTERVAL '1 hour'
+    ORDER BY abs(EXTRACT(EPOCH FROM pr.end_date - dr.run_after))
+    LIMIT 1) par ON true
   CROSS JOIN params p
   WHERE ti.state = 'success'
     AND (dr.run_type = 'scheduled'          -- 재처리·수동 trigger 제외
-         OR EXISTS (SELECT 1 FROM unnest(p.trigger_tables) AS t(name)   -- 단, trigger로만 도는 테이블은 전부
-                    WHERE ti.dag_id || '.' || ti.task_id ~ ('(^|[._])' || t.name || '($|[._])')))
+         OR tm.name IS NOT NULL)            -- 단, trigger로만 도는 테이블은 전부
     AND ti.duration IS NOT NULL
     AND ti.start_date IS NOT NULL
     AND (p.period_from IS NULL OR dr.run_after >= p.period_from)
@@ -551,7 +630,8 @@ SELECT job_type,
        ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration))::numeric / 60, 1)
                                                                          AS "Duration median (min)",
        ROUND(MAX(duration)::numeric / 60, 1)                             AS "Duration max (min)",
-       ROUND(AVG(offset_sec)::numeric / 60, 1)                           AS "Start Offset (min)",
+       ROUND(COALESCE(AVG(parent_offset_sec), AVG(offset_sec))::numeric / 60, 1)
+                                                                         AS "Start Offset (min)",
        MIN(run_after)                                                    AS oldest_run,
        MAX(run_after)                                                    AS latest_run
 FROM labeled
