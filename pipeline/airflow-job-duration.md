@@ -5,7 +5,7 @@
 | 목적 | 하루 동안 시각별로 실제 동시에 떠 있는 core·memory를 그리기 위해, job별 **Duration**과 **Start Offset**을 최근 100회 실측으로 구한다 |
 | 대상 | append·Compaction·maintenance 등 Spark pod를 띄우는 task 전부 |
 | 방법 | Airflow 3.x REST API v2 (권장, Python) 또는 메타데이터 DB SQL — 두 결과는 같다 |
-| 검증 | Airflow 3.2.2 OpenAPI 명세로 endpoint·파라미터·응답 필드 확인. 운영과 같은 구조의 DAG(append 2종, summary, hourly·daily Compaction mapped task, maintenance 3종)를 가짜 Airflow API 서버와 PostgreSQL 16에 넣고 두 방법의 결과가 순서·값까지 일치함을 확인. 기간 지정(KST 하루)도 손으로 센 실행 횟수와 일치 (2026-09-28) |
+| 검증 | Airflow 3.2.2 OpenAPI 명세로 endpoint·파라미터·응답 필드 확인. 운영과 같은 구조의 DAG(append 2종, summary, hourly·daily Compaction mapped task, maintenance 3종)를 가짜 Airflow API 서버와 PostgreSQL 16에 넣고 두 방법의 결과가 순서·값까지 일치함을 확인. 기간 지정(일·시·분 단위)도 손으로 센 실행 횟수와 일치 (2026-09-28) |
 
 ---
 
@@ -84,18 +84,26 @@ pip install requests
 export AIRFLOW_URL=http://<airflow-api-server>:8080   # UI 주소와 같다
 export AIRFLOW_USER=<계정>
 export AIRFLOW_PASSWORD=<비밀번호>
-python job_durations.py                      # job별 최근 100회
-python job_durations.py 20260921 20260922    # 9/21 00시 ~ 9/22 24시(KST) 실행 전부
-python job_durations.py 20260921             # 9/21 하루
+python job_durations.py                              # job별 최근 100회
+python job_durations.py 20260921 20260922            # 기간 지정 (아래 표)
 ```
 
-| 실행 방법 | 무엇을 평균 내나 | 결과 파일 |
-|---|---|---|
-| 인자 없음 | job(테이블)별 **최근 100회** | `job_durations.csv` |
-| 날짜 2개 `시작일 종료일` | 그 기간의 실행 **전부**(100회 제한 없음). 종료일은 그날 24시까지 포함 | `job_durations_<시작일>_<종료일>.csv` |
-| 날짜 1개 | 그 하루의 실행 전부 | `job_durations_<날짜>_<날짜>.csv` |
+인자 없이 돌리면 job(테이블)별 **최근 100회**를 평균 내고 `job_durations.csv`에 저장한다. **시작·끝을 주면** 그 기간의 실행을 **전부**(100회 제한 없음) 평균 내고 `job_durations_<시작>_<끝>.csv`에 저장한다.
 
-- 날짜는 `YYYYMMDD` 형식이고 **한국 시간(KST)** 기준이다. `20260921`은 9/21 00:00~24:00 KST이다. 시간대는 스크립트 상단 `TZ`로 바꾼다
+날짜·시각은 `YYYYMMDD`(일) / `YYYYMMDDHH`(시) / `YYYYMMDDHHMM`(분) 세 형식 중 하나로 적는다. **끝 값은 적은 단위까지 포함한다** — 날짜만 적으면 그날 23:59까지, 시까지 적으면 그 시의 59분까지다.
+
+| 인자 | 해석되는 기간 (KST) |
+|---|---|
+| `20260921 20260922` | 9/21 00:00 ~ 9/22 23:59 |
+| `2026092109 2026092118` | 9/21 09:00 ~ 18:59 |
+| `202609210930 202609211830` | 9/21 09:30 ~ 18:30 |
+| `20260921 2026092212` | 9/21 00:00 ~ 9/22 12:59 (형식을 섞어도 된다) |
+| `20260921` (하나만) | 9/21 하루 |
+| `2026092109` (하나만) | 9/21 09:00 ~ 09:59 |
+
+- 실행하면 첫 줄에 `기간(KST): 2026-09-21 09:00 ~ 2026-09-21 18:59 까지 포함`처럼 **실제로 해석한 기간**을 찍는다. 의도와 다르면 여기서 바로 보인다
+- 모든 날짜·시각은 **한국 시간(KST)** 기준이다. 시간대는 스크립트 상단 `TZ`로 바꾼다
+- 형식이 틀리거나(`2026-09-21`), 없는 시각이거나(`2026092125`), 시작이 끝보다 늦으면 이유를 적고 멈춘다
 - 기간은 **cron 예정 시각**(`run_after`)으로 자른다. 9/21 23:45에 시작 예정이던 hourly Compaction은 실제로 9/22 0시를 넘겨 끝나도 9/21에 들어간다
 - 결과는 엑셀에서 바로 열린다(한글 깨짐 방지 인코딩). 정렬은 append → summary → hourly Compaction → daily Compaction → expired snapshot → delete orphan → rewrite manifest 순이고, 같은 종류 안에서는 테이블명 오름차순이다
 
@@ -104,7 +112,7 @@ python job_durations.py 20260921             # 9/21 하루
 | 설정 | 기본값 | 언제 바꾸나 |
 |------|--------|------------|
 | `N_RUNS` | 100 | 기간을 안 줬을 때 평균 낼 최근 실행 횟수 |
-| `TZ` | KST (UTC+9) | 기간 날짜를 해석할 시간대 |
+| `TZ` | KST (UTC+9) | 기간 날짜·시각을 해석할 시간대 |
 | `TASK_NAMES` | `append_data`, `compaction`, `del_expired_snapshots` | 집계할 task 이름(점 뒤 부분). 새 Spark task가 생기면 이름을 추가 |
 | `TASK_PREFIXES` | `summary_` | 이 접두어로 시작하는 task를 집계. 대상 이름은 접두어를 뗀 alias |
 | `NUMBERED_TASK` | `^\d+_` | `번호_테이블명` 형태 task를 잡는 규칙 (rewrite manifests·orphan 삭제). 대상 이름에서 번호를 뗀다 |
@@ -123,9 +131,12 @@ python job_durations.py 20260921             # 9/21 하루
 실행:
     export AIRFLOW_URL=http://<airflow-api-server>:8080
     export AIRFLOW_USER=<계정>  AIRFLOW_PASSWORD=<비밀번호>
-    python job_durations.py                      # job별 최근 100회      → job_durations.csv
-    python job_durations.py 20260921 20260922    # 9/21 00시 ~ 9/22 24시 → job_durations_20260921_20260922.csv
-    python job_durations.py 20260921             # 9/21 하루             → job_durations_20260921_20260921.csv
+    python job_durations.py                              # job별 최근 100회
+    python job_durations.py 20260921 20260922            # 9/21 00:00 ~ 9/22 23:59 (KST)
+    python job_durations.py 2026092109 2026092118        # 9/21 09:00 ~ 18:59
+    python job_durations.py 202609210930 202609211830    # 9/21 09:30 ~ 18:30
+    python job_durations.py 20260921                     # 9/21 하루 (값 하나 = 그 단위 하나)
+  날짜·시각은 YYYYMMDD / YYYYMMDDHH / YYYYMMDDHHMM. 끝 값은 준 단위까지 포함한다.
 """
 import csv
 import os
@@ -143,7 +154,7 @@ AIRFLOW_URL = os.environ["AIRFLOW_URL"].rstrip("/")
 USERNAME = os.environ["AIRFLOW_USER"]
 PASSWORD = os.environ["AIRFLOW_PASSWORD"]
 N_RUNS = 100                    # 기간을 안 줬을 때 job(테이블)별 최근 몇 회를 볼지
-TZ = timezone(timedelta(hours=9))   # 기간 날짜(YYYYMMDD)를 해석할 시간대 = KST
+TZ = timezone(timedelta(hours=9))   # 기간 날짜·시각을 해석할 시간대 = KST
 OUTPUT = "job_durations.csv"
 VERIFY = True                   # 사내 CA면 인증서 경로 문자열로 (예: "/etc/ssl/certs/ca.pem")
 
@@ -190,20 +201,36 @@ def parse_time(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
 
 
+# 입력 자릿수 → (형식, 그 값이 가리키는 단위의 길이)
+PERIOD_FORMATS = {8: ("%Y%m%d", timedelta(days=1)),
+                  10: ("%Y%m%d%H", timedelta(hours=1)),
+                  12: ("%Y%m%d%H%M", timedelta(minutes=1))}
+
+
+def parse_moment(text):
+    """'20260921' / '2026092109' / '202609210930' → (그 단위의 시작 시각, 단위 길이)."""
+    if not text.isdigit() or len(text) not in PERIOD_FORMATS:
+        raise SystemExit(f"날짜·시각은 YYYYMMDD, YYYYMMDDHH, YYYYMMDDHHMM 중 하나여야 한다: {text}")
+    fmt, unit = PERIOD_FORMATS[len(text)]
+    try:
+        return datetime.strptime(text, fmt).replace(tzinfo=TZ), unit
+    except ValueError:
+        raise SystemExit(f"없는 날짜·시각이다: {text}")
+
+
 def parse_period(args):
-    """인자 없음 → None (최근 N_RUNS회). YYYYMMDD 1~2개 → (시작, 끝) UTC. 끝 날짜는 그날 24시까지 포함."""
+    """인자 없음 → None (최근 N_RUNS회). 1~2개 → (시작, 끝) — 끝 값은 준 단위까지 포함한다.
+    20260922 → 9/22 23:59까지, 2026092218 → 18:59까지, 202609221830 → 18:30까지."""
     if not args:
         return None
     if len(args) > 2:
-        raise SystemExit("사용법: python job_durations.py [시작일 [종료일]]   예) 20260921 20260922")
-    try:
-        days = [datetime.strptime(a, "%Y%m%d").replace(tzinfo=TZ) for a in args]
-    except ValueError:
-        raise SystemExit(f"날짜는 YYYYMMDD 형식이어야 한다: {' '.join(args)}")
-    start, end = days[0], days[-1] + timedelta(days=1)
+        raise SystemExit("사용법: python job_durations.py [시작 [끝]]   예) 20260921 20260922, 2026092109 2026092118")
+    start, _ = parse_moment(args[0])
+    end_begin, end_unit = parse_moment(args[-1])
+    end = end_begin + end_unit            # 끝 값이 가리키는 단위의 끝 (그 시각 '직전'까지 포함)
     if start >= end:
-        raise SystemExit("시작일이 종료일보다 늦다")
-    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+        raise SystemExit("시작이 끝보다 늦다")
+    return start, end
 
 
 def list_dags():
@@ -240,7 +267,7 @@ def collect_runs(dag_id, task_id, is_mapped, period):
               "order_by": "-run_after", "limit": 100}
     if period:
         params["run_after_gte"], params["run_after_lt"] = (
-            t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in period)
+            t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") for t in period)
     cap = None if period else N_RUNS
     by_key = defaultdict(list)
     for page_no in range(MAX_PAGES):
@@ -314,7 +341,8 @@ def main():
     period = parse_period(args)
     output = OUTPUT if not period else OUTPUT.replace(".csv", f"_{args[0]}_{args[-1]}.csv")
     if period:
-        print(f"기간: {args[0]} 00:00 ~ {args[-1]} 24:00 (UTC {period[0]:%Y-%m-%d %H:%M} ~ {period[1]:%Y-%m-%d %H:%M}), 그 기간 실행 전부")
+        last = period[1] - timedelta(minutes=1)
+        print(f"기간(KST): {period[0]:%Y-%m-%d %H:%M} ~ {last:%Y-%m-%d %H:%M} 까지 포함, 그 기간 실행 전부")
     else:
         print(f"기간 지정 없음: job별 최근 {N_RUNS}회")
     login()
@@ -415,7 +443,7 @@ rewrite manifest,iceberg_rewrite_manifest,1_table_a,table_a,0 6 */3 * *,60,0.8,0
 
 위 스크립트와 같은 결과를 같은 순서로 쿼리 한 번에 낸다. 대상 task는 `WHERE`의 task 조건에 직접 적는다. SQL은 operator 이름을 모르므로 `MATCH_SPARK_OPERATOR`에 해당하는 자동 포함은 없다 — 새 Spark task는 `OR ti.task_id LIKE '%<이름>'`으로 추가한다.
 
-**기간 지정**은 맨 위 `params`의 `NULL` 두 개를 바꾼다. 비워 두면 job별 최근 100회, 채우면 그 기간 전부다. 종료는 **종료일 다음 날 0시**로 적는다(9/21~9/22면 `'2026-09-23 00:00:00+09'`).
+**기간 지정**은 맨 위 `params`의 `NULL` 두 개를 바꾼다. 비워 두면 job별 최근 100회, 채우면 그 기간 전부다. `period_to`는 **포함하지 않는 끝 시각**이다. 9/21~9/22 하루 단위면 `'2026-09-23 00:00:00+09'`, 9/21 09:00~18:59면 `'2026-09-21 19:00:00+09'`, 9/21 09:30~18:30이면 `'2026-09-21 18:31:00+09'`로 적는다.
 
 ```sql
 -- Airflow 3.x 메타데이터 DB (PostgreSQL) — Spark job의 Duration·Start Offset
