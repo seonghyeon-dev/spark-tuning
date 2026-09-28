@@ -95,6 +95,30 @@ python job_durations.py 20260921 20260922            # 기간 지정 (아래 표
 - 기간은 **cron 예정 시각**(`run_after`)으로 자른다. 9/21 23:45에 시작 예정이던 hourly Compaction은 실제로 9/22 0시를 넘겨 끝나도 9/21에 들어간다
 - 결과는 엑셀에서 바로 열린다(한글 깨짐 방지 인코딩). 정렬은 append → summary → hourly Compaction → daily Compaction → expired snapshot → delete orphan → rewrite manifest 순이다. 같은 종류 안에서는 테이블명 오름차순이고, task_id가 `1_테이블명`처럼 **번호로 시작하는 task(expired snapshot·delete orphan·rewrite manifest)는 번호 순**이다. 번호는 숫자로 비교하므로 1, 2, …, 9, 10 순서가 된다(글자 순이면 1, 10, 2가 된다)
 
+#### 수동(trigger) append 테이블 값 넣기
+
+스케줄이 None이고 수직분할 4개 append DAG가 끝나면 trigger되는 append 테이블이 있으면, 실행 전에 `job_durations.py` 위쪽 설정의 **두 줄**을 고친다. 값은 따옴표 안에 적는다.
+
+```python
+# 고치기 전
+TRIGGER_TABLE = None
+TRIGGER_PARENT_DAG = None
+
+# 고친 후 (예: 테이블명이 table_t, 수직분할 append DAG가 append_vertical이면)
+TRIGGER_TABLE = "table_t"
+TRIGGER_PARENT_DAG = "append_vertical"
+```
+
+| 변수 | 넣을 값 | 어디서 보나 |
+|---|---|---|
+| `TRIGGER_TABLE` | 수동 테이블의 **테이블명**. 테이블명으로 안 잡히면 그 테이블 append DAG의 **dag_id** | Airflow UI DAG 목록 |
+| `TRIGGER_PARENT_DAG` | 수직분할 4개 테이블을 append하는 **DAG의 dag_id** (수동 테이블을 trigger하는 쪽) | Airflow UI DAG 목록 |
+
+- 이 두 값은 **append task(`append_data`)에만 적용**된다. 같은 테이블명을 가진 Compaction·expired snapshot·delete orphan·rewrite manifest task는 건드리지 않는다
+- 제대로 잡히면 실행 화면의 그 테이블 append 줄 끝에 `(trigger 실행, Offset·cron = 부모 … 기준, 짝 100/100)`이 붙는다
+- 이름이 틀려 append가 하나도 안 잡히면(또는 2개 이상 잡히면) `⚠ TRIGGER_TABLE '…'에 걸린 append가 0개다` 경고가 뜬다 → 테이블명 대신 그 append DAG의 dag_id를 넣어 본다
+- 엑셀 작업 시트에서는 이 테이블 행의 B열(cron)에 **부모 DAG의 cron**(`*/5 * * * *`)을 적는다 (§3.4 아래 설명)
+
 ### 3.2 고칠 수 있는 설정 (스크립트 상단)
 
 | 설정 | 기본값 | 언제 바꾸나 |
@@ -105,7 +129,7 @@ python job_durations.py 20260921 20260922            # 기간 지정 (아래 표
 | `TASK_PREFIXES` | `summary_` | 이 접두어로 시작하는 task를 집계. 대상 이름은 접두어를 뗀 alias |
 | `NUMBERED_TASK` | `^\d+_` | `번호_테이블명` 형태 task를 잡는 규칙 (rewrite manifests·orphan 삭제). 대상 이름에서 번호를 뗀다 |
 | `MATCH_SPARK_OPERATOR` | `True` | operator 이름에 `Spark`가 든 task를 자동 포함. 위 두 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치 |
-| `TRIGGER_TABLES` | `{}` | **trigger로만 도는 테이블** → `{테이블명 또는 dag_id: trigger하는 부모 dag_id}`. 실행 종류를 가리지 않고 성공 실행을 전부 세고, Start Offset을 부모 cron 시각 기준으로 잰다 (§3.4). 예) `{"table_t": "append_vertical"}` |
+| `TRIGGER_TABLE`, `TRIGGER_PARENT_DAG` | `None` | **수동(trigger) append 테이블** 1개의 테이블명과, 그 테이블을 trigger하는 수직분할 4개 append DAG의 dag_id. 넣는 법은 §3.1 끝. **append task에만 적용**되고 다른 job에는 영향 없다 (§3.4) |
 | `DAG_ID_PREFIX` | `None` (전체) | 특정 DAG만 볼 때 dag_id 접두어 |
 | `GENERIC_GROUPS` | `convert_files` | 테이블명이 아닌 TaskGroup 이름. 이 그룹이면 target을 dag_id로 표시 |
 | `VERIFY` | `True` | 사내 인증서를 쓰면 CA 파일 경로 |
@@ -158,13 +182,10 @@ TASK_PREFIXES = ("summary_",)
 NUMBERED_TASK = re.compile(r"^\d+_")
 # operator 이름에 "Spark"가 들어간 task도 자동 포함 (위 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치)
 MATCH_SPARK_OPERATOR = True
-# trigger로만 도는 테이블 (schedule=None, 다른 DAG가 끝나면 trigger) → {테이블명 또는 dag_id: trigger하는 부모 dag_id}
-#   - 이 테이블은 실행 종류를 가리지 않고 성공 실행을 전부 센다 (나머지 job은 cron으로 돈 실행만)
-#   - Start Offset은 자기 trigger 시각이 아니라 "부모 DAG의 cron 시각 → 이 테이블 실제 시작"으로 잰다
-#     → 엑셀 cron 칸에 부모 cron을 적으면 부모와 같은 주기·같은 자리에 그려진다
-#   - 부모를 모르면 None: Offset은 자기 trigger 시각 기준
-#   예) {"table_t": "append_vertical"}
-TRIGGER_TABLES = {}
+# 수동(trigger) append 테이블 — 스케줄이 None이고, 수직분할 4개 append DAG가 끝나면 trigger되는 append 테이블 1개.
+# 두 줄에 값을 넣는다 (따옴표 안에). append task(append_data)에만 적용되고 다른 job에는 영향 없다.
+TRIGGER_TABLE = None        # 수동 테이블의 테이블명 (또는 그 append DAG의 dag_id)   예) TRIGGER_TABLE = "table_t"
+TRIGGER_PARENT_DAG = None   # 그 테이블을 trigger하는 수직분할 4개 append DAG의 dag_id   예) TRIGGER_PARENT_DAG = "append_vertical"
 # 특정 DAG만 볼 때 접두어 (None이면 전체 DAG)
 DAG_ID_PREFIX = None
 # 이 TaskGroup 이름은 테이블명이 아니다 → 대상(target)을 dag_id로 표시
@@ -261,12 +282,9 @@ def name_in(name, dag_id, task_id):
     return re.search(rf"(^|[._]){re.escape(name)}($|[._])", f"{dag_id}.{task_id}") is not None
 
 
-def trigger_entry(dag_id, task_id):
-    """TRIGGER_TABLES에 걸리면 (True, 부모 dag_id), 아니면 (False, None)."""
-    for t, parent in TRIGGER_TABLES.items():
-        if name_in(t, dag_id, task_id):
-            return True, parent
-    return False, None
+def is_trigger_append(dag_id, task_id):
+    """수동 테이블의 append task인가. append_data task만 보고, 테이블명(또는 dag_id)이 dag_id·task_id 안에 단어로 있으면 해당."""
+    return bool(TRIGGER_TABLE) and task_id.rsplit(".", 1)[-1] == "append_data" and name_in(TRIGGER_TABLE, dag_id, task_id)
 
 
 def parent_runs(parent, tis):
@@ -400,7 +418,8 @@ def main():
     cron_of = dict(dags)
     for dag_id, cron in dags:
         for task_id, is_mapped in target_tasks(dag_id):
-            all_runs, parent = trigger_entry(dag_id, task_id)
+            all_runs = is_trigger_append(dag_id, task_id)
+            parent = TRIGGER_PARENT_DAG if all_runs else None
             for key, tis in collect_runs(dag_id, task_id, is_mapped, period, all_runs).items():
                 durations = [ti["duration"] for ti in tis]
                 offsets = [(parse_time(ti["start_date"]) - parse_time(ti["run_after"])).total_seconds()
@@ -435,9 +454,11 @@ def main():
                       + note)
     if not rows:
         raise SystemExit("집계 대상이 없다 — 기간·TASK_NAMES·DAG_ID_PREFIX를 확인")
-    for t in TRIGGER_TABLES:
-        if not any(name_in(t, r["dag_id"], r["task_id"]) for r in rows):
-            print(f"  ⚠ TRIGGER_TABLES의 '{t}'에 해당하는 행이 없다 — 이름(테이블명·dag_id)과 기간을 확인")
+    if TRIGGER_TABLE:
+        hit = [r for r in rows if is_trigger_append(r["dag_id"], r["task_id"])]
+        if len(hit) != 1:
+            print(f"  ⚠ TRIGGER_TABLE '{TRIGGER_TABLE}'에 걸린 append가 {len(hit)}개다 (1개여야 한다) — "
+                  f"테이블명 대신 그 append DAG의 dag_id를 넣어 본다")
     rows.sort(key=sort_key)
     with open(output, "w", newline="", encoding="utf-8-sig") as f:   # utf-8-sig: 엑셀 한글 깨짐 방지
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -455,7 +476,7 @@ if __name__ == "__main__":
 | 필터 | 이유 |
 |------|------|
 | `run_id_prefix_pattern=scheduled` | **cron으로 돈 실행만.** 재처리 DAG가 trigger한 Compaction(20시간치면 10분 이상)은 run_id가 `manual__`로 시작해 빠진다. 이게 섞이면 평균이 튄다 |
-| 단, `TRIGGER_TABLES`의 테이블은 이 필터를 끈다 | cron 없이(schedule=None) 다른 DAG의 trigger로만 도는 테이블은 실행이 전부 `manual__` 등이라 위 필터에 전부 걸려 **CSV에서 통째로 빠진다**. 이 테이블만 실행 종류를 가리지 않는다. 이름은 dag_id·task_id 안에 단어로 들어 있어야 걸린다(앞뒤가 끝이나 `.`·`_` — `table_1`을 넣어도 `table_10`은 안 걸린다). 아무 행에도 안 걸린 이름은 경고가 뜬다 |
+| 단, 수동 append 테이블(`TRIGGER_TABLE`)은 이 필터를 끈다 | 스케줄 없이(None) 수직분할 4개 append DAG의 trigger로만 도는 append 테이블은 실행이 전부 `manual__` 등이라 위 필터에 전부 걸려 **CSV에서 통째로 빠진다**. 그 테이블의 **append task(`append_data`)만** 실행 종류를 가리지 않는다. 같은 테이블의 Compaction·expired snapshot·delete orphan·rewrite manifest는 다른 job과 똑같이 cron 실행만 센다 |
 | `state=success` | 실패한 실행은 중간에 끊겨 duration이 짧게 잡힌다 |
 | `order_by=-run_after` | 최신순. 앞에서부터 N회만 쓴다 |
 | mapped task는 테이블별로 N회 | 한 DAG 실행에 테이블 4개가 있으므로 페이지를 넘기며 테이블마다 100회를 채운다 |
