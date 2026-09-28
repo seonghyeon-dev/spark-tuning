@@ -64,12 +64,11 @@ Spark pod를 띄우는 task만 센다. 아래 task는 Spark job이 아니므로 
 | 그 외 테이블 append (테이블별 DAG) | `convert_files.append_data` | **dag_id** (DAG 하나가 테이블 하나) |
 | summary (`iceberg_summary_<alias>`, 테이블별 DAG) | `summary_<alias>` (DAG 안 task 3개 중 Spark job 하나) | 접두어를 뗀 **alias** |
 | hourly·daily Compaction | `compaction` (mapped task) | map index 이름 = **테이블명**. hourly·daily는 DAG의 cron으로 구분(시 자리가 `*`면 hourly) |
-| rewrite manifests (`iceberg_rewrite_manifest` 등, dag_id에 `manifest`가 든 DAG) | `<번호>_<테이블명>` (예: `1_table_a` ~ `25_...`) | 번호를 뗀 **테이블명** |
-| orphan 파일 삭제 (`iceberg_delete_orphan_files` 등, dag_id에 `orphan`이 든 DAG) | `<번호>_<테이블명>` | 번호를 뗀 **테이블명** |
+| rewrite manifests (`iceberg_rewrite_manifests`) | `<번호>_<테이블명>` (예: `1_table_a` ~ `25_...`) | 번호를 뗀 **테이블명** |
+| orphan 파일 삭제 (`iceberg_delete_orphan_files`) | `<번호>_<테이블명>` | 번호를 뗀 **테이블명** |
 | 만료 데이터·snapshot 삭제 (`iceberg_delete_expired_data`) | `<번호>_<테이블명>.del_expired_snapshots` | TaskGroup 이름에서 번호를 뗀 **테이블명** |
 | 위 규칙에 안 걸리는 Spark task | operator 이름에 `Spark`가 든 task | dag_id |
 
-> **rewrite manifests·orphan 삭제는 dag_id에 든 단어로 알아본다.** 처음에는 dag_id가 정확히 `iceberg_rewrite_manifest`일 때만 알아봐서, 운영 dag_id가 조금만 달라도(예: `…_manifests`) `job_type`이 `other`로 나왔다(2026-09-28 정정). 지금은 dag_id에 `manifest`·`orphan`이 들어 있으면 된다.
 
 > **번호가 붙은 task는 번호 순서대로 Start Offset이 쌓인다.** rewrite manifests·orphan 삭제·만료 데이터 삭제 DAG는 테이블 task가 `1_`, `2_` … `25_` 순서로 돈다. 순차 실행이면 Compaction처럼 뒤 번호일수록 Start Offset이 커지고, 병렬이면 전부 비슷하게 나온다. 어느 쪽이든 실측값 그대로 그래프에 들어간다.
 
@@ -167,7 +166,7 @@ VERIFY = True                   # 사내 CA면 인증서 경로 문자열로 (�
 TASK_NAMES = {"append_data", "compaction", "del_expired_snapshots"}
 # 이 접두어로 시작하는 task (iceberg_summary_<alias> DAG 의 summary_<alias>). 대상 이름은 접두어를 뗀 alias
 TASK_PREFIXES = ("summary_",)
-# "번호_테이블명" 형태의 task (iceberg_rewrite_manifest·iceberg_delete_orphan_files, 예: 1_table_a)
+# "번호_테이블명" 형태의 task (iceberg_rewrite_manifests·iceberg_delete_orphan_files, 예: 1_table_a)
 NUMBERED_TASK = re.compile(r"^\d+_")
 # operator 이름에 "Spark"가 들어간 task도 자동 포함 (위 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치)
 MATCH_SPARK_OPERATOR = True
@@ -326,10 +325,9 @@ def job_type_of(dag_id, task_id, cron):
         return "hourly compaction" if is_hourly(dag_id, cron) else "daily compaction"
     if name == "del_expired_snapshots":
         return "expired snapshot"
-    # maintenance DAG는 dag_id에 이 단어가 들어 있는지로 판단한다 (iceberg_rewrite_manifest·…_manifests 둘 다)
-    if "orphan" in dag_id:
+    if dag_id == "iceberg_delete_orphan_files":
         return "delete orphan"
-    if "manifest" in dag_id:
+    if dag_id == "iceberg_rewrite_manifests":
         return "rewrite manifest"
     return "other"
 
@@ -503,8 +501,8 @@ labeled AS (
                    THEN CASE WHEN cron = '@hourly' OR split_part(cron, ' ', 2) IN ('*', '*/1')
                              THEN 'hourly compaction' ELSE 'daily compaction' END
               WHEN task_id LIKE '%del_expired_snapshots' THEN 'expired snapshot'
-              WHEN dag_id LIKE '%orphan%' THEN 'delete orphan'             -- dag_id에 단어가 들어 있으면
-              WHEN dag_id LIKE '%manifest%' THEN 'rewrite manifest'
+              WHEN dag_id = 'iceberg_delete_orphan_files' THEN 'delete orphan'
+              WHEN dag_id = 'iceberg_rewrite_manifests' THEN 'rewrite manifest'
               ELSE 'other' END                                            AS job_type,
          CASE WHEN map_key IS NOT NULL THEN map_key                       -- Compaction: 테이블명
               WHEN task_id ~ '^summary_' THEN substr(task_id, 9)          -- summary_<alias> → alias
