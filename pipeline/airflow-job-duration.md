@@ -64,10 +64,11 @@ Spark pod를 띄우는 task만 센다. 아래 task는 Spark job이 아니므로 
 | 그 외 테이블 append (테이블별 DAG) | `convert_files.append_data` | **dag_id** (DAG 하나가 테이블 하나) |
 | summary (`iceberg_summary_<alias>`, 테이블별 DAG) | `summary_<alias>` (DAG 안 task 3개 중 Spark job 하나) | 접두어를 뗀 **alias** |
 | hourly·daily Compaction | `compaction` (mapped task) | map index 이름 = **테이블명**. hourly·daily는 DAG의 cron으로 구분(시 자리가 `*`면 hourly) |
-| rewrite manifests (`iceberg_rewrite_manifest`) | `<번호>_<테이블명>` (예: `1_table_a` ~ `25_...`) | 번호를 뗀 **테이블명** |
+| rewrite manifests (`iceberg_rewrite_manifests`) | `<번호>_<테이블명>` (예: `1_table_a` ~ `25_...`) | 번호를 뗀 **테이블명** |
 | orphan 파일 삭제 (`iceberg_delete_orphan_files`) | `<번호>_<테이블명>` | 번호를 뗀 **테이블명** |
 | 만료 데이터·snapshot 삭제 (`iceberg_delete_expired_data`) | `<번호>_<테이블명>.del_expired_snapshots` | TaskGroup 이름에서 번호를 뗀 **테이블명** |
 | 위 규칙에 안 걸리는 Spark task | operator 이름에 `Spark`가 든 task | dag_id |
+
 
 > **번호가 붙은 task는 번호 순서대로 Start Offset이 쌓인다.** rewrite manifests·orphan 삭제·만료 데이터 삭제 DAG는 테이블 task가 `1_`, `2_` … `25_` 순서로 돈다. 순차 실행이면 Compaction처럼 뒤 번호일수록 Start Offset이 커지고, 병렬이면 전부 비슷하게 나온다. 어느 쪽이든 실측값 그대로 그래프에 들어간다.
 
@@ -105,7 +106,7 @@ python job_durations.py 20260921 20260922            # 기간 지정 (아래 표
 - 모든 날짜·시각은 **한국 시간(KST)** 기준이다. 시간대는 스크립트 상단 `TZ`로 바꾼다
 - 형식이 틀리거나(`2026-09-21`), 없는 시각이거나(`2026092125`), 시작이 끝보다 늦으면 이유를 적고 멈춘다
 - 기간은 **cron 예정 시각**(`run_after`)으로 자른다. 9/21 23:45에 시작 예정이던 hourly Compaction은 실제로 9/22 0시를 넘겨 끝나도 9/21에 들어간다
-- 결과는 엑셀에서 바로 열린다(한글 깨짐 방지 인코딩). 정렬은 append → summary → hourly Compaction → daily Compaction → expired snapshot → delete orphan → rewrite manifest 순이고, 같은 종류 안에서는 테이블명 오름차순이다
+- 결과는 엑셀에서 바로 열린다(한글 깨짐 방지 인코딩). 정렬은 append → summary → hourly Compaction → daily Compaction → expired snapshot → delete orphan → rewrite manifest 순이다. 같은 종류 안에서는 테이블명 오름차순이고, task_id가 `1_테이블명`처럼 **번호로 시작하는 task(expired snapshot·delete orphan·rewrite manifest)는 번호 순**이다. 번호는 숫자로 비교하므로 1, 2, …, 9, 10 순서가 된다(글자 순이면 1, 10, 2가 된다)
 
 ### 4.2 고칠 수 있는 설정 (스크립트 상단)
 
@@ -121,7 +122,7 @@ python job_durations.py 20260921 20260922            # 기간 지정 (아래 표
 | `GENERIC_GROUPS` | `convert_files` | 테이블명이 아닌 TaskGroup 이름. 이 그룹이면 target을 dag_id로 표시 |
 | `VERIFY` | `True` | 사내 인증서를 쓰면 CA 파일 경로 |
 | `MAX_PAGES` | 100 | task 하나당 최대 몇 페이지(100건씩)를 훑을지. 긴 기간을 줄 때 모자라면 경고가 뜬다 |
-| `JOB_TYPE_ORDER` | append … rewrite manifest, other | 출력 정렬 순서. 순서를 바꾸려면 이 목록만 바꾼다 |
+| `JOB_TYPE_ORDER` | append … rewrite manifest, other | 출력 정렬 순서. 순서를 바꾸려면 이 목록만 바꾼다. 같은 종류 안에서는 테이블명 순이고, `번호_테이블명` task는 번호 순이다 |
 
 ### 4.3 스크립트
 
@@ -165,7 +166,7 @@ VERIFY = True                   # 사내 CA면 인증서 경로 문자열로 (�
 TASK_NAMES = {"append_data", "compaction", "del_expired_snapshots"}
 # 이 접두어로 시작하는 task (iceberg_summary_<alias> DAG 의 summary_<alias>). 대상 이름은 접두어를 뗀 alias
 TASK_PREFIXES = ("summary_",)
-# "번호_테이블명" 형태의 task (iceberg_rewrite_manifest·iceberg_delete_orphan_files, 예: 1_table_a)
+# "번호_테이블명" 형태의 task (iceberg_rewrite_manifests·iceberg_delete_orphan_files, 예: 1_table_a)
 NUMBERED_TASK = re.compile(r"^\d+_")
 # operator 이름에 "Spark"가 들어간 task도 자동 포함 (위 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치)
 MATCH_SPARK_OPERATOR = True
@@ -175,7 +176,7 @@ DAG_ID_PREFIX = None
 GENERIC_GROUPS = {"convert_files"}
 # 페이지 상한 (100개 × 100 = task 하나당 최근 1만 건까지만 훑는다)
 MAX_PAGES = 100
-# 출력 정렬 순서 (job_type 열). 같은 job_type 안에서는 대상(테이블명) 오름차순
+# 출력 정렬 순서 (job_type 열). 같은 job_type 안에서는 테이블명 순, "번호_테이블명" task는 번호 순
 JOB_TYPE_ORDER = ["append", "summary", "hourly compaction", "daily compaction",
                   "expired snapshot", "delete orphan", "rewrite manifest", "other"]
 # ─────────────────────────────────────────────────────────────────────
@@ -326,9 +327,19 @@ def job_type_of(dag_id, task_id, cron):
         return "expired snapshot"
     if dag_id == "iceberg_delete_orphan_files":
         return "delete orphan"
-    if dag_id == "iceberg_rewrite_manifest":
+    if dag_id == "iceberg_rewrite_manifests":
         return "rewrite manifest"
     return "other"
+
+
+def sort_key(r):
+    """job_type 순서 → 같은 종류 안에서는
+    "번호_테이블명" task(1_table_a …)는 번호 순 (숫자로 비교: 1, 2, …, 10), 나머지는 테이블명 순."""
+    order = JOB_TYPE_ORDER.index(r["job_type"])
+    m = re.match(r"(\d+)_", r["task_id"])
+    if m:
+        return (order, 0, r["dag_id"], int(m.group(1)), r["task_id"])
+    return (order, 1, r["target"], 0, r["dag_id"] + "." + r["task_id"])
 
 
 def to_min(seconds):
@@ -372,7 +383,7 @@ def main():
                       f"dur={r['Duration (min)']:5.1f} offset={r['Start Offset (min)']:5.1f}")
     if not rows:
         raise SystemExit("집계 대상이 없다 — 기간·TASK_NAMES·DAG_ID_PREFIX를 확인")
-    rows.sort(key=lambda r: (JOB_TYPE_ORDER.index(r["job_type"]), r["target"], r["dag_id"], r["task_id"]))
+    rows.sort(key=sort_key)
     with open(output, "w", newline="", encoding="utf-8-sig") as f:   # utf-8-sig: 엑셀 한글 깨짐 방지
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
@@ -403,11 +414,12 @@ job_type,dag_id,task_id,target,cron,runs,Duration (min),Duration median (min),Du
 append,append_vertical,table_a.append_data,table_a,*/5 * * * *,100,3.0,3.0,3.0,0.3,2026-09-27T15:45:00Z,2026-09-28T00:00:00Z
 summary,iceberg_summary_alpha,summary_alpha,alpha,10 * * * *,100,2.0,2.0,2.0,0.2,2026-09-23T21:10:00Z,2026-09-28T00:10:00Z
 hourly compaction,iceberg_compaction_hourly,compaction,table_1,45 * * * *,100,1.5,1.5,1.5,0.3,2026-09-23T21:45:00Z,2026-09-28T00:45:00Z
-hourly compaction,iceberg_compaction_hourly,compaction,table_2,45 * * * *,100,1.8,1.8,1.8,1.9,2026-09-23T21:45:00Z,2026-09-28T00:45:00Z
 daily compaction,iceberg_compaction_daily,compaction,table_1,0 1 * * *,60,30.0,30.0,30.0,0.2,2026-07-31T01:00:00Z,2026-09-28T01:00:00Z
 expired snapshot,iceberg_delete_expired_data,1_table_a.del_expired_snapshots,table_a,0 3 * * *,60,1.5,1.5,1.5,1.3,2026-07-31T03:00:00Z,2026-09-28T03:00:00Z
 delete orphan,iceberg_delete_orphan_files,1_table_a,table_a,0 5 * * *,60,2.0,2.0,2.0,0.1,2026-07-31T05:00:00Z,2026-09-28T05:00:00Z
-rewrite manifest,iceberg_rewrite_manifest,1_table_a,table_a,0 6 */3 * *,60,0.8,0.8,0.8,0.1,2026-07-31T06:00:00Z,2026-09-28T06:00:00Z
+rewrite manifest,iceberg_rewrite_manifests,1_zeta,zeta,0 6 */3 * *,60,0.8,0.8,0.8,0.1,2026-07-31T06:00:00Z,2026-09-28T06:00:00Z
+rewrite manifest,iceberg_rewrite_manifests,2_alpha,alpha,0 6 */3 * *,60,0.8,0.8,0.8,1.0,2026-07-31T06:00:00Z,2026-09-28T06:00:00Z
+rewrite manifest,iceberg_rewrite_manifests,10_echo,echo,0 6 */3 * *,60,0.8,0.8,0.8,8.3,2026-07-31T06:00:00Z,2026-09-28T06:00:00Z
 ```
 
 | 열 | 뜻 |
@@ -490,7 +502,7 @@ labeled AS (
                              THEN 'hourly compaction' ELSE 'daily compaction' END
               WHEN task_id LIKE '%del_expired_snapshots' THEN 'expired snapshot'
               WHEN dag_id = 'iceberg_delete_orphan_files' THEN 'delete orphan'
-              WHEN dag_id = 'iceberg_rewrite_manifest' THEN 'rewrite manifest'
+              WHEN dag_id = 'iceberg_rewrite_manifests' THEN 'rewrite manifest'
               ELSE 'other' END                                            AS job_type,
          CASE WHEN map_key IS NOT NULL THEN map_key                       -- Compaction: 테이블명
               WHEN task_id ~ '^summary_' THEN substr(task_id, 9)          -- summary_<alias> → alias
@@ -520,7 +532,11 @@ GROUP BY job_type, dag_id, task_id, target, cron
 ORDER BY array_position(ARRAY['append', 'summary', 'hourly compaction', 'daily compaction',
                               'expired snapshot', 'delete orphan', 'rewrite manifest', 'other'],
                         job_type),
-         target, dag_id, task_id;
+         (task_id !~ '^[0-9]+_'),                                          -- "번호_테이블명" task 먼저
+         CASE WHEN task_id ~ '^[0-9]+_' THEN dag_id ELSE target END,
+         CASE WHEN task_id ~ '^[0-9]+_'                                    -- 번호는 숫자로 비교 (1, 2, …, 10)
+              THEN substring(task_id FROM '^([0-9]+)_')::int END,
+         dag_id, task_id;
 ```
 
 MySQL 8이면 `PERCENTILE_CONT` 줄(중앙값)과 `::numeric`·`::text`를 빼고, `split_part`를 `SUBSTRING_INDEX(task_id, '.', 1)`로, `~ '...'`를 `REGEXP '...'`로 바꾼다(`regexp_replace`는 MySQL 8에도 있다).
