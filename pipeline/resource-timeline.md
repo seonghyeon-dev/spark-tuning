@@ -71,13 +71,12 @@ python resource_timeline.py "C:\경로\작업엑셀.xlsx"
 
 **기준일(선택)**: 그래프로 그릴 하루다. 매일·매시·5분마다 도는 job은 날짜와 무관하고, **3일마다 도는 rewrite manifests(`0 6 */3 * *`)만** 그날 도는지가 날짜에 따라 달라진다. 생략하면 오늘. rewrite manifests까지 넣은 그림을 보려면 도는 날(1·4·7…일)을 준다.
 
-**파일을 못 열 때**: xlsx는 내부가 zip 파일이다. zip이 아니면 스크립트가 파일 첫 바이트로 원인을 알려 준다.
+**파일을 못 열 때**: xlsx는 내부가 zip 파일이다. zip이 아니면(사내 DRM·열기 암호·옛 xls·CSV 등) **Windows에서는 종류를 가리지 않고 엑셀을 통해 읽는다** (§2.2). 엑셀은 이 파일들을 다 열 수 있고, DRM 파일은 맨 앞이 글자(보안 제품 표식)로 시작하기도 해서 첫 바이트로 종류를 단정하지 않는다. WSL·리눅스에서는 파일 앞부분을 보여 주고 Windows에서 실행하라고 안내한다.
 
-| 원인 | 조치 |
+| 경우 | 조치 |
 |---|---|
-| 사내 보안(DRM) 암호화 | Windows용 Python + xlwings로 실행 → 엑셀을 통해 읽는다 (§2.2) |
-| 열기 암호가 걸린 파일 / 옛 .xls 형식 | Windows에서는 엑셀을 통해 읽는다. 열기 암호는 엑셀이 암호를 묻다 멈추므로 암호를 먼저 지운다 |
-| CSV 등을 확장자만 .xlsx로 바꾼 파일 | [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)] |
+| 사내 보안(DRM)·옛 .xls·CSV | Windows용 Python + xlwings로 실행하면 엑셀을 통해 읽는다 (§2.2) |
+| 열기 암호가 걸린 파일 | 엑셀이 암호를 묻다 멈추므로 암호를 먼저 지운다 |
 | `~$`로 시작하는 파일 | 엑셀 잠금 파일이다. 원래 파일 이름을 넣는다 |
 
 실행 화면 예 (예시 데이터):
@@ -958,22 +957,21 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
 
 
 def open_workbook(src):
-    """xlsx는 zip 파일이다. zip이면 openpyxl로 직접 읽고,
-    zip이 아니면(사내 DRM·열기 암호·옛 xls) Windows에서는 엑셀을 통해 읽고, 그 밖에는 원인을 알려 준다."""
+    """xlsx는 zip 파일이다. zip이면 openpyxl로 직접 읽는다.
+    zip이 아니면(사내 DRM·열기 암호·옛 xls·CSV 등) Windows에서는 무조건 엑셀을 통해 읽는다 — 엑셀은 이 파일들을 다 연다.
+    DRM 파일은 맨 앞이 글자로 시작하기도 해서(보안 제품 표식) 첫 바이트만으로 종류를 단정하지 않는다."""
     if not src.exists():
         raise SystemExit(f"파일이 없다: {src}")
     if src.name.startswith("~$"):
         raise SystemExit(f"'{src.name}'은 엑셀이 파일을 열어 둘 때 만드는 잠금 파일이다 — '~$'가 없는 원래 파일 이름을 넣는다")
-    head = src.read_bytes()[:8]
+    head = src.read_bytes()[:16]
     if head[:2] == b"PK":
         return load_workbook(src, data_only=True)     # 수식 셀은 계산된 값으로 읽는다
-    if head[:1] == b"<" or all(32 <= b < 127 or b in (9, 10, 13) for b in head):
-        raise SystemExit(f"'{src.name}'은 xlsx가 아니라 CSV·HTML 같은 텍스트 파일이다 — "
-                         f"엑셀에서 열어 [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)]로 저장한다")
     if sys.platform == "win32":
         return read_via_excel(src)
-    raise SystemExit(f"'{src.name}'은 Python이 직접 열 수 없는 파일이다 (파일 첫 바이트 {head.hex(' ').upper()} — "
-                     f"사내 보안(DRM)·열기 암호·옛 xls). Windows용 Python에서 실행하면 엑셀을 통해 읽는다: "
+    shown = head.decode("latin-1").encode("unicode_escape").decode("ascii")
+    raise SystemExit(f"'{src.name}'은 Python이 직접 열 수 없는 파일이다 (파일 앞부분: {shown}) — "
+                     f"사내 보안(DRM)·열기 암호·옛 xls·CSV 중 하나다. Windows용 Python에서 실행하면 엑셀을 통해 읽는다: "
                      f"pip install openpyxl xlwings → python resource_timeline.py <파일>. WSL·리눅스에서는 안 된다")
 
 
