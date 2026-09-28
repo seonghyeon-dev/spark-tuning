@@ -121,4 +121,4 @@ nav:
       - Compaction executor 자원 할당 설계: pipeline/compaction-executor-sizing-design.md
       - 테이블 재생성 + tmp_id 추가 절차서: pipeline/recreate-table-tmp-id.md
       - Airflow job 실행 시간 집계 (리소스 시각화용): pipeline/airflow-job-duration.md
-      - 하루 리소스 사용량 시각화 (엑셀 그래프): pipeline/resource-timeline.md
+      - 하루 리소스 사용량 as-is/to-be 비교 (엑셀 그래프): pipeline/resource-timeline.md
