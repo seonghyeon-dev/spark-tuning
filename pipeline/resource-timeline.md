@@ -1,6 +1,6 @@
 # 하루 리소스 사용량 시각화 (엑셀 그래프)
 
-> **결론**: 작업 시트(cron·CPU·메모리)에 `job_durations.py` 결과(Duration·Start Offset)를 붙인 엑셀을 넣으면, **시각별 동시 CPU·메모리 그래프가 들어 있는 새 엑셀**이 나온다. 예시 데이터에서 설정값 단순 합산은 588코어인데 실제로 한 순간에 겹친 최대는 **129코어(22%)**였다 — 단순 합산은 "모든 job이 동시에 떠 있는 순간"이라는, 실제로는 없는 값이다.
+> **결론**: 작업 시트(cron·CPU·메모리)에 `job_durations.py` 결과(Duration·Start Offset)를 붙인 엑셀을 넣으면, **시각별 동시 CPU·메모리 그래프가 들어 있는 새 엑셀**이 나온다. 예시 데이터에서 설정값 단순 합산은 591코어인데 실제로 한 순간에 겹친 최대는 **132코어(22%)**였다 — 단순 합산은 "모든 job이 동시에 떠 있는 순간"이라는, 실제로는 없는 값이다.
 >
 > 원본 엑셀은 건드리지 않는다. 결과는 같은 폴더에 `<원본이름>_리소스시각화.xlsx`로 생긴다.
 
@@ -15,25 +15,18 @@
 
 | 열 | 내용 | 스크립트가 쓰나 |
 |---|---|---|
-| A~C | 구분·이름·cron 등 (순서 무관) | ✅ 값을 보고 자동 판별 (§1.1) |
+| **A** | **job_type** (`job_durations.csv`의 `job_type` 값: `append`, `summary`, `hourly compaction`, `daily compaction`, `expired snapshot`, `delete orphan`, `rewrite manifest`, `other`) | ✅ 그래프에서 쌓는 종류 |
+| **B** | **cron** | ✅ 비어 있거나 cron 식이 아니면 그 행만 실행 간격을 추정 (§3.4) |
+| **C** | **app name** | ✅ 결과 표의 이름 |
 | D~J | 드라이버 cpu, 드라이버 메모리, 드라이버 메모리 오버헤드, 익스큐터 cpu, 익스큐터 메모리, 익스큐터 메모리 오버헤드, 익스큐터 개수 | ❌ (K·L을 만드는 재료) |
 | **K** | **토탈 cpu** (코어) | ✅ |
 | **L** | **토탈 메모리** (GB. `228g`처럼 단위가 붙어 있어도 읽는다) | ✅ |
 | M~S | `job_durations.csv`의 **F~L열**을 그대로 붙인 것: runs, Duration (min), Duration median (min), Duration max (min), **Start Offset (min)**, oldest_run, latest_run | ✅ |
+| **U** | **기능 요약** | ✅ 결과 표(`job별 실행`, 최대 순간 job 목록)에 같이 보여 준다 |
 
 - K·L이 수식이어도 된다. 엑셀에 **저장된 계산값**을 읽는다 (엑셀에서 한 번 저장된 파일이면 값이 들어 있다)
 - 제목 행·빈 행·메모 행은 알아서 건너뛴다. **N열(Duration)과 K열(토탈 cpu)이 둘 다 숫자인 행만** job으로 본다
 - 열 위치가 다르면 스크립트 상단 설정(§4)의 열 문자만 바꾼다
-
-### 1.1 A~C열 자동 판별
-
-| 찾는 것 | 판별 기준 | 없으면 |
-|---|---|---|
-| cron | 행의 절반 이상이 cron 식(`45 * * * *`, `@hourly` 등)인 열 | runs·oldest_run·latest_run으로 **실행 간격을 추정**한다 (§3.4) |
-| 구분 | 값의 절반 이상이 `append`, `summary`, `hourly compaction`, `daily compaction`, `expired snapshot`, `delete orphan`, `rewrite manifest` 중 하나인 열 (`job_durations.csv`의 `job_type` 값 그대로) | 이름에 든 단어(`append`, `convert_file`, `summary`, `compaction`, `expire`, `orphan`, `manifest`)로 추정. compaction은 cron의 시 자리가 `*`면 hourly |
-| 이름 | cron·구분이 아닌 나머지 글자 열을 이어 붙인 것 | `<행 번호>행` |
-
-판별 결과는 실행할 때 첫 줄과 결과 엑셀 `요약` 시트에 찍힌다. 틀리면 설정의 `COL_CRON`·`COL_GROUP`·`COL_NAME`에 열 문자를 직접 넣는다.
 
 ---
 
@@ -50,9 +43,9 @@ python resource_timeline.py 작업엑셀.xlsx 리소스 20260928   # 기준일 �
 실행 화면 예 (예시 데이터):
 
 ```text
-시트 '리소스': job 31개, 제외 0개 / 열 판별: cron C · 이름 B · 구분 A
+시트 '리소스': job 32개, 제외 0개 / cron 없어 간격 추정 1개
 cron 시간대: KST (latest_run 18건 중 18건이 KST 기준 cron과 일치) / 기준일 2026-09-28
-최대 동시 CPU 129.0코어 / 메모리 560.6GB (단순 합산 588.0코어 / 1,999.4GB)
+최대 동시 CPU 132.0코어 / 메모리 568.0GB (단순 합산 591.0코어 / 2,006.8GB)
 → 작업엑셀_리소스시각화.xlsx
 ```
 
@@ -60,9 +53,9 @@ cron 시간대: KST (latest_run 18건 중 18건이 KST 기준 cron과 일치) / 
 
 | 시트 | 내용 |
 |---|---|
-| **요약** | 기준일·판별 결과, 지표 표(단순 합산 / 실제 최대 / 최대 시각 / 하루 평균 / 최대 ÷ 단순 합산), **CPU 그래프·메모리 그래프**(job 종류별로 쌓은 면적 그래프, x축 00:00~24:00 KST), 최대 CPU 순간에 떠 있던 job 목록, 계산에서 뺀 행 |
+| **요약** | 기준일·읽은 열·cron 시간대, 지표 표(단순 합산 / 실제 최대 / 최대 시각 / 하루 평균 / 최대 ÷ 단순 합산), **CPU 그래프·메모리 그래프**(job 종류별로 쌓은 면적 그래프, x축 00:00~24:00 KST), 최대 CPU 순간에 떠 있던 job 목록(기능 요약 포함), 계산에서 뺀 행 |
 | **시각별 사용량** | 5분 칸 = 1행(288행). 칸마다 종류별 CPU·메모리와 합계(`SUM` 수식). 그래프의 원본 데이터 |
-| **job별 실행** | job마다 종류·cron·하루 실행 횟수·Start Offset·Duration·총 CPU·총 메모리와 `CPU·분 / 일`(= 횟수 × Duration × CPU, 수식), CPU·분 비중 |
+| **job별 실행** | job마다 종류·cron·하루 실행 횟수·Start Offset·Duration·총 CPU·총 메모리와 `CPU·분 / 일`(= 횟수 × Duration × CPU, 수식), CPU·분 비중, 기능 요약 |
 
 `요약`의 지표와 `job별 실행`의 계산 열은 수식이라 엑셀이 열 때 계산한다.
 
@@ -85,7 +78,7 @@ hourly compaction은 테이블을 순서대로 돈다. 1번이 47:36에 끝나�
 
 ### 3.3 왜 그래프 한 칸이 5분이고, 칸의 값은 최댓값인가
 
-예시의 append 7개(합계 29코어)는 5분마다 시작해 2.4분 돌고 꺼진다. 1분 칸 그래프로 그리면 29 → 0 → 29 → 0 톱니가 하루 288번 반복되어 다른 job이 안 보인다.
+예시의 cron으로 도는 append 7개(합계 29코어)는 5분마다 시작해 2.4분 돌고 꺼진다. 1분 칸 그래프로 그리면 29 → 0 → 29 → 0 톱니가 하루 288번 반복되어 다른 job이 안 보인다.
 
 5분 칸으로 묶고 **칸 안에서 합계가 가장 큰 순간의 값**을 쓰면 append는 29코어로 평평해진다. 뜻은 "이 5분 안에 한 번은 29코어가 필요하다" — 자원을 확보하는 입장에서 필요한 값이다. 칸 폭은 설정 `BUCKET_MIN`으로 바꾼다(1로 두면 1분 칸).
 
@@ -94,10 +87,10 @@ hourly compaction은 테이블을 순서대로 돈다. 1번이 47:36에 끝나�
 
 ### 3.4 cron이 없을 때 — 실행 간격 추정
 
-A~C열에 cron이 없으면 `(latest_run − oldest_run) ÷ (runs − 1)`로 간격을 구한다. 예: 최근 100회가 99시간에 걸쳐 있으면 99시간 ÷ 99 = 60분 → 매시 실행, 시작 분은 latest_run의 분. 실패한 실행이 빠져 조금 길게 나오므로 가까운 정규 간격(5·10·15·30·60분, 1·2·3일 등)으로 맞춘다. `job별 실행` 시트의 cron 칸에 `60분마다 (추정)`으로 표시된다.
+B열(cron)이 비어 있거나 cron 식이 아니면 그 행만 `(latest_run − oldest_run) ÷ (runs − 1)`로 간격을 구한다. 예: 최근 100회가 99시간에 걸쳐 있으면 99시간 ÷ 99 = 60분 → 매시 실행, 시작 분은 latest_run의 분. 실패한 실행이 빠져 조금 길게 나오므로 가까운 정규 간격(5·10·15·30·60분, 1·2·3일 등)으로 맞춘다. `job별 실행` 시트의 cron 칸에 `60분마다 (추정)`으로 표시된다.
 
-- cron 열이 있어도 **그 행의 cron 칸이 비어 있으면** 그 행만 같은 방법으로 추정한다. cron 없이 다른 DAG의 trigger로만 도는 테이블(집계 스크립트의 `TRIGGER_TABLES`)이 이 경우다
-- 3일마다 도는 job은 cron(`*/3`, 매달 1일 기준)과 추정(최근 실행 + 3일 간격)이 월말에 어긋날 수 있다. 정확히 하려면 cron 열을 넣는다
+- cron 없이 다른 DAG의 trigger로만 도는 테이블(집계 스크립트의 `TRIGGER_TABLES`)이 이 경우다. 예시의 `append_table_t`: 100회가 8시간 15분(495분)에 걸쳐 있어 495 ÷ 99 = 5분 → `5분마다 (추정)`, 시작은 latest_run 09:56 기준 매 :01·:06·…
+- 3일마다 도는 job은 cron(`*/3`, 매달 1일 기준)과 추정(최근 실행 + 3일 간격)이 월말에 어긋날 수 있다. cron이 있는 job은 B열에 적어 둔다
 
 ### 3.5 cron 시간대 판단
 
@@ -107,8 +100,8 @@ Airflow cron은 UTC로 적었을 수도, KST로 적었을 수도 있다. 스크�
 
 | 지표 | CPU | 뜻 |
 |---|---|---|
-| 설정값 단순 합산 | 588코어 | 31개 job의 토탈 cpu를 전부 더한 값 |
-| 실제 최대 동시 사용량 | 129코어 | 01:45 — daily compaction 3번째 테이블 시작(01:45:36) + hourly compaction 1번(01:45:30~) + append 7개 = 50 + 50 + 29 |
+| 설정값 단순 합산 | 591코어 | 32개 job의 토탈 cpu를 전부 더한 값 |
+| 실제 최대 동시 사용량 | 132코어 | 01:46 — daily compaction 3번째 테이블(01:45:36~) + hourly compaction 1번(01:45:30~01:47:36) + append 8개(trigger 테이블 01:46:42~ 포함) = 50 + 50 + 32 |
 | 최대 ÷ 단순 합산 | 22% | 단순 합산의 5분의 1 정도만 실제로 동시에 필요 |
 
 최대 순간은 **daily compaction(01:00~) 구간에 매시 45분 hourly compaction이 겹칠 때**다. 이런 겹침이 그래프에서 봉우리로 보인다.
@@ -122,7 +115,8 @@ Airflow cron은 UTC로 적었을 수도, KST로 적었을 수도 있다. 스크�
 | `COL_TOTAL_CPU`, `COL_TOTAL_MEM` | `K`, `L` | 토탈 열 위치가 다를 때 |
 | `COL_RUNS` … `COL_LATEST` | `M` ~ `S` | `job_durations.csv` F~L열을 다른 곳에 붙였을 때 |
 | `COL_DURATION` | `COL_DUR_AVG` (평균) | 중앙값(`COL_DUR_MEDIAN`)이나 최댓값(`COL_DUR_MAX`)으로 그리고 싶을 때. 최댓값 = 가장 오래 걸린 날 기준의 보수적 그림 |
-| `COL_NAME`, `COL_CRON`, `COL_GROUP` | `None` (자동) | 자동 판별이 틀렸을 때 열 문자 지정 |
+| `COL_GROUP`, `COL_CRON`, `COL_NAME` | `A`, `B`, `C` | job_type·cron·app name 열 |
+| `COL_DESC` | `U` | 기능 요약 열. 없으면 `None` |
 | `CRON_TZ` | `"auto"` | 판단 근거가 없을 때(daily job이 없음) `"KST"`/`"UTC"` 지정 |
 | `BUCKET_MIN` | `5` | 그래프 한 칸의 폭(분). 1440의 약수 |
 | `GROUP_ORDER`, `GROUP_COLORS` | 종류 7개 + 기타 | 종류 순서 = 그래프에 아래부터 쌓이는 순서. 색은 색각 이상 검사를 통과한 팔레트라 순서째로 바꾸지 말 것 |
@@ -170,6 +164,9 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ── 설정: 작업 시트의 열 위치 ─────────────────────────────────────────────
+COL_GROUP = "A"              # job_type (append, summary, hourly compaction …)
+COL_CRON = "B"               # cron. 비어 있거나 cron이 아니면(trigger로만 도는 job) 실행 간격을 추정한다
+COL_NAME = "C"               # app name
 COL_TOTAL_CPU = "K"          # 토탈 cpu (코어)
 COL_TOTAL_MEM = "L"          # 토탈 메모리 (GB. "228g"처럼 단위가 붙어 있어도 읽는다)
 # job_durations.csv의 F~L열(runs … latest_run)을 M열부터 붙인 위치
@@ -177,11 +174,7 @@ COL_RUNS, COL_DUR_AVG, COL_DUR_MEDIAN, COL_DUR_MAX, COL_OFFSET, COL_OLDEST, COL_
     "M", "N", "O", "P", "Q", "R", "S"
 # 그래프에 쓸 Duration: 평균(COL_DUR_AVG) / 중앙값(COL_DUR_MEDIAN) / 최댓값(COL_DUR_MAX)
 COL_DURATION = COL_DUR_AVG
-# 이름·cron·구분 열은 A~C에서 값을 보고 자동으로 찾는다. 직접 정하려면 열 문자를 넣는다 (예: "B")
-COL_NAME = None
-COL_CRON = None
-COL_GROUP = None
-SEARCH_COLS = ["A", "B", "C"]
+COL_DESC = "U"               # 기능 요약 (결과 표에 같이 보여 준다. 없으면 None)
 # cron을 어느 시간대로 적었나: "auto"(latest_run으로 판단) / "KST" / "UTC". 그래프는 항상 KST로 그린다
 CRON_TZ = "auto"
 KST = timezone(timedelta(hours=9))
@@ -341,33 +334,14 @@ def read_jobs(ws):
     if not data:
         raise SystemExit(f"{COL_DURATION}열(Duration)과 {COL_TOTAL_CPU}열(토탈 cpu)에 숫자가 있는 행이 없다 — 열 설정을 확인")
 
-    def column_values(letter):
-        return [vals[col(letter)] if len(vals) > col(letter) else None for _, vals in data]
-
-    cron_col = COL_CRON or next((c for c in SEARCH_COLS
-                                 if sum(is_cron(v) for v in column_values(c)) >= len(data) * 0.5), None)
-    text_cols = [c for c in SEARCH_COLS if c != cron_col
-                 and sum(isinstance(v, str) and v.strip() != "" for v in column_values(c)) >= len(data) * 0.5]
-    name_col = COL_NAME or None
-    group_col = COL_GROUP
-    if group_col is None:                        # 값 대부분이 job 종류 이름(append, summary …)인 열만 구분 열로 쓴다
-        for c in text_cols:
-            vals = [v for v in column_values(c) if v]
-            if vals and sum(normalize_group(v) in GROUP_ORDER for v in vals) >= len(vals) * 0.5:
-                group_col = c
-                break
-
-    if not name_col:                             # 이름 = 구분·cron을 뺀 텍스트 열을 이어 붙인 것
-        name_col = " + ".join(c for c in text_cols if c != group_col) or None
     jobs, skipped = [], []
     for rn, vals in data:
         get = lambda letter: vals[col(letter)] if letter and len(vals) > col(letter) else None
-        cron = get(cron_col)
-        parts = [str(get(c)).strip() for c in ([name_col] if COL_NAME else text_cols)
-                 if c and c != group_col and get(c) not in (None, "")]
-        name = " · ".join(parts) or f"{rn}행"
+        cron = get(COL_CRON)
+        name = str(get(COL_NAME) or "").strip() or f"{rn}행"
         job = {
-            "row": rn, "name": name, "cron_text": "", "cron": None, "every": None,
+            "row": rn, "name": name, "desc": str(get(COL_DESC) or "").strip(),
+            "cron_text": "", "cron": None, "every": None,
             "cpu": to_number(get(COL_TOTAL_CPU)), "mem": to_number(get(COL_TOTAL_MEM)) or 0.0,
             "duration": to_number(get(COL_DURATION)), "offset": to_number(get(COL_OFFSET)) or 0.0,
             "latest": to_utc(get(COL_LATEST)),
@@ -375,18 +349,17 @@ def read_jobs(ws):
         if is_cron(cron):
             job["cron_text"], job["cron"] = cron.strip(), Cron(cron)
         else:
-            # cron 열이 없으면 실행 간격을 runs·oldest_run·latest_run으로 추정한다
+            # cron이 없으면(trigger로만 도는 job) 실행 간격을 runs·oldest_run·latest_run으로 추정한다
             every = infer_every(to_number(get(COL_RUNS)), to_utc(get(COL_OLDEST)), job["latest"])
             if not every:
                 skipped.append((rn, name, "cron이 없고 runs·oldest_run·latest_run으로 간격도 못 구함"))
                 continue
             job["every"] = every
             job["cron_text"] = f"{every}분마다 (추정)"
-        text = " ".join(str(v) for v in vals[:col(COL_TOTAL_CPU)] if isinstance(v, str))
-        job["group"] = normalize_group(get(group_col)) if group_col and get(group_col) else classify(
-            text, job["cron_text"] if job["cron"] else ("0 * * * *" if job["every"] <= 60 else "0 0 * * *"))
+        job["group"] = normalize_group(get(COL_GROUP)) if get(COL_GROUP) else classify(
+            name, job["cron_text"] if job["cron"] else ("0 * * * *" if job["every"] <= 60 else "0 0 * * *"))
         jobs.append(job)
-    return jobs, skipped, {"cron": cron_col, "name": name_col, "group": group_col}
+    return jobs, skipped
 
 
 NICE_INTERVALS = [1, 2, 3, 5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440, 2880, 4320, 10080]
@@ -535,7 +508,7 @@ def area_chart(title, ws, groups, first_col, label_col, y_title):
     return ch
 
 
-def write_workbook(path, jobs, skipped, detected, groups, per_minute, runs, spans, day, cron_tz, tz_reason, src):
+def write_workbook(path, jobs, skipped, groups, per_minute, runs, spans, day, cron_tz, tz_reason, src):
     wb = Workbook()
     summary = wb.active
     summary.title = "요약"
@@ -576,19 +549,19 @@ def write_workbook(path, jobs, skipped, detected, groups, per_minute, runs, span
 
     # ── job별 실행: 작업 시트 값 + 하루 합계(수식)
     jh = ["작업 시트 행", "종류", "이름", "cron", "하루 실행 횟수", "Start Offset (min)", "Duration (min)",
-          "총 CPU (코어)", "총 메모리 (GB)", "CPU·분 / 일", "메모리 GB·분 / 일", "CPU·분 비중"]
+          "총 CPU (코어)", "총 메모리 (GB)", "CPU·분 / 일", "메모리 GB·분 / 일", "CPU·분 비중", "기능 요약"]
     jb.append(jh)
     last = len(jobs) + 1
     for i, j in enumerate(jobs):
         r = i + 2
         jb.append([j["row"], j["group"], j["name"], j["cron_text"], len(runs.get(i, [])),
                    j["offset"], j["duration"], j["cpu"], j["mem"],
-                   f"=E{r}*G{r}*H{r}", f"=E{r}*G{r}*I{r}", f"=IF(SUM($J$2:$J${last})=0,0,J{r}/SUM($J$2:$J${last}))"])
+                   f"=E{r}*G{r}*H{r}", f"=E{r}*G{r}*I{r}", f"=IF(SUM($J$2:$J${last})=0,0,J{r}/SUM($J$2:$J${last}))", j["desc"]])
         for c, fmt in ((6, "0.0"), (7, "0.0"), (8, "#,##0.0"), (9, "#,##0.0"), (10, "#,##0"), (11, "#,##0"), (12, "0.0%")):
             jb.cell(row=r, column=c).number_format = fmt
     style_header(jb, 1, len(jh))
     jb.freeze_panes = "D2"
-    for c, w in zip("ABCDEFGHIJKL", (9, 17, 34, 15, 10, 11, 11, 11, 12, 12, 14, 10)):
+    for c, w in zip("ABCDEFGHIJKLM", (9, 17, 34, 15, 10, 11, 11, 11, 12, 12, 14, 10, 40)):
         jb.column_dimensions[c].width = w
     set_font(jb)
 
@@ -598,6 +571,7 @@ def write_workbook(path, jobs, skipped, detected, groups, per_minute, runs, span
     s.column_dimensions["B"].width = 18
     s.column_dimensions["C"].width = 16
     s.column_dimensions["D"].width = 50
+    s.column_dimensions["E"].width = 40
     s["A1"] = "하루 리소스 사용량"
     s["A1"].font = Font(name=FONT, bold=True, size=14)
     ct, mt = get_column_letter(cpu_tot), get_column_letter(mem_tot)
@@ -607,7 +581,8 @@ def write_workbook(path, jobs, skipped, detected, groups, per_minute, runs, span
         ("cron 시간대", cron_tz, tz_reason),
         ("Duration 기준", {COL_DUR_AVG: "평균", COL_DUR_MEDIAN: "중앙값", COL_DUR_MAX: "최댓값"}.get(COL_DURATION, COL_DURATION),
          "스크립트 상단 COL_DURATION으로 바꾼다"),
-        ("열 자동 판별", f"cron {detected['cron'] or '없음(간격 추정)'}열 · 이름 {detected['name']}열 · 구분 {(detected['group'] + '열') if detected['group'] else '없음(이름으로 추정)'}", ""),
+        ("읽은 열", f"job_type {COL_GROUP} · cron {COL_CRON} · app name {COL_NAME} · 토탈 {COL_TOTAL_CPU}·{COL_TOTAL_MEM} "
+                   f"· Duration {COL_DURATION} · Start Offset {COL_OFFSET}", "스크립트 상단 설정"),
     ]
     for i, (k, v, note) in enumerate(info, start=3):
         s.cell(row=i, column=1, value=k).font = Font(name=FONT, bold=True, size=10)
@@ -657,12 +632,14 @@ def write_workbook(path, jobs, skipped, detected, groups, per_minute, runs, span
     s.cell(row=r1 + 1, column=2, value="종류")
     s.cell(row=r1 + 1, column=3, value="총 CPU (코어)")
     s.cell(row=r1 + 1, column=4, value="총 메모리 (GB)")
-    style_header(s, r1 + 1, 4)
+    s.cell(row=r1 + 1, column=5, value="기능 요약")
+    style_header(s, r1 + 1, 5)
     for i, j in enumerate(act, start=r1 + 2):
         s.cell(row=i, column=1, value=j["name"])
         s.cell(row=i, column=2, value=j["group"])
         s.cell(row=i, column=3, value=j["cpu"]).number_format = "#,##0.0"
         s.cell(row=i, column=4, value=j["mem"]).number_format = "#,##0.0"
+        s.cell(row=i, column=5, value=j["desc"] or None)
     if skipped:
         r2 = r1 + 3 + len(act)
         s.cell(row=r2, column=1, value=f"계산에서 뺀 행 — {len(skipped)}개").font = Font(name=FONT, bold=True, size=11)
@@ -684,14 +661,15 @@ def main():
     wb = load_workbook(src, data_only=True)       # 수식 셀은 계산된 값으로 읽는다
     ws = wb[sys.argv[2]] if len(sys.argv) > 2 else wb.worksheets[0]
     day = datetime.strptime(sys.argv[3], "%Y%m%d").date() if len(sys.argv) > 3 else datetime.now(KST).date()
-    jobs, skipped, detected = read_jobs(ws)
+    jobs, skipped = read_jobs(ws)
     cron_tz, reason = detect_cron_tz(jobs)
-    print(f"시트 '{ws.title}': job {len(jobs)}개, 제외 {len(skipped)}개 / "
-          f"열 판별: cron {detected['cron'] or '없음(runs·oldest·latest로 간격 추정)'} · 이름 {detected['name']} · 구분 {detected['group'] or '없음(이름으로 추정)'}")
+    guessed = sum(1 for j in jobs if j["every"])
+    print(f"시트 '{ws.title}': job {len(jobs)}개, 제외 {len(skipped)}개"
+          + (f" / cron 없어 간격 추정 {guessed}개" if guessed else ""))
     print(f"cron 시간대: {cron_tz} ({reason}) / 기준일 {day}")
     groups, per_minute, runs, spans = simulate(jobs, day, cron_tz)
     out = src.with_name(f"{src.stem}_리소스시각화.xlsx")
-    write_workbook(out, jobs, skipped, detected, groups, per_minute, runs, spans, day, cron_tz, reason, src.name)
+    write_workbook(out, jobs, skipped, groups, per_minute, runs, spans, day, cron_tz, reason, src.name)
     peak_cpu = max(sum(per_minute["cpu"][m][g] for g in groups) for m in range(NB))
     peak_mem = max(sum(per_minute["mem"][m][g] for g in groups) for m in range(NB))
     print(f"최대 동시 CPU {peak_cpu:,.1f}코어 / 메모리 {peak_mem:,.1f}GB "
