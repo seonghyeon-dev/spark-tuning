@@ -18,7 +18,9 @@
 | **AS-IS** | 튜닝 전 설정·실행 시간 | 시트 이름에 `as-is`가 들어 있으면 (대소문자·기호 무시: `AS-IS`, `asis`, `as_is` 모두) |
 | **TO-BE** | 튜닝 후 설정·실행 시간 | 시트 이름에 `to-be`가 들어 있으면 (`TO-BE`, `tobe` …) |
 
-이름이 다르면 스크립트 상단 `SHEET_ASIS`·`SHEET_TOBE`에 시트 이름을 넣는다.
+- 이름이 **정확히** as-is / to-be인 시트(대소문자·기호 무시)를 먼저 고른다. 그런 시트가 없을 때만 이름에 들어 있는 시트를 쓴다 → `AS-IS(x)`·`DIFF` 같은 다른 시트가 있어도 `AS-IS`·`TO-BE`를 고른다
+- 이름이 다르면 스크립트 상단 `SHEET_ASIS`·`SHEET_TOBE`에 시트 이름을 넣는다
+- 실행 화면 첫 두 줄 `시트 'AS-IS'`·`시트 'TO-BE'`로 고른 시트를 확인한다
 
 시트 한 행 = job 하나. 두 시트 모두 아래 열 위치로 읽는다.
 
@@ -60,7 +62,16 @@ python resource_timeline.py 작업엑셀.xlsx              # 기준일 = 오늘(
 python resource_timeline.py 작업엑셀.xlsx 20260928     # 기준일 지정
 ```
 
-**기준일이 필요한 이유**: rewrite manifests처럼 3일마다 도는 job(`0 6 */3 * *`)은 날짜에 따라 그날 도는지가 다르다. 그래프에 넣고 싶은 날을 고른다.
+**기준일(선택)**: 그래프로 그릴 하루다. 매일·매시·5분마다 도는 job은 날짜와 무관하고, **3일마다 도는 rewrite manifests(`0 6 */3 * *`)만** 그날 도는지가 날짜에 따라 달라진다. 생략하면 오늘. rewrite manifests까지 넣은 그림을 보려면 도는 날(1·4·7…일)을 준다.
+
+**`BadZipFile: File is not a zip file`이 나면**: xlsx는 내부가 zip 파일인데, 넣은 파일이 zip이 아니라는 뜻이다(데이터·시트 문제가 아님). 스크립트가 파일 첫 바이트로 원인을 찍는다.
+
+| 원인 | 조치 |
+|---|---|
+| 사내 보안(DRM) 암호화 | 엑셀은 보안 프로그램이 풀어 주지만 Python은 못 연다 → 보안 해제(반출) 후 실행 |
+| 열기 암호가 걸린 파일 / 옛 .xls 형식 | 암호 제거, 또는 [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)] |
+| CSV 등을 확장자만 .xlsx로 바꾼 파일 | [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)] |
+| `~$`로 시작하는 파일 | 엑셀 잠금 파일이다. 원래 파일 이름을 넣는다 |
 
 실행 화면 예 (예시 데이터):
 
@@ -922,10 +933,37 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
     wb.save(path)
 
 
+def open_workbook(src):
+    """xlsx는 zip 파일이다. zip이 아니면 openpyxl이 BadZipFile로 죽으므로 파일 첫 바이트로 원인을 알려 준다."""
+    if not src.exists():
+        raise SystemExit(f"파일이 없다: {src}")
+    if src.name.startswith("~$"):
+        raise SystemExit(f"'{src.name}'은 엑셀이 파일을 열어 둘 때 만드는 잠금 파일이다 — '~$'가 없는 원래 파일 이름을 넣는다")
+    head = src.read_bytes()[:8]
+    if head[:2] != b"PK":
+        if head == bytes.fromhex("D0CF11E0A1B11AE1"):
+            why = ("① 암호(열기 암호)가 걸린 파일이거나 ② 옛 .xls 형식이다. "
+                   "엑셀에서 열어 [파일 → 정보 → 통합 문서 보호 → 암호 설정]의 암호를 지우거나, "
+                   "[다른 이름으로 저장 → Excel 통합 문서(*.xlsx)]로 저장한다")
+        elif head[:1] in (b"<",) or all(32 <= b < 127 or b in (9, 10, 13) for b in head):
+            why = "CSV·HTML 같은 텍스트 파일이다. 엑셀에서 열어 [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)]로 저장한다"
+        else:
+            why = ("사내 보안(DRM) 암호화가 걸린 파일로 보인다. 엑셀은 보안 프로그램이 풀어 주지만 Python은 못 연다. "
+                   "보안 해제(반출) 후 다시 실행한다")
+        raise SystemExit(f"'{src.name}'은 xlsx 형식이 아니다 (파일 첫 바이트 {head.hex(' ').upper()}) — {why}")
+    return load_workbook(src, data_only=True)     # 수식 셀은 계산된 값으로 읽는다
+
+
 def find_sheets(wb):
+    """이름이 정확히 as-is / to-be인 시트(대소문자·기호 무시)를 먼저 찾는다.
+    없을 때만 이름에 들어 있는 시트를 쓴다 — 'AS-IS(x)' 같은 시트가 앞에 있어도 'AS-IS'를 고른다."""
     key = lambda n: re.sub(r"[^a-z]", "", n.lower())
-    asis = SHEET_ASIS or next((n for n in wb.sheetnames if "asis" in key(n)), None)
-    tobe = SHEET_TOBE or next((n for n in wb.sheetnames if "tobe" in key(n)), None)
+
+    def pick(word):
+        exact = [n for n in wb.sheetnames if key(n) == word]
+        return exact[0] if exact else next((n for n in wb.sheetnames if word in key(n)), None)
+    asis = SHEET_ASIS or pick("asis")
+    tobe = SHEET_TOBE or pick("tobe")
     for label, name in (("as-is", asis), ("to-be", tobe)):
         if not name or name not in wb.sheetnames:
             raise SystemExit(f"{label} 시트를 못 찾았다 (시트: {', '.join(wb.sheetnames)}) — "
@@ -937,7 +975,7 @@ def main():
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
     src = Path(sys.argv[1])
-    wb = load_workbook(src, data_only=True)       # 수식 셀은 계산된 값으로 읽는다
+    wb = open_workbook(src)
     day = datetime.strptime(sys.argv[2], "%Y%m%d").date() if len(sys.argv) > 2 else datetime.now(KST).date()
     names = find_sheets(wb)
     sides = {}
