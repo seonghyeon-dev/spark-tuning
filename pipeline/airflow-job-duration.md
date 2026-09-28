@@ -545,14 +545,11 @@ MySQL 8이면 `PERCENTILE_CONT` 줄(중앙값)과 `::numeric`·`::text`를 빼�
 
 ## 6. 엑셀 반영과 시각화
 
-CSV의 `dag_id`·`target`으로 기존 엑셀 행(cron·CPU·memory)과 맞추고, 두 열을 붙인다.
+CSV의 **F~L열**(runs ~ latest_run)을 기존 작업 시트(cron·CPU·memory가 있는 시트)의 M열부터 붙이고, 시각화 스크립트를 돌린다 → [하루 리소스 사용량 시각화](resource-timeline.md).
 
-| dag_id | target | cron | CPU | Memory | **Duration (min)** | **Start Offset (min)** |
-|---|---|---|---|---|---|---|
+계산은 1장의 두 줄이 전부다. 각 job의 실행마다 `[cron 시각 + Start Offset, + Duration)` 구간 동안 그 job의 CPU·memory를 잡고 있다고 보고, 시각마다 떠 있는 job을 더하면 시각별 실제 동시 사용량이 된다. 순차 실행을 두 번 세지 않도록 6초 간격으로 재고, 그래프는 5분 칸의 최댓값으로 그린다 (시각화 문서 §3).
 
-시각화 계산은 1장의 두 줄이 전부다. 하루 1,440분을 1분 칸으로 나누고, 각 job의 실행마다 `[cron 시각 + Start Offset, + Duration)` 구간의 칸에 그 job의 CPU·memory를 더하면 시각별 실제 동시 사용량이 된다.
-
-> **Duration이 cron 간격보다 길면 앞 실행과 겹친다.** 예를 들어 `*/5` job이 평균 6분 걸리면 항상 두 실행이 동시에 떠 있는 구간이 생긴다. 칸에 더하는 방식이면 이 겹침도 자동으로 반영된다. 단 DAG에 `max_active_runs=1`이 걸려 있으면 겹치지 않고 다음 실행이 밀리며, 그 밀림은 Start Offset이 커지는 것으로 나타난다.
+> **Duration이 cron 간격보다 길면 앞 실행과 겹친다.** 예를 들어 `*/5` job이 평균 6분 걸리면 항상 두 실행이 동시에 떠 있는 구간이 생긴다. 구간을 더하는 방식이면 이 겹침도 자동으로 반영된다. 단 DAG에 `max_active_runs=1`이 걸려 있으면 겹치지 않고 다음 실행이 밀리며, 그 밀림은 Start Offset이 커지는 것으로 나타난다.
 
 ---
 

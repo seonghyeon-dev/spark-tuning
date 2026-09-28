@@ -303,15 +303,16 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **운영 적용 (2026-09-15)**: `backup` CTAS 후 append가 이어져 추가분은 Trino `INSERT INTO ... WHERE ts > <임시 max(ts)>`로 보충(서브쿼리는 파티션 필터 강제에 걸려 리터럴 사용). `load` 완료. 단 `DtTo`를 `20260910`으로 두고 실행해 그 이후 Oracle row와 다른 Oracle에만 있는 row가 `''`로 남음 → **`load`의 INSERT 줄을 UPDATE로, 사후 검수 ②를 `tmp_id 미반영`으로 바꿔 재실행**(절차서 실행 3 하단, 로컬 검증 완료 — 이미 채워진 row 불변, 반복 실행 가능). 별도 모드·함수 분리는 하지 않는다(사용자 결정, PR #68 revert). Oracle 접속 변경은 상수 수동 편집
 - **다음 단계**: 운영에서 UPDATE 버전 `load` 실행(①`DtTo` 수정 ②다른 Oracle 접속) → Trino 확인 → DAG 재개 → 며칠 뒤 임시 `DROP ... PURGE`. (이전) 개발 `backup`→DDL→`load` 전 구간 통과(2026-09-14, 코드 교체 후) — 사전 확인: `DtFrom`/`DtTo`가 운영 데이터 전체 기간을 덮는지, `gc.enabled=false` 여부, Airflow 중지 범위(append 외 Compaction·expire·orphan·재처리 포함), 대상 테이블 최근 2일 `FAILURE`·`IN_PROGRESS` 0건. 운영 적용 (Airflow 중지 → backup → DDL → load → Trino 확인 → 재개 → 며칠 뒤 임시 `DROP ... PURGE`) → 다른 테이블에 같은 절차 반복
 
-## 작업 10: 일일 리소스 사용량 시각화 — 준비 단계 (job 실행 시간 집계 도구 완료)
+## 작업 10: 일일 리소스 사용량 시각화 — 집계·시각화 도구 완료, 사용자 실데이터 적용 대기
 
-- **산출물**: `pipeline/airflow-job-duration.md` — 복붙용 Python 스크립트(REST API v2)와 SQL(PostgreSQL 메타 DB). 둘은 같은 결과를 낸다(가짜 API 서버·PostgreSQL 16으로 대조 확인, 2026-09-28). endpoint·파라미터·응답 필드는 Airflow 3.2.2 OpenAPI 명세로 확인
+- **산출물**: `pipeline/airflow-job-duration.md`(집계), `pipeline/resource-timeline.md`(시각화) — 집계는 복붙용 Python 스크립트(REST API v2)와 SQL(PostgreSQL 메타 DB). 둘은 같은 결과를 낸다(가짜 API 서버·PostgreSQL 16으로 대조 확인, 2026-09-28). endpoint·파라미터·응답 필드는 Airflow 3.2.2 OpenAPI 명세로 확인
 - **배경**: append·Compaction·maintenance의 cron이 달라 CPU·memory 설정 단순 합산은 "전부 동시에 뜬 순간"이라는 없는 값이다. 시각별 실제 동시 사용량을 그리려면 job별 시작·종료가 필요 → **Duration (min)** = task 시작~끝 최근 100회 평균, **Start Offset (min)** = cron 예정 시각(`run_after`) → 실제 시작. 그래프는 `시작 = cron + Start Offset`, `종료 = 시작 + Duration`. 순차 실행(hourly·daily Compaction mapped task)은 Start Offset에 자동 반영. 열 이름은 Delay가 아니라 Offset(순차 실행의 대기는 문제가 아니라 설계된 자리) — 사용자 결정 2026-09-28
 - **DAG 구조 (사용자 공유 2026-09-28)**: 수직분할 4개 append = DAG 1개·테이블별 병렬, task_id `<테이블명>.append_data` / 그 외 테이블 append = 테이블별 DAG, `convert_files.append_data` / summary = 테이블별 DAG `iceberg_summary_<alias>`, task 3개 중 Spark job `summary_<alias>`만(대상 = alias) / hourly·daily Compaction = mapped task `compaction`(테이블은 `rendered_map_index`, hourly·daily는 DAG cron의 시 자리로 구분) / `iceberg_rewrite_manifests`·`iceberg_delete_orphan_files` = 테이블별 task `1_테이블명`~`25_테이블명` / `iceberg_delete_expired_data` = 같은 번호 TaskGroup 안에 `validate_target_dt`·`del_expired_data`·`del_expired_snapshots`, Spark job은 **`del_expired_snapshots`만**. 대상 이름은 번호를 떼고 테이블명. `get_jobs`·`update_*`·`validate_target_dt`·`del_expired_data`는 제외
 - **필터**: `run_id_prefix_pattern=scheduled`(재처리 trigger한 `manual__` 실행 제외 — 20시간치 Compaction이 평균을 튀게 함), `state=success`. API는 페이지당 최대 100(`maximum_page_limit`)이라 mapped task는 페이지를 넘겨 테이블별 100회를 채움
 - **Airflow Duration ≠ DataFlint duration** — Airflow는 pod 기동·spark-submit 포함. 리소스 점유 시각화에는 Airflow 값이 맞다
 - **출력 (사용자 요청 2026-09-28)**: `job_type` 순 정렬 append → summary → hourly compaction → daily compaction → expired snapshot → delete orphan → rewrite manifest(→ other), 같은 종류 안에서 테이블명 오름차순, **`번호_테이블명` task는 번호 순(숫자 비교, 1·2·…·10)**. **rewrite manifest DAG의 정확한 dag_id는 `iceberg_rewrite_manifests`**(끝에 s, 사용자 확인 2026-09-28) — 처음에 `iceberg_rewrite_manifest`로 적어 `other`로 나왔다. delete orphan은 `iceberg_delete_orphan_files`. 둘 다 dag_id 완전 일치로 판별. **기간 지정** `python job_durations.py <시작> [<끝>]` — `YYYYMMDD`/`YYYYMMDDHH`/`YYYYMMDDHHMM`(KST), **끝 값은 적은 단위까지 포함**(`20260922` → 23:59, `2026092218` → 18:59, 하나만 주면 그 단위 하나), cron 예정 시각(`run_after`) 기준 실행 **전부**(100회 제한 없음). 실행 첫 줄에 해석한 기간 출력. 인자 없으면 최근 100회. SQL은 `params` CTE로 같은 기능. 평균 vs 중앙값 — 차이가 크면 튀는 실행이 섞인 것, 평소 모양은 중앙값·자원 산정은 평균/최댓값
-- **다음 단계**: 사용자가 스크립트 실행 → CSV를 엑셀(cron·CPU·memory)에 붙임 → 1분 칸 × 1,440 누적으로 시각별 동시 core·memory 그래프(Compaction은 평소 시작 대수, 재처리 36대는 별도 시나리오)
+- **시각화 (`resource_timeline.py`, 2026-09-28)**: 작업 시트 레이아웃 = A~C 구분·이름·cron(값으로 자동 판별) / D~J 드라이버 cpu·메모리·오버헤드, 익스큐터 cpu·메모리·오버헤드·개수 / **K 토탈 cpu · L 토탈 메모리** / **M~S = CSV F~L**(runs, Duration, median, max, Start Offset, oldest_run, latest_run) (사용자 공유). 결과는 새 파일 `<원본>_리소스시각화.xlsx`(시트 요약·시각별 사용량·job별 실행, job 종류별 누적 면적 그래프 CPU·메모리 2개). 계산: 실행 구간 `[cron + Offset, + Duration)`, **6초 간격 측정**(순차 실행 hourly Compaction을 1분 칸 합산으로 두 번 세는 오류 방지), **그래프는 5분 칸 최댓값**(`BUCKET_MIN` — 1분이면 append 5분 주기 톱니로 판독 불가). cron 시간대는 latest_run으로 UTC/KST 자동 판단, cron 열이 없으면 `(latest − oldest) ÷ (runs − 1)`로 간격 추정. **LibreOffice로 다시 저장하면 x축 `tickLblSkip`(정시 눈금)이 빠진다** → 스크립트 출력 파일을 그대로 쓰고 `fullCalcOnLoad`로 엑셀이 열 때 수식 계산. 예시 데이터: 단순 합산 588코어 vs 실제 최대 129코어(22%, daily Compaction 구간 + 매시 :45 hourly 겹침)
+- **다음 단계**: 사용자가 실데이터로 시각화 실행 → 결과 확인(자동 판별·cron 시간대). Compaction은 평소 시작 대수로 그리고, 재처리 36대는 K·L을 바꾼 시트로 별도 시나리오
 
 ## 파일 구조
 
@@ -353,6 +354,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
     │   └── iceberg_reprocess.py        # 재처리 DAG 정의 (신규 파일은 이것 하나)
     ├── recreate-table-tmp-id.md        # 테이블 재생성 + tmp_id(NOT NULL) 추가 절차서 (코드·DDL 포함, 작업 9)
     ├── airflow-job-duration.md         # job별 Duration·Start Offset 집계 (리소스 시각화용, 작업 10)
+    ├── resource-timeline.md            # 하루 리소스 사용량 시각화 스크립트 (엑셀 그래프, 작업 10)
     └── examples/
         ├── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
         ├── compaction_dag_example.py          # Compaction DAG 변경(tables 필터 = mapped task) 예시
