@@ -89,7 +89,7 @@ hourly compaction은 테이블을 순서대로 돈다. 1번이 47:36에 끝나�
 
 B열(cron)이 비어 있거나 cron 식이 아니면 그 행만 `(latest_run − oldest_run) ÷ (runs − 1)`로 간격을 구한다. 예: 최근 100회가 99시간에 걸쳐 있으면 99시간 ÷ 99 = 60분 → 매시 실행, 시작 분은 latest_run의 분. 실패한 실행이 빠져 조금 길게 나오므로 가까운 정규 간격(5·10·15·30·60분, 1·2·3일 등)으로 맞춘다. `job별 실행` 시트의 cron 칸에 `60분마다 (추정)`으로 표시된다.
 
-- **trigger로만 도는 테이블은 추정 대신 B열에 부모 cron을 적는 것이 정확하다.** 집계 스크립트에 부모를 지정하면(`TRIGGER_TABLES`) Start Offset이 "부모 cron 시각 → 이 테이블 실제 시작"으로 나오므로, B열 `*/5 * * * *` + 그 Offset이면 부모가 도는 5분마다, 부모가 끝나는 자리에 그려진다 ([집계 문서](airflow-job-duration.md) §4.4). 추정으로 그리면 간격은 5분으로 맞지만 시작 자리를 latest_run 한 번에 맞추므로 덜 정확하다
+- **trigger로만 도는 테이블은 추정 대신 B열에 부모 cron을 적는 것이 정확하다.** 집계 스크립트에 부모를 지정하면(`TRIGGER_TABLES`) Start Offset이 "부모 cron 시각 → 이 테이블 실제 시작"으로 나오므로, B열 `*/5 * * * *` + 그 Offset이면 부모가 도는 5분마다, 부모가 끝나는 자리에 그려진다 ([집계 문서](airflow-job-duration.md) §3.4). 추정으로 그리면 간격은 5분으로 맞지만 시작 자리를 latest_run 한 번에 맞추므로 덜 정확하다
 - 3일마다 도는 job은 cron(`*/3`, 매달 1일 기준)과 추정(최근 실행 + 3일 간격)이 월말에 어긋날 수 있다. cron이 있는 job은 B열에 적어 둔다
 
 ### 3.5 cron 시간대 판단
@@ -128,7 +128,7 @@ Airflow cron은 UTC로 적었을 수도, KST로 적었을 수도 있다. 스크�
 | 항목 | 내용 |
 |---|---|
 | Compaction executor 수 | Dynamic Allocation이라 평소 1시간치는 시작 대수(1번 12, 2번 8, 3·4번 12)로 K·L을 채운다. 재처리처럼 여러 시간치를 돌 때만 최대 36대까지 늘어나므로, 그 경우는 K·L을 36대 기준으로 바꾼 시트로 한 번 더 돌려 별도 그림으로 본다 (`compaction-executor-sizing-design.md` §5.5) |
-| Duration = Airflow 기준 | pod 기동·spark-submit이 포함된 시간이라 자원 점유 시간에 맞다 ([집계 문서](airflow-job-duration.md) §7) |
+| Duration = Airflow 기준 | pod 기동·spark-submit이 포함된 시간이라 자원 점유 시간에 맞다 ([집계 문서](airflow-job-duration.md) §5) |
 | 수동 실행 | `job_durations.py`가 `scheduled` 실행만 집계하므로 재처리가 trigger한 Compaction은 그래프에 없다 |
 | Duration이 cron 간격보다 길 때 | 앞 실행과 겹치는 구간이 자동으로 두 번 더해진다. DAG에 `max_active_runs=1`이 있으면 실제로는 겹치지 않고 밀리며, 그 밀림은 Start Offset에 이미 들어 있다 |
 | 작업 시트를 고치면 | 그래프는 스크립트가 계산한 값이다. 작업 시트 값이 바뀌면 스크립트를 다시 돌린다 |

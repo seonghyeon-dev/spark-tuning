@@ -4,8 +4,8 @@
 |------|------|
 | 목적 | 하루 동안 시각별로 실제 동시에 떠 있는 core·memory를 그리기 위해, job별 **Duration**과 **Start Offset**을 최근 100회 실측으로 구한다 |
 | 대상 | append·Compaction·maintenance 등 Spark pod를 띄우는 task 전부 |
-| 방법 | Airflow 3.x REST API v2 (권장, Python) 또는 메타데이터 DB SQL — 두 결과는 같다 |
-| 검증 | Airflow 3.2.2 OpenAPI 명세로 endpoint·파라미터·응답 필드 확인. 운영과 같은 구조의 DAG(append 2종, summary, hourly·daily Compaction mapped task, maintenance 3종)를 가짜 Airflow API 서버와 PostgreSQL 16에 넣고 두 방법의 결과가 순서·값까지 일치함을 확인. 기간 지정(일·시·분 단위)도 손으로 센 실행 횟수와 일치 (2026-09-28) |
+| 방법 | Airflow 3.x REST API v2 (Python 스크립트) |
+| 검증 | Airflow 3.2.2 OpenAPI 명세로 endpoint·파라미터·응답 필드 확인. 운영과 같은 구조의 DAG(append 2종, summary, hourly·daily Compaction mapped task, maintenance 3종)를 가짜 Airflow API 서버에 넣고 결과를 손으로 센 값과 대조. 기간 지정(일·시·분 단위)도 손으로 센 실행 횟수와 일치 (2026-09-28) |
 
 ---
 
@@ -38,20 +38,7 @@
 
 ---
 
-## 2. 방법 선택 — REST API를 권장한다
-
-| | REST API (Python) | 메타데이터 DB (SQL) |
-|---|---|---|
-| 접근 | Airflow 계정 하나. 읽기 전용 | DB 접속 정보 필요. 운영 DB에 직접 쿼리 |
-| 버전 업그레이드 | API v2는 공개 규약이라 유지된다 | 테이블 구조가 바뀔 수 있다 (예: `dag_run.run_after`는 3.0에서 생긴 컬럼) |
-| 편의 | 대상 task 자동 선택, CSV 바로 저장, cron까지 같이 가져옴 | 쿼리 한 번. 가장 빠름 |
-| 단점 | 한 번에 100개까지만 줘서 페이지를 넘긴다 (스크립트가 처리) | 집계 대상 task 이름을 쿼리에 직접 적어야 한다 |
-
-DB에도 붙을 수 있으면 둘 다 쓸 수 있다. **정기적으로 다시 뽑을 거라면 REST API**, 한 번 확인용이면 SQL이 빠르다.
-
----
-
-## 3. DAG 구조별 집계 대상
+## 2. DAG 구조별 집계 대상
 
 Spark pod를 띄우는 task만 센다. 아래 task는 Spark job이 아니므로 뺀다.
 
@@ -76,9 +63,9 @@ Spark pod를 띄우는 task만 센다. 아래 task는 Spark job이 아니므로 
 
 ---
 
-## 4. Python 스크립트 (REST API) — 권장
+## 3. Python 스크립트 (REST API)
 
-### 4.1 실행
+### 3.1 실행
 
 ```bash
 pip install requests
@@ -108,7 +95,7 @@ python job_durations.py 20260921 20260922            # 기간 지정 (아래 표
 - 기간은 **cron 예정 시각**(`run_after`)으로 자른다. 9/21 23:45에 시작 예정이던 hourly Compaction은 실제로 9/22 0시를 넘겨 끝나도 9/21에 들어간다
 - 결과는 엑셀에서 바로 열린다(한글 깨짐 방지 인코딩). 정렬은 append → summary → hourly Compaction → daily Compaction → expired snapshot → delete orphan → rewrite manifest 순이다. 같은 종류 안에서는 테이블명 오름차순이고, task_id가 `1_테이블명`처럼 **번호로 시작하는 task(expired snapshot·delete orphan·rewrite manifest)는 번호 순**이다. 번호는 숫자로 비교하므로 1, 2, …, 9, 10 순서가 된다(글자 순이면 1, 10, 2가 된다)
 
-### 4.2 고칠 수 있는 설정 (스크립트 상단)
+### 3.2 고칠 수 있는 설정 (스크립트 상단)
 
 | 설정 | 기본값 | 언제 바꾸나 |
 |------|--------|------------|
@@ -118,14 +105,14 @@ python job_durations.py 20260921 20260922            # 기간 지정 (아래 표
 | `TASK_PREFIXES` | `summary_` | 이 접두어로 시작하는 task를 집계. 대상 이름은 접두어를 뗀 alias |
 | `NUMBERED_TASK` | `^\d+_` | `번호_테이블명` 형태 task를 잡는 규칙 (rewrite manifests·orphan 삭제). 대상 이름에서 번호를 뗀다 |
 | `MATCH_SPARK_OPERATOR` | `True` | operator 이름에 `Spark`가 든 task를 자동 포함. 위 두 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치 |
-| `TRIGGER_TABLES` | `{}` | **trigger로만 도는 테이블** → `{테이블명 또는 dag_id: trigger하는 부모 dag_id}`. 실행 종류를 가리지 않고 성공 실행을 전부 세고, Start Offset을 부모 cron 시각 기준으로 잰다 (§4.4). 예) `{"table_t": "append_vertical"}` |
+| `TRIGGER_TABLES` | `{}` | **trigger로만 도는 테이블** → `{테이블명 또는 dag_id: trigger하는 부모 dag_id}`. 실행 종류를 가리지 않고 성공 실행을 전부 세고, Start Offset을 부모 cron 시각 기준으로 잰다 (§3.4). 예) `{"table_t": "append_vertical"}` |
 | `DAG_ID_PREFIX` | `None` (전체) | 특정 DAG만 볼 때 dag_id 접두어 |
 | `GENERIC_GROUPS` | `convert_files` | 테이블명이 아닌 TaskGroup 이름. 이 그룹이면 target을 dag_id로 표시 |
 | `VERIFY` | `True` | 사내 인증서를 쓰면 CA 파일 경로 |
 | `MAX_PAGES` | 100 | task 하나당 최대 몇 페이지(100건씩)를 훑을지. 긴 기간을 줄 때 모자라면 경고가 뜬다 |
 | `JOB_TYPE_ORDER` | append … rewrite manifest, other | 출력 정렬 순서. 순서를 바꾸려면 이 목록만 바꾼다. 같은 종류 안에서는 테이블명 순이고, `번호_테이블명` task는 번호 순이다 |
 
-### 4.3 스크립트
+### 3.3 스크립트
 
 ```python
 """Airflow Spark job의 Duration·Start Offset 집계 (Airflow 3.x REST API v2).
@@ -394,7 +381,7 @@ def sort_key(r):
 
 
 def to_min(seconds):
-    """초 → 분, 소수점 1자리 (반올림은 SQL ROUND와 같은 사사오입)."""
+    """초 → 분, 소수점 1자리 (사사오입. Python round()는 0.25 → 0.2처럼 짝수 쪽으로 가서 쓰지 않는다)."""
     return float(Decimal(str(seconds / 60)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
 
 
@@ -463,7 +450,7 @@ if __name__ == "__main__":
     main()
 ```
 
-### 4.4 무엇을 거르는가
+### 3.4 무엇을 거르는가
 
 | 필터 | 이유 |
 |------|------|
@@ -492,7 +479,7 @@ if __name__ == "__main__":
 - 부모가 실패하면 trigger가 없으므로 그 5분은 비지만, 평균 모양에는 거의 영향이 없다
 - 실행 화면에 `(trigger 실행, Offset·cron = 부모 … 기준, 짝 100/100)`이 붙는다. 부모 실행을 하나도 못 찾으면 경고와 함께 자기 trigger 시각 기준으로 잰다
 
-### 4.5 출력 형식
+### 3.5 출력 형식
 
 아래는 가짜 데이터로 돌린 **형식 예시**다. 숫자는 실측이 아니다.
 
@@ -517,7 +504,7 @@ rewrite manifest,iceberg_rewrite_manifests,10_echo,echo,0 6 */3 * *,60,0.8,0.8,0
 | `Duration max (min)` | 최댓값. peak를 보수적으로 그릴 때 평균 대신 쓴다 |
 | `oldest_run`·`latest_run` | 평균에 쓴 실행 중 가장 오래된·최근 실행의 cron 시각 (UTC). `latest_run`이 오래됐으면 멈춘 DAG다 |
 
-### 4.6 Duration 평균과 중앙값의 차이
+### 3.6 Duration 평균과 중앙값의 차이
 
 - **평균(`Duration (min)`)** = 100회의 시간을 모두 더해 100으로 나눈 값
 - **중앙값(`Duration median (min)`)** = 100회를 짧은 순으로 줄 세웠을 때 가운데(50·51번째) 값
@@ -538,119 +525,7 @@ rewrite manifest,iceberg_rewrite_manifests,10_echo,echo,0 6 */3 * *,60,0.8,0.8,0
 
 ---
 
-## 5. SQL (메타데이터 DB 직접) — PostgreSQL
-
-위 스크립트와 같은 결과를 같은 순서로 쿼리 한 번에 낸다. 대상 task는 `WHERE`의 task 조건에 직접 적는다. SQL은 operator 이름을 모르므로 `MATCH_SPARK_OPERATOR`에 해당하는 자동 포함은 없다 — 새 Spark task는 `OR ti.task_id LIKE '%<이름>'`으로 추가한다.
-
-**기간 지정**은 맨 위 `params`의 `NULL` 두 개를 바꾼다. 비워 두면 job별 최근 100회, 채우면 그 기간 전부다. `period_to`는 **포함하지 않는 끝 시각**이다. 9/21~9/22 하루 단위면 `'2026-09-23 00:00:00+09'`, 9/21 09:00~18:59면 `'2026-09-21 19:00:00+09'`, 9/21 09:30~18:30이면 `'2026-09-21 18:31:00+09'`로 적는다.
-
-**trigger로만 도는 테이블**은 `trigger_map`에 `(테이블명 또는 dag_id, 부모 dag_id)`로 넣는다(예: `VALUES ('table_t', 'append_vertical')`). Python의 `TRIGGER_TABLES`와 같은 규칙이다 (§4.4). 부모 실행의 종료 시각은 `dag_run.end_date`를 쓴다.
-
-```sql
--- Airflow 3.x 메타데이터 DB (PostgreSQL) — Spark job의 Duration·Start Offset
--- 기간 지정: 아래 params의 NULL 두 개를 바꾼다. 비워 두면 job별 최근 100회
--- trigger로만 도는 테이블: trigger_map에 (테이블명 또는 dag_id, trigger하는 부모 dag_id)를 넣는다
---   → 실행 종류를 가리지 않고 집계, Start Offset은 부모 cron 시각 기준, cron 칸은 부모 cron
-WITH params AS (
-  SELECT NULL::timestamptz AS period_from,   -- 예) TIMESTAMPTZ '2026-09-21 00:00:00+09'
-         NULL::timestamptz AS period_to      -- 예) TIMESTAMPTZ '2026-09-23 00:00:00+09'  (종료일 다음 날 0시)
-),
-trigger_map(name, parent_dag) AS (
-  VALUES (NULL::text, NULL::text)            -- 예) ('table_t', 'append_vertical')
-),
-recent AS (
-  SELECT ti.dag_id,
-         ti.task_id,
-         COALESCE(CASE WHEN tm.parent_dag IS NOT NULL THEN pd.timetable_summary
-                       ELSE d.timetable_summary END, '')                 AS cron,
-         COALESCE(ti.rendered_map_index,                                  -- mapped: 테이블명
-                  CASE WHEN ti.map_index >= 0 THEN ti.map_index::text END) AS map_key,
-         ti.duration,                                                     -- 초
-         EXTRACT(EPOCH FROM ti.start_date - dr.run_after) AS offset_sec,  -- cron 시각 → 실제 시작
-         EXTRACT(EPOCH FROM ti.start_date - par.run_after) AS parent_offset_sec,  -- trigger 테이블: 부모 cron 시각 → 실제 시작
-         dr.run_after,
-         ROW_NUMBER() OVER (
-           PARTITION BY ti.dag_id, ti.task_id,
-                        COALESCE(ti.rendered_map_index, ti.map_index::text)
-           ORDER BY dr.run_after DESC) AS rn
-  FROM task_instance ti
-  JOIN dag_run dr ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id
-  LEFT JOIN dag d ON d.dag_id = ti.dag_id
-  LEFT JOIN trigger_map tm ON ti.dag_id || '.' || ti.task_id ~ ('(^|[._])' || tm.name || '($|[._])')
-  LEFT JOIN dag pd ON pd.dag_id = tm.parent_dag
-  LEFT JOIN LATERAL (                       -- 이 실행을 trigger한 부모 실행: trigger 시각 이전 1시간 안에 시작했고
-    SELECT pr.run_after                     -- 종료 시각이 trigger 시각에 가장 가까운 것 (부모가 끝나며 trigger)
-    FROM dag_run pr
-    WHERE pr.dag_id = tm.parent_dag AND pr.run_type = 'scheduled' AND pr.end_date IS NOT NULL
-      AND pr.run_after <= dr.run_after AND pr.run_after > dr.run_after - INTERVAL '1 hour'
-    ORDER BY abs(EXTRACT(EPOCH FROM pr.end_date - dr.run_after))
-    LIMIT 1) par ON true
-  CROSS JOIN params p
-  WHERE ti.state = 'success'
-    AND (dr.run_type = 'scheduled'          -- 재처리·수동 trigger 제외
-         OR tm.name IS NOT NULL)            -- 단, trigger로만 도는 테이블은 전부
-    AND ti.duration IS NOT NULL
-    AND ti.start_date IS NOT NULL
-    AND (p.period_from IS NULL OR dr.run_after >= p.period_from)
-    AND (p.period_to   IS NULL OR dr.run_after <  p.period_to)
-    AND (ti.task_id LIKE '%append_data'               -- append
-         OR ti.task_id ~ '^summary_'                     -- iceberg_summary_<alias> 의 summary_<alias>
-         OR ti.task_id LIKE '%compaction'                -- hourly·daily Compaction (mapped)
-         OR ti.task_id LIKE '%del_expired_snapshots'     -- iceberg_delete_expired_data 의 snapshot 삭제
-         OR ti.task_id ~ '^[0-9]+_[^.]*$')              -- rewrite_manifest·delete_orphan_files: "번호_테이블명"
-),
-labeled AS (
-  SELECT r.*,
-         CASE WHEN task_id LIKE '%append_data' THEN 'append'
-              WHEN task_id ~ '^summary_' THEN 'summary'
-              WHEN task_id LIKE '%compaction'
-                   THEN CASE WHEN cron = '@hourly' OR split_part(cron, ' ', 2) IN ('*', '*/1')
-                             THEN 'hourly compaction' ELSE 'daily compaction' END
-              WHEN task_id LIKE '%del_expired_snapshots' THEN 'expired snapshot'
-              WHEN dag_id = 'iceberg_delete_orphan_files' THEN 'delete orphan'
-              WHEN dag_id = 'iceberg_rewrite_manifests' THEN 'rewrite manifest'
-              ELSE 'other' END                                            AS job_type,
-         CASE WHEN map_key IS NOT NULL THEN map_key                       -- Compaction: 테이블명
-              WHEN task_id ~ '^summary_' THEN substr(task_id, 9)          -- summary_<alias> → alias
-              WHEN task_id LIKE 'convert_files.%' THEN dag_id             -- 테이블별 append DAG
-              WHEN task_id LIKE '%.%'                                     -- TaskGroup: 번호 떼고 테이블명
-                   THEN regexp_replace(split_part(task_id, '.', 1), '^[0-9]+_', '')
-              WHEN task_id ~ '^[0-9]+_' THEN regexp_replace(task_id, '^[0-9]+_', '')
-              ELSE dag_id END                                             AS target
-  FROM recent r CROSS JOIN params p
-  WHERE r.rn <= 100 OR p.period_from IS NOT NULL   -- 기간을 주면 그 기간 전부
-)
-SELECT job_type,
-       dag_id,
-       task_id,
-       target,
-       cron,
-       COUNT(*)                                                          AS runs,
-       ROUND(AVG(duration)::numeric / 60, 1)                             AS "Duration (min)",
-       ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration))::numeric / 60, 1)
-                                                                         AS "Duration median (min)",
-       ROUND(MAX(duration)::numeric / 60, 1)                             AS "Duration max (min)",
-       ROUND(COALESCE(AVG(parent_offset_sec), AVG(offset_sec))::numeric / 60, 1)
-                                                                         AS "Start Offset (min)",
-       MIN(run_after)                                                    AS oldest_run,
-       MAX(run_after)                                                    AS latest_run
-FROM labeled
-GROUP BY job_type, dag_id, task_id, target, cron
-ORDER BY array_position(ARRAY['append', 'summary', 'hourly compaction', 'daily compaction',
-                              'expired snapshot', 'delete orphan', 'rewrite manifest', 'other'],
-                        job_type),
-         (task_id !~ '^[0-9]+_'),                                          -- "번호_테이블명" task 먼저
-         CASE WHEN task_id ~ '^[0-9]+_' THEN dag_id ELSE target END,
-         CASE WHEN task_id ~ '^[0-9]+_'                                    -- 번호는 숫자로 비교 (1, 2, …, 10)
-              THEN substring(task_id FROM '^([0-9]+)_')::int END,
-         dag_id, task_id;
-```
-
-MySQL 8이면 `PERCENTILE_CONT` 줄(중앙값)과 `::numeric`·`::text`를 빼고, `split_part`를 `SUBSTRING_INDEX(task_id, '.', 1)`로, `~ '...'`를 `REGEXP '...'`로 바꾼다(`regexp_replace`는 MySQL 8에도 있다).
-
----
-
-## 6. 엑셀 반영과 시각화
+## 4. 엑셀 반영과 시각화
 
 CSV의 **F~L열**(runs ~ latest_run)을 기존 작업 시트(cron·CPU·memory가 있는 시트)의 M열부터 붙이고, 시각화 스크립트를 돌린다 → [하루 리소스 사용량 시각화](resource-timeline.md).
 
@@ -660,7 +535,7 @@ CSV의 **F~L열**(runs ~ latest_run)을 기존 작업 시트(cron·CPU·memory�
 
 ---
 
-## 7. 알아둘 점
+## 5. 알아둘 점
 
 | 항목 | 내용 |
 |------|------|
@@ -669,5 +544,5 @@ CSV의 **F~L열**(runs ~ latest_run)을 기존 작업 시트(cron·CPU·memory�
 | executor 수 | Compaction은 Dynamic Allocation이라 평소 1시간치는 시작 대수(1번 12, 2번 8, 3·4번 12)로 그린다. 재처리처럼 여러 시간치를 돌 때만 최대 36대까지 늘어나므로 별도 시나리오로 그린다 (`compaction-executor-sizing-design.md` §5.5) |
 | memory | executor pod 한 대 = executor memory + `memoryOverhead`. 예: 3번 테이블 18g + 3g = 21g |
 | 재시도된 실행 | Airflow는 마지막 시도만 남긴다. 재시도 전 시간은 Duration·Offset에 안 들어간다 |
-| 시간대 | API·DB의 시각은 UTC다. Offset은 두 시각의 차이라 시간대와 무관하다 |
+| 시간대 | API의 시각은 UTC다. Offset은 두 시각의 차이라 시간대와 무관하다 |
 | 인증 | `POST /auth/token`에 계정·비밀번호를 보내 받은 토큰(JWT)을 쓴다. Airflow 3의 기본 로그인(Simple·FAB auth manager) 기준이며, SSO 등 다른 방식이면 토큰 발급 방법이 다르다. 401이 나면 이 부분을 먼저 확인 |
