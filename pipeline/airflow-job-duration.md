@@ -118,6 +118,7 @@ python job_durations.py 20260921 20260922            # 기간 지정 (아래 표
 | `TASK_PREFIXES` | `summary_` | 이 접두어로 시작하는 task를 집계. 대상 이름은 접두어를 뗀 alias |
 | `NUMBERED_TASK` | `^\d+_` | `번호_테이블명` 형태 task를 잡는 규칙 (rewrite manifests·orphan 삭제). 대상 이름에서 번호를 뗀다 |
 | `MATCH_SPARK_OPERATOR` | `True` | operator 이름에 `Spark`가 든 task를 자동 포함. 위 두 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치 |
+| `TRIGGER_TABLES` | `[]` | **trigger로만 도는 테이블**의 테이블명 또는 dag_id. 여기 넣은 테이블은 실행 종류를 가리지 않고 성공 실행을 전부 센다 (§4.4). 예) `["table_t"]` |
 | `DAG_ID_PREFIX` | `None` (전체) | 특정 DAG만 볼 때 dag_id 접두어 |
 | `GENERIC_GROUPS` | `convert_files` | 테이블명이 아닌 TaskGroup 이름. 이 그룹이면 target을 dag_id로 표시 |
 | `VERIFY` | `True` | 사내 인증서를 쓰면 CA 파일 경로 |
@@ -170,6 +171,9 @@ TASK_PREFIXES = ("summary_",)
 NUMBERED_TASK = re.compile(r"^\d+_")
 # operator 이름에 "Spark"가 들어간 task도 자동 포함 (위 규칙에 안 걸리는 Spark task를 놓치지 않기 위한 안전장치)
 MATCH_SPARK_OPERATOR = True
+# trigger로만 도는 테이블 — 여기 넣은 테이블은 실행 종류를 가리지 않고 성공 실행을 전부 집계한다.
+# 나머지 job은 cron으로 돈 실행(scheduled)만 센다. 테이블명 또는 dag_id를 넣는다. 예) ["table_t"]
+TRIGGER_TABLES = []
 # 특정 DAG만 볼 때 접두어 (None이면 전체 DAG)
 DAG_ID_PREFIX = None
 # 이 TaskGroup 이름은 테이블명이 아니다 → 대상(target)을 dag_id로 표시
@@ -260,12 +264,23 @@ def target_tasks(dag_id):
     return picked
 
 
-def collect_runs(dag_id, task_id, is_mapped, period):
-    """cron으로 돈(scheduled) 성공 실행만, 최신순.
+def name_in(name, dag_id, task_id):
+    """name이 dag_id·task_id 안에 단어로 들어 있나.
+    앞뒤가 문자열 끝이나 . _ 이어야 한다 → table_1을 넣어도 table_10은 안 걸린다."""
+    return re.search(rf"(^|[._]){re.escape(name)}($|[._])", f"{dag_id}.{task_id}") is not None
+
+
+def is_trigger_table(dag_id, task_id):
+    return any(name_in(t, dag_id, task_id) for t in TRIGGER_TABLES)
+
+
+def collect_runs(dag_id, task_id, is_mapped, period, all_runs=False):
+    """성공 실행만, 최신순. cron으로 돈(scheduled) 실행만 세고, all_runs면 trigger 실행도 센다.
     기간이 없으면 최근 N_RUNS회, 있으면 그 기간 전부. mapped task는 테이블별로 센다."""
     params = {"task_id": task_id, "state": "success",
-              "run_id_prefix_pattern": "scheduled",   # 재처리·수동 trigger(manual__) 제외
               "order_by": "-run_after", "limit": 100}
+    if not all_runs:
+        params["run_id_prefix_pattern"] = "scheduled"   # 재처리·수동 trigger(manual__) 제외
     if period:
         params["run_after_gte"], params["run_after_lt"] = (
             t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") for t in period)
@@ -360,7 +375,8 @@ def main():
     rows = []
     for dag_id, cron in list_dags():
         for task_id, is_mapped in target_tasks(dag_id):
-            for key, tis in collect_runs(dag_id, task_id, is_mapped, period).items():
+            all_runs = is_trigger_table(dag_id, task_id)
+            for key, tis in collect_runs(dag_id, task_id, is_mapped, period, all_runs).items():
                 durations = [ti["duration"] for ti in tis]
                 offsets = [(parse_time(ti["start_date"]) - parse_time(ti["run_after"])).total_seconds()
                            for ti in tis]
@@ -380,9 +396,13 @@ def main():
                 })
                 r = rows[-1]
                 print(f"{r['job_type']:18s} {dag_id:34s} {r['target']:20s} runs={len(tis):4d} "
-                      f"dur={r['Duration (min)']:5.1f} offset={r['Start Offset (min)']:5.1f}")
+                      f"dur={r['Duration (min)']:5.1f} offset={r['Start Offset (min)']:5.1f}"
+                      + ("  (trigger 실행 포함)" if all_runs else ""))
     if not rows:
         raise SystemExit("집계 대상이 없다 — 기간·TASK_NAMES·DAG_ID_PREFIX를 확인")
+    for t in TRIGGER_TABLES:
+        if not any(name_in(t, r["dag_id"], r["task_id"]) for r in rows):
+            print(f"  ⚠ TRIGGER_TABLES의 '{t}'에 해당하는 행이 없다 — 이름(테이블명·dag_id)과 기간을 확인")
     rows.sort(key=sort_key)
     with open(output, "w", newline="", encoding="utf-8-sig") as f:   # utf-8-sig: 엑셀 한글 깨짐 방지
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -400,6 +420,7 @@ if __name__ == "__main__":
 | 필터 | 이유 |
 |------|------|
 | `run_id_prefix_pattern=scheduled` | **cron으로 돈 실행만.** 재처리 DAG가 trigger한 Compaction(20시간치면 10분 이상)은 run_id가 `manual__`로 시작해 빠진다. 이게 섞이면 평균이 튄다 |
+| 단, `TRIGGER_TABLES`의 테이블은 이 필터를 끈다 | cron 없이 다른 DAG의 trigger로만 도는 테이블은 실행이 전부 `manual__` 등이라 위 필터에 전부 걸려 **CSV에서 통째로 빠진다**. 이 테이블만 실행 종류를 가리지 않는다. 이름은 dag_id·task_id 안에 단어로 들어 있어야 걸린다(앞뒤가 끝이나 `.`·`_` — `table_1`을 넣어도 `table_10`은 안 걸린다). 걸린 행은 실행 화면에 `(trigger 실행 포함)`이 붙고, 아무 행에도 안 걸린 이름은 경고가 뜬다. cron이 없으니 CSV의 cron 칸은 비고, 시각화 스크립트가 실행 간격을 추정한다 ([시각화 문서](resource-timeline.md) §3.4). Start Offset은 trigger된 시각 → 실제 시작이다 |
 | `state=success` | 실패한 실행은 중간에 끊겨 duration이 짧게 잡힌다 |
 | `order_by=-run_after` | 최신순. 앞에서부터 N회만 쓴다 |
 | mapped task는 테이블별로 N회 | 한 DAG 실행에 테이블 4개가 있으므로 페이지를 넘기며 테이블마다 100회를 채운다 |
@@ -457,12 +478,16 @@ rewrite manifest,iceberg_rewrite_manifests,10_echo,echo,0 6 */3 * *,60,0.8,0.8,0
 
 **기간 지정**은 맨 위 `params`의 `NULL` 두 개를 바꾼다. 비워 두면 job별 최근 100회, 채우면 그 기간 전부다. `period_to`는 **포함하지 않는 끝 시각**이다. 9/21~9/22 하루 단위면 `'2026-09-23 00:00:00+09'`, 9/21 09:00~18:59면 `'2026-09-21 19:00:00+09'`, 9/21 09:30~18:30이면 `'2026-09-21 18:31:00+09'`로 적는다.
 
+**trigger로만 도는 테이블**은 `params`의 `trigger_tables`에 넣는다(예: `ARRAY['table_t']`). Python의 `TRIGGER_TABLES`와 같은 규칙이다 (§4.4).
+
 ```sql
 -- Airflow 3.x 메타데이터 DB (PostgreSQL) — Spark job의 Duration·Start Offset
 -- 기간 지정: 아래 params의 NULL 두 개를 바꾼다. 비워 두면 job별 최근 100회
+-- trigger로만 도는 테이블: trigger_tables에 테이블명 또는 dag_id를 넣는다 → 그 테이블은 실행 종류를 가리지 않고 집계
 WITH params AS (
   SELECT NULL::timestamptz AS period_from,   -- 예) TIMESTAMPTZ '2026-09-21 00:00:00+09'
-         NULL::timestamptz AS period_to      -- 예) TIMESTAMPTZ '2026-09-23 00:00:00+09'  (종료일 다음 날 0시)
+         NULL::timestamptz AS period_to,     -- 예) TIMESTAMPTZ '2026-09-23 00:00:00+09'  (종료일 다음 날 0시)
+         ARRAY[]::text[]   AS trigger_tables -- 예) ARRAY['table_t']
 ),
 recent AS (
   SELECT ti.dag_id,
@@ -482,7 +507,9 @@ recent AS (
   LEFT JOIN dag d ON d.dag_id = ti.dag_id
   CROSS JOIN params p
   WHERE ti.state = 'success'
-    AND dr.run_type = 'scheduled'           -- 재처리·수동 trigger 제외
+    AND (dr.run_type = 'scheduled'          -- 재처리·수동 trigger 제외
+         OR EXISTS (SELECT 1 FROM unnest(p.trigger_tables) AS t(name)   -- 단, trigger로만 도는 테이블은 전부
+                    WHERE ti.dag_id || '.' || ti.task_id ~ ('(^|[._])' || t.name || '($|[._])')))
     AND ti.duration IS NOT NULL
     AND ti.start_date IS NOT NULL
     AND (p.period_from IS NULL OR dr.run_after >= p.period_from)
