@@ -303,6 +303,15 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **운영 적용 (2026-09-15)**: `backup` CTAS 후 append가 이어져 추가분은 Trino `INSERT INTO ... WHERE ts > <임시 max(ts)>`로 보충(서브쿼리는 파티션 필터 강제에 걸려 리터럴 사용). `load` 완료. 단 `DtTo`를 `20260910`으로 두고 실행해 그 이후 Oracle row와 다른 Oracle에만 있는 row가 `''`로 남음 → **`load`의 INSERT 줄을 UPDATE로, 사후 검수 ②를 `tmp_id 미반영`으로 바꿔 재실행**(절차서 실행 3 하단, 로컬 검증 완료 — 이미 채워진 row 불변, 반복 실행 가능). 별도 모드·함수 분리는 하지 않는다(사용자 결정, PR #68 revert). Oracle 접속 변경은 상수 수동 편집
 - **다음 단계**: 운영에서 UPDATE 버전 `load` 실행(①`DtTo` 수정 ②다른 Oracle 접속) → Trino 확인 → DAG 재개 → 며칠 뒤 임시 `DROP ... PURGE`. (이전) 개발 `backup`→DDL→`load` 전 구간 통과(2026-09-14, 코드 교체 후) — 사전 확인: `DtFrom`/`DtTo`가 운영 데이터 전체 기간을 덮는지, `gc.enabled=false` 여부, Airflow 중지 범위(append 외 Compaction·expire·orphan·재처리 포함), 대상 테이블 최근 2일 `FAILURE`·`IN_PROGRESS` 0건. 운영 적용 (Airflow 중지 → backup → DDL → load → Trino 확인 → 재개 → 며칠 뒤 임시 `DROP ... PURGE`) → 다른 테이블에 같은 절차 반복
 
+## 작업 10: 일일 리소스 사용량 시각화 — 준비 단계 (job 실행 시간 집계 도구 완료)
+
+- **산출물**: `pipeline/airflow-job-duration.md` — 복붙용 Python 스크립트(REST API v2)와 SQL(PostgreSQL 메타 DB). 둘은 같은 결과를 낸다(가짜 API 서버·PostgreSQL 16으로 대조 확인, 2026-09-28). endpoint·파라미터·응답 필드는 Airflow 3.2.2 OpenAPI 명세로 확인
+- **배경**: append·Compaction·maintenance의 cron이 달라 CPU·memory 설정 단순 합산은 "전부 동시에 뜬 순간"이라는 없는 값이다. 시각별 실제 동시 사용량을 그리려면 job별 시작·종료가 필요 → **Duration (min)** = task 시작~끝 최근 100회 평균, **Start Offset (min)** = cron 예정 시각(`run_after`) → 실제 시작. 그래프는 `시작 = cron + Start Offset`, `종료 = 시작 + Duration`. 순차 실행(hourly·daily Compaction mapped task)은 Start Offset에 자동 반영. 열 이름은 Delay가 아니라 Offset(순차 실행의 대기는 문제가 아니라 설계된 자리) — 사용자 결정 2026-09-28
+- **DAG 구조 (사용자 공유 2026-09-28)**: 수직분할 4개 append = DAG 1개·테이블별 병렬, task_id `<테이블명>.append_data` / 그 외 테이블 append = 테이블별 DAG, `convert_files.append_data` / hourly·daily Compaction = mapped task `compaction`(테이블은 `rendered_map_index`). `get_jobs`·`update_*`는 worker 안 Python task라 제외
+- **필터**: `run_id_prefix_pattern=scheduled`(재처리 trigger한 `manual__` 실행 제외 — 20시간치 Compaction이 평균을 튀게 함), `state=success`. API는 페이지당 최대 100(`maximum_page_limit`)이라 mapped task는 페이지를 넘겨 테이블별 100회를 채움
+- **Airflow Duration ≠ DataFlint duration** — Airflow는 pod 기동·spark-submit 포함. 리소스 점유 시각화에는 Airflow 값이 맞다
+- **다음 단계**: 사용자가 스크립트 실행 → CSV를 엑셀(cron·CPU·memory)에 붙임 → 1분 칸 × 1,440 누적으로 시각별 동시 core·memory 그래프(Compaction은 평소 시작 대수, 재처리 36대는 별도 시나리오)
+
 ## 파일 구조
 
 ```
@@ -342,6 +351,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
     ├── dags/
     │   └── iceberg_reprocess.py        # 재처리 DAG 정의 (신규 파일은 이것 하나)
     ├── recreate-table-tmp-id.md        # 테이블 재생성 + tmp_id(NOT NULL) 추가 절차서 (코드·DDL 포함, 작업 9)
+    ├── airflow-job-duration.md         # job별 Duration·Start Offset 집계 (리소스 시각화용, 작업 10)
     └── examples/
         ├── convert_file_taskgroup_example.py  # ConvertFileTaskGroup 변경(builder 인자) 예시
         ├── compaction_dag_example.py          # Compaction DAG 변경(tables 필터 = mapped task) 예시
