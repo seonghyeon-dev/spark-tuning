@@ -6,6 +6,7 @@
 
 - 앞 단계: [Airflow job 실행 시간 집계](airflow-job-duration.md) — Duration·Start Offset을 뽑는 스크립트
 - 필요: Python 3.9 이상, `pip install openpyxl`
+- **사내 보안(DRM)이 걸린 작업 엑셀**: **Windows용 Python**에서 실행하고 `pip install xlwings`를 추가한다 → 스크립트가 엑셀을 통해 값을 읽는다 (§2.2). WSL·리눅스 Python은 Windows 엑셀을 조종할 수 없어 안 된다
 
 ---
 
@@ -62,14 +63,20 @@ python resource_timeline.py 작업엑셀.xlsx              # 기준일 = 오늘(
 python resource_timeline.py 작업엑셀.xlsx 20260928     # 기준일 지정
 ```
 
+DRM 파일이면 Windows PowerShell에서 실행한다 (§2.2):
+
+```powershell
+python resource_timeline.py "C:\경로\작업엑셀.xlsx"
+```
+
 **기준일(선택)**: 그래프로 그릴 하루다. 매일·매시·5분마다 도는 job은 날짜와 무관하고, **3일마다 도는 rewrite manifests(`0 6 */3 * *`)만** 그날 도는지가 날짜에 따라 달라진다. 생략하면 오늘. rewrite manifests까지 넣은 그림을 보려면 도는 날(1·4·7…일)을 준다.
 
-**`BadZipFile: File is not a zip file`이 나면**: xlsx는 내부가 zip 파일인데, 넣은 파일이 zip이 아니라는 뜻이다(데이터·시트 문제가 아님). 스크립트가 파일 첫 바이트로 원인을 찍는다.
+**파일을 못 열 때**: xlsx는 내부가 zip 파일이다. zip이 아니면 스크립트가 파일 첫 바이트로 원인을 알려 준다.
 
 | 원인 | 조치 |
 |---|---|
-| 사내 보안(DRM) 암호화 | 엑셀은 보안 프로그램이 풀어 주지만 Python은 못 연다 → 보안 해제(반출) 후 실행 |
-| 열기 암호가 걸린 파일 / 옛 .xls 형식 | 암호 제거, 또는 [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)] |
+| 사내 보안(DRM) 암호화 | Windows용 Python + xlwings로 실행 → 엑셀을 통해 읽는다 (§2.2) |
+| 열기 암호가 걸린 파일 / 옛 .xls 형식 | Windows에서는 엑셀을 통해 읽는다. 열기 암호는 엑셀이 암호를 묻다 멈추므로 암호를 먼저 지운다 |
 | CSV 등을 확장자만 .xlsx로 바꾼 파일 | [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)] |
 | `~$`로 시작하는 파일 | 엑셀 잠금 파일이다. 원래 파일 이름을 넣는다 |
 
@@ -98,6 +105,21 @@ to-be: 최대 동시 CPU 132.0코어 / 메모리 568.0GB, 하루 33,684코어·�
 | 최대 순간 job | as-is·to-be 각각 CPU가 가장 높았던 순간에 떠 있던 job 목록 |
 
 비교 표·차이·합계는 수식이라 엑셀이 열 때 계산한다.
+
+### 2.2 사내 보안(DRM) 파일 — 엑셀을 통해 읽기
+
+DRM 파일은 암호화돼 있어 Python이 직접 못 연다. 엑셀은 보안 프로그램이 풀어 주므로, **Python이 엑셀을 조종해 셀 값만 받아 온다.** 엑셀 창은 뜨지 않고, 파일은 읽기 전용으로 열었다 닫는다(원본 불변). 이미 열어 둔 엑셀 창과는 별개로 동작한다.
+
+**준비 (한 번만, Windows에서)**
+
+1. Windows용 Python 설치 — python.org에서 받아 설치(관리자 권한 없이 "Install for me only" 가능, **"Add python.exe to PATH" 체크**)
+2. PowerShell에서 `pip install openpyxl xlwings`
+
+**실행**: PowerShell에서 `python resource_timeline.py "C:\경로\작업엑셀.xlsx"`. 첫 줄에 `엑셀을 통해 읽는다`가 찍히면 이 경로로 읽은 것이다. 이후 출력·결과 엑셀은 일반 파일과 같다.
+
+- 먼저 되는지 확인하려면 PowerShell에서 `$x = New-Object -ComObject Excel.Application; $b = $x.Workbooks.Open("C:\경로\작업엑셀.xlsx"); $b.Sheets.Item("AS-IS").Range("A1:C3").Value2; $b.Close($false); $x.Quit()` — 셀 값이 나오면 된다. 안 나오면 DRM이 엑셀 조종까지 막는 것이라 보안 해제(반출)만 남는다
+- 수식 셀(K·L 등)은 엑셀이 계산한 값을 받아 오므로 "엑셀에서 저장한 파일" 조건이 필요 없다
+- 결과 엑셀(`_리소스비교.xlsx`)은 Python이 새로 만든 파일이다. 보안 프로그램에 따라 저장 후 자동으로 DRM이 걸릴 수 있으나, 엑셀로 여는 데는 지장이 없다
 
 ---
 
@@ -192,6 +214,8 @@ Airflow cron은 UTC로 적었을 수도, KST로 적었을 수도 있다. 스크�
   as-is·to-be 시트는 이름으로 찾는다 (as-is / asis / AS_IS, to-be / tobe …). 다르면 SHEET_ASIS·SHEET_TOBE에 이름을 넣는다
 결과: 같은 폴더에 <작업엑셀>_리소스비교.xlsx  (원본은 건드리지 않는다)
 필요: pip install openpyxl
+  사내 보안(DRM)이 걸린 파일은 Python이 직접 못 연다 → Windows용 Python에서 실행하면 엑셀을 통해 값을 읽는다
+  (pip install xlwings 추가. WSL·리눅스에서는 엑셀을 조종할 수 없어 안 된다)
 """
 import math
 import re
@@ -934,39 +958,68 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
 
 
 def open_workbook(src):
-    """xlsx는 zip 파일이다. zip이 아니면 openpyxl이 BadZipFile로 죽으므로 파일 첫 바이트로 원인을 알려 준다."""
+    """xlsx는 zip 파일이다. zip이면 openpyxl로 직접 읽고,
+    zip이 아니면(사내 DRM·열기 암호·옛 xls) Windows에서는 엑셀을 통해 읽고, 그 밖에는 원인을 알려 준다."""
     if not src.exists():
         raise SystemExit(f"파일이 없다: {src}")
     if src.name.startswith("~$"):
         raise SystemExit(f"'{src.name}'은 엑셀이 파일을 열어 둘 때 만드는 잠금 파일이다 — '~$'가 없는 원래 파일 이름을 넣는다")
     head = src.read_bytes()[:8]
-    if head[:2] != b"PK":
-        if head == bytes.fromhex("D0CF11E0A1B11AE1"):
-            why = ("① 암호(열기 암호)가 걸린 파일이거나 ② 옛 .xls 형식이다. "
-                   "엑셀에서 열어 [파일 → 정보 → 통합 문서 보호 → 암호 설정]의 암호를 지우거나, "
-                   "[다른 이름으로 저장 → Excel 통합 문서(*.xlsx)]로 저장한다")
-        elif head[:1] in (b"<",) or all(32 <= b < 127 or b in (9, 10, 13) for b in head):
-            why = "CSV·HTML 같은 텍스트 파일이다. 엑셀에서 열어 [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)]로 저장한다"
-        else:
-            why = ("사내 보안(DRM) 암호화가 걸린 파일로 보인다. 엑셀은 보안 프로그램이 풀어 주지만 Python은 못 연다. "
-                   "보안 해제(반출) 후 다시 실행한다")
-        raise SystemExit(f"'{src.name}'은 xlsx 형식이 아니다 (파일 첫 바이트 {head.hex(' ').upper()}) — {why}")
-    return load_workbook(src, data_only=True)     # 수식 셀은 계산된 값으로 읽는다
+    if head[:2] == b"PK":
+        return load_workbook(src, data_only=True)     # 수식 셀은 계산된 값으로 읽는다
+    if head[:1] == b"<" or all(32 <= b < 127 or b in (9, 10, 13) for b in head):
+        raise SystemExit(f"'{src.name}'은 xlsx가 아니라 CSV·HTML 같은 텍스트 파일이다 — "
+                         f"엑셀에서 열어 [다른 이름으로 저장 → Excel 통합 문서(*.xlsx)]로 저장한다")
+    if sys.platform == "win32":
+        return read_via_excel(src)
+    raise SystemExit(f"'{src.name}'은 Python이 직접 열 수 없는 파일이다 (파일 첫 바이트 {head.hex(' ').upper()} — "
+                     f"사내 보안(DRM)·열기 암호·옛 xls). Windows용 Python에서 실행하면 엑셀을 통해 읽는다: "
+                     f"pip install openpyxl xlwings → python resource_timeline.py <파일>. WSL·리눅스에서는 안 된다")
 
 
-def find_sheets(wb):
+def read_via_excel(src):
+    """엑셀을 화면에 띄우지 않고 실행해 파일을 읽기 전용으로 열고, as-is·to-be 시트의 셀 값만 받아 온다.
+    엑셀은 보안(DRM) 프로그램이 풀어 주므로 Python이 파일을 직접 건드리지 않아도 된다.
+    받아 온 값은 메모리 안의 새 통합 문서에 같은 셀 위치로 옮긴다 → 이후 계산은 일반 xlsx와 똑같다."""
+    try:
+        import xlwings as xw
+    except ImportError:
+        raise SystemExit("사내 보안(DRM) 파일은 엑셀을 통해 읽는다 — pip install xlwings 후 다시 실행한다")
+    print(f"'{src.name}'은 Python이 직접 못 여는 파일이다 → 엑셀을 통해 읽는다 (엑셀 창은 뜨지 않는다)")
+    app = xw.App(visible=False, add_book=False)       # 새 엑셀 프로세스 — 사용자가 열어 둔 엑셀 창과 별개
+    app.display_alerts = False
+    try:
+        book = app.books.open(str(src.resolve()), read_only=True, update_links=False)
+        names = find_sheets([sh.name for sh in book.sheets])
+        wb = Workbook()
+        wb.remove(wb.active)
+        for name in dict.fromkeys(names.values()):
+            sh, ws = book.sheets[name], wb.create_sheet(name)
+            used = sh.used_range
+            values = used.options(ndim=2).value          # 수식 셀은 엑셀이 계산한 값
+            for i, row in enumerate(values):
+                for j, v in enumerate(row):
+                    if v is not None:
+                        ws.cell(row=used.row + i, column=used.column + j, value=v)
+        book.close()
+    finally:
+        app.quit()
+    return wb
+
+
+def find_sheets(sheetnames):
     """이름이 정확히 as-is / to-be인 시트(대소문자·기호 무시)를 먼저 찾는다.
     없을 때만 이름에 들어 있는 시트를 쓴다 — 'AS-IS(x)' 같은 시트가 앞에 있어도 'AS-IS'를 고른다."""
     key = lambda n: re.sub(r"[^a-z]", "", n.lower())
 
     def pick(word):
-        exact = [n for n in wb.sheetnames if key(n) == word]
-        return exact[0] if exact else next((n for n in wb.sheetnames if word in key(n)), None)
+        exact = [n for n in sheetnames if key(n) == word]
+        return exact[0] if exact else next((n for n in sheetnames if word in key(n)), None)
     asis = SHEET_ASIS or pick("asis")
     tobe = SHEET_TOBE or pick("tobe")
     for label, name in (("as-is", asis), ("to-be", tobe)):
-        if not name or name not in wb.sheetnames:
-            raise SystemExit(f"{label} 시트를 못 찾았다 (시트: {', '.join(wb.sheetnames)}) — "
+        if not name or name not in sheetnames:
+            raise SystemExit(f"{label} 시트를 못 찾았다 (시트: {', '.join(sheetnames)}) — "
                              f"스크립트 상단 SHEET_ASIS·SHEET_TOBE에 시트 이름을 넣는다")
     return {"as-is": asis, "to-be": tobe}
 
@@ -977,7 +1030,7 @@ def main():
     src = Path(sys.argv[1])
     wb = open_workbook(src)
     day = datetime.strptime(sys.argv[2], "%Y%m%d").date() if len(sys.argv) > 2 else datetime.now(KST).date()
-    names = find_sheets(wb)
+    names = find_sheets(wb.sheetnames)
     sides = {}
     for side in SIDES:
         jobs, skipped, no_run = read_jobs(wb[names[side]])
