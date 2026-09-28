@@ -43,6 +43,7 @@ Spark → Iceberg(S3/MinIO, HMS) → Trino 로 이어지는 배치 파이프라�
 | [재처리 DAG 설계](pipeline/reprocessing-dag-design.md) | 잔류 WAIT_SCHEDULING / FAILURE 데이터 재처리 DAG 설계 |
 | [재처리 DAG 처리 흐름](pipeline/reprocess-flow.md) | 보고용 흐름 요약 |
 | [Compaction executor 자원 할당 설계](pipeline/compaction-executor-sizing-design.md) | Dynamic Allocation + ratio 채택 근거 |
+| [Airflow job 실행 시간 집계](pipeline/airflow-job-duration.md) | 리소스 시각화용 job별 Duration·Start Offset 최근 100회 평균 (REST API 스크립트·SQL) |
 
 ## 문서 사이트 로컬 실행
 
