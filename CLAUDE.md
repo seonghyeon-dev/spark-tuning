@@ -46,7 +46,7 @@
 ### 기존 시스템 (as-is)
 
 - Hive 테이블 (ORC, HDFS 블록 128MB)
-- 수직분할 4개 테이블 — Iceberg 대상(TABLE_A)은 그 중 1개
+- 수직분할 4개 테이블 — Iceberg 대상(TABLE_A)은 그 중 1개. **이 4개 테이블을 '빅테이블'이라 부른다** (사용자 명명 2026-09-29, hourly Compaction 튜닝 대상 1~4번 테이블과 같음)
 - 파티션: 날짜 1개 (dt=날짜)
 
 ### 대상 테이블 (TABLE_A)
@@ -137,7 +137,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **전제**: Iceberg snapshot 보존 3일 > 재처리 조회 범위 2일 유지 필수. maintenance 스케줄 재배치와 Compaction DAG 변경(tables params + mapped task)은 재처리 DAG 배포 전 적용
 - **후속 과제**: daily 계열 maintenance를 DAG 1개의 순차 task로 통합 (시계 기반 간격은 duration이 늘면 조용히 깨짐)
 
-## 작업 5: Compaction 튜닝 (hourly) — 4개 테이블 heap·memoryOverhead 전부 확정 (3·4번 18g), DAG 일괄 반영 대기
+## 작업 5: Compaction 튜닝 (hourly, 빅테이블) — 확정 설정 운영 반영 완료
 
 - **산출물**: `tuning/compaction-tuning-guide.md` (상세), `tuning/compaction-tuning-report.md` (회의 보고용 요약)
 - **상태**: 9회 측정으로 설정 확정. 초/GB **3.24 → 2.41(−26%)**, dcu/GB **0.00416 → 0.00219(−47%)**, idle cores 58%→17%. DAG 전체 10~12분 → 약 6분
@@ -173,7 +173,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - **shuffle·메모리 산정 규칙 (설계서 §8.2)**: shuffle 총량 ≈ 데이터 × 1.5(실측 1.41·1.57), task당 shuffle ≈ 512MB × 1.5 = 0.8GB로 데이터 양과 무관, executor당 디스크 ≈ 1.5 ÷ 0.32 ≈ 4.7GB 일정. task당 정렬 메모리 = `(executor memory − 300MiB) × 0.6 ÷ cores`(16g 2.4GB, 20g 3.0GB — Spark `tuning.md`·`ExecutionMemoryPool.scala` 1/N 규칙). **2번이 16g에서 spill 나는 이유는 task당 row 수** — 512MB 파일에 7KB row가 7.2만 개(1번 11KB row 4.5만 개). spill은 시간대 데이터 양이 아니라 테이블 row 모양이 정한다
   - **0.32는 비례식이다** — "37GB에 12대가 dcu 최저"를 12 ÷ 37.3으로 환산한 것. 방법(최저점 실측 → 비례 확장)은 일반적, 값은 이 job(4core·512MB·sort) 전용
   - **새 hourly 테이블 절차** (4번까지 적용 완료): `instances`=init=min=`ceil(시간당 GB × 0.32)`, ratio 0.13, max 36, **18g + 3g로 1회**(4개 중 3개가 16g에서 spill, 그 중 3·4번은 18g로 충분). spill이 나면 20g. 판정: 수렴 대수, spill 0, duration 2분 이내, 384MB 미만 파일 3개 미만 (설계서 §8.3)
-  - **DAG 미반영** — 4개 테이블 heap·`memoryOverhead` 확정 완료(2026-09-21, 3·4번 18g 포함). 설계서 §5.5 "DAG 반영용 최종 설정" 표로 일괄 적용 (사용자 결정 2026-09-15)
+  - **DAG 반영 완료** (사용자 확인 2026-09-29, 반영 시점 미기록) — 설계서 §5.5 "DAG 반영용 최종 설정" 표 기준. 반영 후 Airflow 이력이 작업 10 시각화의 to-be다
   - **`initialExecutors` 기본값이 0이라 반드시 명시.** 생략하면 0대에서 시작해 warm-up 20~40초 낭비
   - **ratio 도출**: `desired = 데이터GB × 2.25 × ratio`, 목표 `데이터GB × 0.32` → `ratio = 0.32/2.25 = 0.142`. **양변에서 데이터GB가 소거되므로 ratio는 테이블 크기와 무관 → 공통값 사용 가능**. 실측: 39GB→12대, 82GB→24대
   - **`instances`/`initial`/`min`은 테이블별이어야 한다** — 비율이 아니라 절대 개수라 크기에 비례. **`ceil(시간당 GB × 0.32)`로 산정하며 기존 `com_num_executor`와 다를 수 있다** (2번: 기존 12 → 8. 12로 두면 바닥이 되어 dcu +10~16%). 역할 분담: `instances/initial/min`=평소 대수 바닥, `ratio`=많은 시간대에 얼마나 더 부를지
@@ -188,7 +188,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
   - 기존 `com_num_executor` 상수는 **fallback으로 유지** (조회 실패·0 반환·비정상 크기 전부). 지우면 Trino 장애가 곧 Compaction 실패가 된다
   - 미확인: Trino `$partitions`의 `partition.ts_hour` 타입, manifest pruning 동작 여부
   - 현재 데이터(36~42GB)에서 산정값이 12~14로 좁아 **정적 12로 운영하며 동적화를 미루는 선택도 가능**. `C=0.32`은 hourly 전용 — daily는 별도 측정 필요
-- **후속 과제**: DAG 일괄 반영(설계서 §5.5 표: 1번 12대 16g, 2번 8대 20g, 3·4번 12대 18g, overhead 3g 공통, `max-concurrent-file-group-rewrites` 12) → 운영 첫 실행에서 duration·task error 0·`spark-local-dir-1` 사용량 확인 → (보류, 시간 될 때) `spark.memory.fraction` 0.8 실험. daily Compaction은 별건(대상 테이블 크기·구성 공유 후 시작)
+- **후속 과제**: 운영 반영 후 duration·task error 0·`spark-local-dir-1` 사용량 확인 → (보류, 시간 될 때) `spark.memory.fraction` 0.8 실험. daily Compaction은 별건(대상 테이블 크기·구성 공유 후 시작)
 
 ## 작업 6: FileIO 전환 (S3AFileSystem → S3FileIO) — 전환 완료, 후속 작업 대기
 
@@ -303,7 +303,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **운영 적용 (2026-09-15)**: `backup` CTAS 후 append가 이어져 추가분은 Trino `INSERT INTO ... WHERE ts > <임시 max(ts)>`로 보충(서브쿼리는 파티션 필터 강제에 걸려 리터럴 사용). `load` 완료. 단 `DtTo`를 `20260910`으로 두고 실행해 그 이후 Oracle row와 다른 Oracle에만 있는 row가 `''`로 남음 → **`load`의 INSERT 줄을 UPDATE로, 사후 검수 ②를 `tmp_id 미반영`으로 바꿔 재실행**(절차서 실행 3 하단, 로컬 검증 완료 — 이미 채워진 row 불변, 반복 실행 가능). 별도 모드·함수 분리는 하지 않는다(사용자 결정, PR #68 revert). Oracle 접속 변경은 상수 수동 편집
 - **다음 단계**: 운영에서 UPDATE 버전 `load` 실행(①`DtTo` 수정 ②다른 Oracle 접속) → Trino 확인 → DAG 재개 → 며칠 뒤 임시 `DROP ... PURGE`. (이전) 개발 `backup`→DDL→`load` 전 구간 통과(2026-09-14, 코드 교체 후) — 사전 확인: `DtFrom`/`DtTo`가 운영 데이터 전체 기간을 덮는지, `gc.enabled=false` 여부, Airflow 중지 범위(append 외 Compaction·expire·orphan·재처리 포함), 대상 테이블 최근 2일 `FAILURE`·`IN_PROGRESS` 0건. 운영 적용 (Airflow 중지 → backup → DDL → load → Trino 확인 → 재개 → 며칠 뒤 임시 `DROP ... PURGE`) → 다른 테이블에 같은 절차 반복
 
-## 작업 10: 일일 리소스 사용량 시각화 — 집계·시각화 도구 완료, 사용자 실데이터 적용 대기
+## 작업 10: 일일 리소스 사용량 시각화 — 완료 (as-is/to-be 비교 보고용 HTML·엑셀)
 
 - **산출물**: `pipeline/airflow-job-duration.md`(집계), `pipeline/resource-timeline.md`(시각화) — 집계는 복붙용 Python 스크립트(REST API v2, 가짜 API 서버로 검증). endpoint·파라미터·응답 필드는 Airflow 3.2.2 OpenAPI 명세로 확인. **SQL(메타 DB 직접) 방법은 삭제**(사용자 결정 2026-09-28 — REST API만 쓴다)
 - **배경**: append·Compaction·maintenance의 cron이 달라 CPU·memory 설정 단순 합산은 "전부 동시에 뜬 순간"이라는 없는 값이다. 시각별 실제 동시 사용량을 그리려면 job별 시작·종료가 필요 → **Duration (min)** = task 시작~끝 최근 100회 평균, **Start Offset (min)** = cron 예정 시각(`run_after`) → 실제 시작. 그래프는 `시작 = cron + Start Offset`, `종료 = 시작 + Duration`. 순차 실행(hourly·daily Compaction mapped task)은 Start Offset에 자동 반영. 열 이름은 Delay가 아니라 Offset(순차 실행의 대기는 문제가 아니라 설계된 자리) — 사용자 결정 2026-09-28
@@ -312,7 +312,7 @@ Compaction: 1시간(`35 * * * *` → `45 * * * *`, 직전 1시간치) + 1일(`35
 - **Airflow Duration ≠ DataFlint duration** — Airflow는 pod 기동·spark-submit 포함. 리소스 점유 시각화에는 Airflow 값이 맞다
 - **출력 (사용자 요청 2026-09-28)**: `job_type` 순 정렬 append → summary → hourly compaction → daily compaction → expired snapshot → delete orphan → rewrite manifest(→ other), 같은 종류 안에서 테이블명 오름차순, **`번호_테이블명` task는 번호 순(숫자 비교, 1·2·…·10)**. **rewrite manifest DAG의 정확한 dag_id는 `iceberg_rewrite_manifests`**(끝에 s, 사용자 확인 2026-09-28) — 처음에 `iceberg_rewrite_manifest`로 적어 `other`로 나왔다. delete orphan은 `iceberg_delete_orphan_files`. 둘 다 dag_id 완전 일치로 판별. **기간 지정** `python job_durations.py <시작> [<끝>]` — `YYYYMMDD`/`YYYYMMDDHH`/`YYYYMMDDHHMM`(KST), **끝 값은 적은 단위까지 포함**(`20260922` → 23:59, `2026092218` → 18:59, 하나만 주면 그 단위 하나), cron 예정 시각(`run_after`) 기준 실행 **전부**(100회 제한 없음). 실행 첫 줄에 해석한 기간 출력. 인자 없으면 최근 100회. 평균 vs 중앙값 — 차이가 크면 튀는 실행이 섞인 것, 평소 모양은 중앙값·자원 산정은 평균/최댓값
 - **시각화 (`resource_timeline.py`) — as-is / to-be 비교**: 입력 = 작업 엑셀의 같은 규격 시트 `AS-IS`·`TO-BE`(같은 파일에 `AS-IS(x)`·`DIFF`도 있음 → 이름 완전 일치 우선, 없을 때만 포함 일치). 열 고정: **A job_type**(사용자 라벨 `append`·`summary`·`comp_range`·`comp_daily`·`exp_snap`·`del_orphan`·`rw_mani`, 같은 값끼리 **셀 병합**) · B cron · C app name · D~J 리소스 재료 · **K 토탈 cpu · L 토탈 메모리** · M~S = CSV F~L · **T 기능 요약**(병합, U 아님 — 사용자 정정 2026-09-29). 병합 셀은 범위 전체에 첫 값을 채운다(openpyxl `merged_cells`, 엑셀 경유는 열별 `merge_cells`·칸별 `merge_area`). Duration 빈 행은 제외(목록 출력 안 함 — 사용자 '쓸모없음'), 한쪽에만 있는 job은 job별 비교에서 다른 쪽 0. **결과 파일명 `<원본>_resource_diff.xlsx/.html`**(사용자 2026-09-29, 예전 `_리소스비교`). **지표 (2026-09-29 3차 개편 — 사용자가 `분/일`·`코어·시간`을 이해 못 함)**: 복합 단위 전부 폐기. **평균 사용량(코어·GB) = 실행 횟수 × 1회 실행 시간(분) × 코어 ÷ 1,440** = 하루 평균 사용 중인 코어 수, 튜닝 효과 판단 기준(예시 29.6 → 23.4코어 −21%) · **최대 사용량** = 동시 사용 최댓값(147 → 132, −10%) · 최대 사용 시간대(`01:50~01:55`) · 설정값 합계(참고). 5분 단위 값 = 그 5분 동안의 최대 동시 사용량. **문구 규칙 (사용자 2026-09-29)**: 보고서체·간결. '붐빈다' 금지(→ 최대 사용), '파랑이 회색보다 낮은 만큼' 같은 초보 설명·'순간의 값을 이었다'·'글자가 없으면 변화 없음'·HTML 하단 '스크립트로 만든 파일' 문구 금지, AI 티 나는 장황한 설명·줄표(—) 남발 금지. `주요 결과` 문장은 `headline()`이 계산값으로 생성(감소분 출처 종류, 최대 사용량이 덜 줄어든 이유 = 최대 시점의 설정 변경 없는 job 비중). **엑셀 시트**: 요약(주요 결과 병합·줄바꿈, 비교 표, 그래프 4) → 설명(기준일·원본·cron 시간대, 시트 목록, 용어) → 종류별 비교 → job별 비교(필터) → 최대 사용 시점(CPU·메모리 합계, 최대 시점이 다르면 두 목록) → 종류별 누적 그래프 → 시간대별 비교 → as-is/to-be 시간대별 → as-is/to-be job별(하루 총 실행 시간·평균 사용량 수식, 필터). 모든 시트 상단 설명 한 줄, **열 폭 자동 맞춤**(`autofit`: 한글 1.9·영문 1.1 폭 추정, 머리글은 두 줄 기준, 상한 초과 시 줄바꿈·행 높이), 변화 값 감소 초록·증가 빨강 서식. 맑은 고딕 10 통일(기본 스타일 포함), 그래프 30×11cm·2시간 눈금·범례 위, **엑셀 선은 직선**(smooth는 급변 구간을 실제보다 크게 휘게 그림), 엑셀 막대는 세로(가로 막대는 LibreOffice에서 값 축 소실). **HTML**(plotly 내장, 오프라인 약 5MB, 대안 검토: PPT 차트는 엑셀과 같은 엔진, Grafana는 서버·데이터 소스 필요한 실시간 감시용이라 채택 안 함): 상단 남색 띠(기준일·원본) → 지표 카드 4개(변화율 배지 + as-is·to-be 막대) → 1 주요 결과 → CPU/메모리 전환·인쇄/PDF 버튼(sticky, 인쇄 시 둘 다 출력) → 2 시간대별(spline `SMOOTH` 0.5, as-is·to-be 사이 음영, 최대값 표시 — **as-is·to-be 최대 시점이 1시간 넘게 떨어지면 좌우로 나눠 겹침 방지**, 사용자 지적) → 3 종류별 평균 가로 막대(변경 종류만 변화율) → 4 종류별 누적(as-is 위·to-be 아래 동일 축, **범례 오른쪽 세로** — 위에 두면 종류가 많을 때 두 줄로 늘어나 'as-is' 제목을 가림, 사용자 지적 2026-09-29) → 5 최대 사용 시점 job → 6 job별 표(as-is → to-be, 변화 막대, 필터·정렬) → 7 용어. 전 글자 10pt. **기준일 자동 선택** = 오늘부터 31일 안 모든 job 실행 첫날(rw_mani `5 2 */3 * *` = 매달 1·4·7…31일 포함), 지정 시 미실행 job 수 안내. DRM: 사용자 작업 엑셀은 사내 DRM(CSV도 DRM) → Windows Python + xlwings 엑셀 경유(zip 아니고 win32면 무조건, DRM 헤더가 글자로 시작해 예전 텍스트 오판 수정), WSL 불가, 사용자 PowerShell COM 테스트 성공(2026-09-28). 검증은 가짜 xlwings까지 — 실제 엑셀 경유는 사용자 첫 실행이 검증. 사용자 환경 Python 3.12·openpyxl 3.1.5. 계산: 실행 구간 `[cron + Offset, + Duration)`, 6초 간격 측정(순차 실행 중복 방지), 그래프는 5분 단위 최댓값(`BUCKET_MIN`), cron 시간대는 latest_run으로 UTC/KST 자동 판단, cron 없는 행만 `(latest − oldest) ÷ (runs − 1)` 간격 추정. LibreOffice 재저장 시 x축 `tickLblSkip` 소실 → 출력 파일 그대로 사용
-- **다음 단계**: 사용자가 실데이터(as-is·to-be 시트)로 시각화 실행 → 결과 확인(시트 찾기·cron 시간대 판단·간격 추정 행·job별 짝). to-be Duration은 튜닝 반영 전이면 테스트 실측값, 반영 후 `job_durations.py`로 교체. Compaction은 평소 시작 대수로 그리고, 재처리 36대는 K·L을 바꾼 시트로 별도 시나리오
+- **as-is / to-be의 뜻 (사용자 정정 2026-09-29)**: 튜닝은 **빅테이블 hourly Compaction DAG만** 했고 **운영에 이미 적용됐다**. as-is = 튜닝 전 기간의 Airflow 이력, to-be = 튜닝 적용 후부터 조회 시점까지의 Airflow 이력(둘 다 `job_durations.py` 실측). to-be는 테스트값·예상값이 아니다. 나머지 job(append·daily Compaction·maintenance)은 설정이 같아 차이는 실행 시간 편차뿐이다. 보고는 HTML 기준, 엑셀은 근거 자료(5분 단위 원본·job별 계산 수식)로 함께 보관
 
 ## 파일 구조
 
