@@ -104,8 +104,8 @@ ALTER TABLE TABLE_A WRITE ORDERED BY
 - Iceberg의 `write.distribution-mode`(`range`로 설정)에 의해, 쓰기 전 파티션 키 + write ordering 기준으로 데이터가 범위 기반 재분배(shuffle)된다
 - Write ordering에 의해 각 파티션 내에서 정렬이 수행된다
 
-> ⚠️ **변동 가능성**
-> 파티션 설정과 write ordering은 현재 확정된 값이 아니며, 다음 기준으로 최종 결정할 예정이다:
+> ⚠️ **변동 가능성** (작성 당시)
+> 파티션 설정과 write ordering은 이후 확정됐다: 파티션 `hour(ts)`, `par_a` + Sort Order `sort_a`, `sort_b` (`schema/iceberg-schema-design-guide.md`). 아래는 작성 당시의 결정 기준이다:
 > 1. **하루치 데이터 적재 후 Compaction 결과**: 데이터 파일 크기 분포 확인
 > 2. **실제 조회 패턴**: 조건절(WHERE)에 사용되는 컬럼 기준으로 파티션/정렬 최적화
 >

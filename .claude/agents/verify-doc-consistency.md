@@ -23,11 +23,11 @@ model: sonnet
 
 | 절 | 확정값의 종류 |
 |----|---------------|
-| 공통 컨텍스트 | 기술 스택 버전, 파티션·Sort Order, Compaction cron, 조회 패턴 |
-| 작업 1 | append Job Spark 설정 7개 |
+| 공통 컨텍스트 | 기술 스택 버전(**운영/목표 구분**), 파티션·Sort Order, Compaction cron, 조회 패턴 |
+| 작업 1 | append Job Spark 설정 개수·검증 수준 (값 자체는 `tuning/spark-tuning-guide.md` §4.1이 원본) |
 | 작업 4 | maintenance 스케줄 재배치(cron 6개), 상한값, `RUN_HOUR` |
-| 작업 5 | Compaction 설정값, dcu/GB·초/GB 실측치, DA 설정(ratio 등) |
-| 작업 6 | 실측 개선율(req/s, duration, dcu), **실제 운영 스택 버전**(§5.0.2), jar 이름·버전 |
+| 작업 5 | Compaction 확정 설정 표(Iceberg·Spark·DA·메모리), dcu/GB·초/GB 실측치 |
+| 작업 6 | 실측 개선율(req/s, duration, dcu), jar 이름·버전 |
 | 작업 7 | 업그레이드 **목표** 버전 |
 | 작업 8 | splits 수, Trino 버전 |
 
@@ -50,7 +50,7 @@ pipeline/**/*.py
 | `tuning/compaction-tuning-guide.md` | `tuning/compaction-tuning-report.md` |
 | `pipeline/s3fileio-migration-guide.md` | `pipeline/s3fileio-migration-report.md` |
 | `pipeline/reprocessing-dag-design.md` | `pipeline/reprocess-flow.md` |
-| `pipeline/compaction-executor-sizing-design.md` | (`CLAUDE.md` 작업 5의 DA 항목) |
+| `pipeline/compaction-executor-sizing-design.md` | (`CLAUDE.md` 작업 5의 확정 설정 표) |
 
 ### 검사 범위 모드 — 호출 시 지정한다
 
@@ -83,7 +83,7 @@ pipeline/**/*.py
 
 ### 검사 2 — 목표 버전과 운영 버전의 혼동
 
-이 프로젝트는 **문서의 기본 스택 표기와 실제 운영 스택이 다르다.** 어느 것이 운영이고 어느 것이 목표인지는 `CLAUDE.md` 작업 6의 "실제 운영 스택" 항목과 작업 7을 읽어 확인한다. 이 파일에 적지 않는다.
+이 프로젝트는 **문서의 기본 스택 표기와 실제 운영 스택이 다르다.** 어느 것이 운영이고 어느 것이 목표인지는 `CLAUDE.md` 공통 컨텍스트의 "기술 스택"(운영/목표 구분)과 작업 7을 읽어 확인한다. 이 파일에 적지 않는다.
 
 Grep 패턴: `Spark [34]\.[0-9]+(\.[0-9]+)?|Iceberg 1\.1[0-9]\.[0-9]|Trino [0-9]{3}|Airflow 3\.[0-9]\.[0-9]|Hadoop 3\.[0-9]\.[0-9]|Scala 2\.1[23]`
 

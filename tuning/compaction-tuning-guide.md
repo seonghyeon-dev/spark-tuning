@@ -729,7 +729,7 @@ desired = (데이터GB × 9 ÷ 4) × ratio = 데이터GB × 2.25 × ratio
 
 | 항목 | 내용 |
 |------|------|
-| `to_partition_hour()` | datetime → `hour(ts)` 파티션 값 변환. **naive datetime으로 계산** (`ts`가 `timestamp_ntz`이므로 timezone을 붙이면 값이 어긋난다). 2026-08-11 13:00 → 496237로 Spark UI 실측값과 일치 검증 |
+| `to_partition_hour()` | datetime → `hour(ts)` 파티션 값 변환. **naive datetime으로 계산** (`ts`가 `timestamp_ntz`이므로 timezone을 붙이면 값이 어긋난다). 변환식 `int((dt − 1970-01-01).total_seconds() // 3600)`. 2026-08-11 13:00 → 496237로 Spark UI 실측값과 일치 검증 |
 | `query_size_bytes()` | `.partitions` 범위 조회. 정기 실행은 1시간이지만 재처리 DAG trigger 시 여러 시간에 걸치므로(`reprocessing-dag-design.md` §6.3) 범위 조회다 |
 | `num_executors_for()` | 산정 + clamp + fallback. 조회 실패, 0 반환, 비정상 크기를 모두 `com_num_executor`로 fallback |
 | 상한 경고 | `MAX_EXECUTORS`에 걸리면 warning 로그. 데이터가 설계 범위를 넘었다는 신호 |
@@ -803,11 +803,11 @@ daily 튜닝은 그 테이블들의 크기·row 수·파일 구성을 받은 뒤
 | 항목 | 내용 | 우선순위 |
 |------|------|---------|
 | ~~`MAX_EXECUTORS` 확정~~ | **36 고정 (2026-09-16).** quota는 확인 불가하나 리소스가 넉넉하고, 실사용량은 ratio가 정하므로 천장은 무해 (설계서 §4.6, §7) | 완료 |
-| 확정 설정 운영 검증 | 여러 시간대에서 `spill 0`, `384MB 미만 파일 ≤ 2개`, DAG 전체 6분대 유지 확인 | 높음 |
+| 확정 설정 운영 검증 | 운영 반영 완료(2026-09-29 확인). 여러 시간대에서 `spill 0`, task error 0%, `384MB 미만 파일 ≤ 2개`, DAG 전체 6분대 유지 확인 | 높음 |
 | metadata table manifest pruning | `.partitions` 파티션 필터가 manifest를 실제로 pruning하는지 (섹션 6.3). 조회 비용 규모 결정 | 중간 |
 | `ts` timezone 검증 | Airflow가 전달하는 from/until의 `timestamp_ntz` 처리 (섹션 3.4) | 중간 |
 | executor local disk 한도 | hourly executor당 shuffle 약 5GiB(1시간치 shuffle 60GiB ÷ 12대), 권장 10GiB × 노드당 executor 수. 재처리 n시간치는 최악 n × 5GiB. 운영 첫 실행에서 `spark-local-dir-1` 사용량 1회 확인 (설계서 §5.5) | 중간 |
-| ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 18g, `memoryOverhead` 3g (설계서 §5.5). 남은 것은 DAG 일괄 반영. par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(12 − 4)도 함께 확인 | 중간 |
+| ~~다른 hourly 테이블 검증~~ | **4개 전부 완료** — 2번 8대 + 20g, 3번·4번 12대 + 18g, `memoryOverhead` 3g (설계서 §5.5). 운영 DAG 반영 완료(2026-09-29 확인). par_a Cardinality가 다르면 file group 수가 달라져 `max-concurrent` 여유(12 − 4)도 함께 확인 | 중간 |
 
 **완료된 항목**: `max-file-group-size-bytes` 100GB 검증(T5), `num-executors` C 캘리브레이션(T6·T7 → C=0.32), `parallelismFirst` 판정(T8 → 무효 확정), `MAX_EXECUTORS` 36 고정, 2번 테이블 검증(12회 → 8대 + 20g, `spark.executor.instances` 규칙 발견, 18g는 20시간치 spill로 탈락), 3번 테이블 검증(9회 → 12대 + 18g, C=0.32 재확인, 22시간치 재처리 검증), 4번 테이블 검증(14회 → 12대 + 18g, `memoryOverhead` 3g 확정, 6시간치 재처리 검증).
 

@@ -9,6 +9,7 @@
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1(**카탈로그: HMS**), Airflow 3.2.2, Oracle DB |
 | 시간대 기준 | **KST (Asia/Seoul)** — 모든 날짜/시간 계산에 적용 |
 | 최종 수정일 | 2026-07-27 |
+| 상태 | **운영 배포 완료** (사용자 확인 2026-09-14, 배포 시점 미기록). 저장소의 `pipeline/dags/iceberg_reprocess.py`는 설계 시점 스켈레톤이며 운영 코드와 다를 수 있다 |
 
 ### 목차
 
@@ -749,7 +750,7 @@ get_jobs가 IN_PROGRESS로 전환한 후 DAG run이 증발하면(scheduler 장�
 
 | 파일 | 구분 | 역할 |
 |------|------|------|
-| `pipeline/dags/iceberg_reprocess.py` | **신규** | DAG 정의. 조회 범위 계산(`prepare_run`), 테이블 그룹 배치, Compaction 연계, loop 판단, 좀비 탐지 |
+| `pipeline/dags/iceberg_reprocess.py` | **신규** (설계 시점 스켈레톤, 운영 코드와 다를 수 있음) | DAG 정의. 조회 범위 계산(`prepare_run`), 테이블 그룹 배치, Compaction 연계, loop 판단, 좀비 탐지 |
 | ConvertFileTaskGroup 파일 | **기존 수정** | 재처리 조회 SQL·함수 + `reprocess_cfg` 분기. 변경 내용 전체: `pipeline/examples/convert_file_taskgroup_example.py` |
 
 > **조회 로직을 왜 부모 파일에 두는가**: 재처리 조회 task는 `__init__` 안에서 만들어야 한다(조회 뒤 처리가 전부 `__init__` 지역 함수라, 밖으로 빼면 그것들을 일일이 넘겨야 하고 헬퍼가 늘 때마다 시그니처가 깨진다). 그렇다고 조회 로직을 DAG 파일에 두면 **공통 모듈이 DAG 파일을 import해야 해서 성립하지 않는다.** 별도 공통 모듈로 빼는 것도 파일만 늘 뿐 이득이 없다.

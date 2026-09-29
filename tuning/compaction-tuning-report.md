@@ -206,7 +206,7 @@
 
 | 항목 | 내용 |
 |------|------|
-| DAG 반영 | 4개 테이블 heap·`memoryOverhead` 확정 완료(3·4번 18g + 3g). 일괄 적용 대기. pod 메모리 4개 합계 916g — 2026-09-18 확정안(3·4번 20g) 대비 48g 감소 |
+| DAG 반영 | 4개 테이블 heap·`memoryOverhead` 확정(3·4번 18g + 3g), **운영 반영 완료**(2026-09-29 확인). pod 메모리 4개 합계 916g — 2026-09-18 확정안(3·4번 20g) 대비 48g 감소 |
 | executor 디스크 | hourly executor당 shuffle 약 5GiB, 권장 10GiB × 노드당 executor 수. 운영 첫 실행에서 사용량 1회 확인 |
 | `spark.memory.fraction` 0.8 | 보류. 캐시를 안 쓰는 job이라 정렬 몫을 60% → 80%로 올리면 2번을 16g로 내릴 여지(2~3회 실험). 시간 될 때 |
 | daily Compaction | 별건. `day` 파티션 테이블 대상이며 크기·구성 미공유 — 이 문서 범위 밖 |

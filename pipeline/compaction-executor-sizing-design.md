@@ -6,7 +6,7 @@
 | 목적 | 데이터 증가·시간대별 편차에 맞춰 executor 수를 자동 조절 |
 | 전제 | 튜닝 결과 확정 (`tuning/compaction-tuning-guide.md`) |
 | 결론 | **Spark Dynamic Allocation + `executorAllocationRatio` 채택.** 1번 9회 + 2번 12회 + 3번 9회 + 4번 14회 실측 검증(섹션 5.1~5.4, 요약 5.5). **`spark.executor.instances` = `initialExecutors` = `minExecutors` 필수** (섹션 4.8) |
-| 진행 | **4개 테이블 heap·`memoryOverhead` 전부 확정 (2026-09-21, 3·4번 18g + 3g). DAG 일괄 반영 대기** — 최종 설정은 섹션 5.5. 여러 시간치 재처리(1번 9시간치, 2번 20시간치, 3번 22시간치, 4번 6시간치)도 같은 설정으로 task error 0 확인, executor 수 수렴 원인(동시 파티션 수) 확정, `max-concurrent-file-group-rewrites` 10 → 12(섹션 5.5) |
+| 진행 | **4개 테이블 heap·`memoryOverhead` 전부 확정 (2026-09-21, 3·4번 18g + 3g). 운영 DAG 반영 완료(2026-09-29 확인, 반영 시점 미기록)** — 최종 설정은 섹션 5.5. 여러 시간치 재처리(1번 9시간치, 2번 20시간치, 3번 22시간치, 4번 6시간치)도 같은 설정으로 task error 0 확인, executor 수 수렴 원인(동시 파티션 수) 확정, `max-concurrent-file-group-rewrites` 10 → 12(섹션 5.5) |
 
 ---
 
@@ -174,7 +174,7 @@ max를 36으로 올려도 24대에서 멈췄다. **실제 사용량은 ratio가 
 ```
 spark.dynamicAllocation.enabled=true
 spark.dynamicAllocation.executorAllocationRatio=0.13        ← 전 테이블 공통
-spark.dynamicAllocation.initialExecutors=<테이블별 평소 대수>  ← 기존 com_num_executor
+spark.dynamicAllocation.initialExecutors=<테이블별 평소 대수>  ← ceil(시간당 GB × 0.32). 기존 com_num_executor와 다를 수 있음 (섹션 8)
 spark.dynamicAllocation.minExecutors=<initialExecutors와 동일>
 spark.dynamicAllocation.maxExecutors=36
 spark.executor.instances=<initialExecutors와 동일>                 ← 섹션 4.8. 다르면 이 값이 바닥이 된다
@@ -484,7 +484,7 @@ C안 상세(산정 위치 대안 비교, 조회 경로 대안 비교, 실패 모
 | executor memory | 테이블별. spill이 0이 되는 최소값 (섹션 8.2). 1번 16g, 2번 20g, 3·4번 18g. **메모리도 dcu에 반영되므로(+5~6%/4g) 필요한 만큼만** |
 | executor `memoryOverhead` | **3g, 4개 테이블 명시.** 4번에서 1g job 실패·2g executor 유실(task error 1~3%)·3g 깨끗(섹션 8.4). 고정값 — 데이터 양과 무관 |
 | driver `memoryOverhead` | 기본값(heap의 10%, 약 410MB) 유지 |
-| 적용 시점 | **DAG 미반영.** 4개 테이블 heap·`memoryOverhead` 확정 완료(2026-09-21, 3·4번 18g 포함) — 섹션 5.5 표로 일괄 적용 |
+| 적용 시점 | **운영 DAG 반영 완료** (사용자 확인 2026-09-29, 반영 시점 미기록). 섹션 5.5 표 기준 |
 | C안 (사전 산정) | 보류. 예시 파일은 유지 |
 
 **더 조절할 여지가 있는가 (2026-09-21 판단)**
@@ -682,7 +682,7 @@ Last State: Terminated   Reason: OOMKilled   Exit Code: 137
 2. **바꿀 수단이 없다.** pod spec에 박히는 값이라 실행 중에는 못 바꾸고, DA가 executor를 더 부를 때도 같은 spec이다
 3. **실패 비용이 크다.** 모자라면 executor가 죽고 재실행이 나며, 재실행도 실패하면 job이 실패한다. 이런 값은 여유를 둔 고정값이 맞고, 재검토는 섹션 9의 조건이 바뀔 때만 한다
 
-**driver `memoryOverhead`**: `spark.driver.memoryOverhead`, 기본값 heap의 10%(최소 384MB) → driver 4g면 약 410MB, pod 4.4g. Compaction에서 driver는 파일 700개를 group 4개로 나누고, job 4개를 띄워 결과를 받고, commit하는 일만 한다 — shuffle 파일도 데이터도 없어 복도에 들어갈 것은 JVM 자체 몫 150MB 정도다. 줄여 봐야 pod 1개에서 200MB이고 실패하면 job 전체가 죽으므로 **기본값이 최선이다.**
+**driver `memoryOverhead`**: `spark.driver.memoryOverhead`, 기본값 heap의 10%(최소 384MB) → driver 4g면 약 410MB, pod 4.4g. Compaction에서 driver는 파일 700개를 group 4개로 나누고, job 4개를 띄워 결과를 받고, commit하는 일만 한다 — shuffle 파일도 데이터도 없어 overhead로 필요한 것은 JVM 자체 몫 150MB 정도다. 줄여 봐야 pod 1개에서 200MB이고 실패하면 job 전체가 죽으므로 **기본값이 최선이다.**
 
 **heap 18g 확정 (2026-09-21)**: test5(18g + 2g)에서 spill 0이었던 신호를 18g + 3g로 3번 3회(1·2·22시간치)·4번 5회(1~6시간치) 돌려 spill 0·task error 0을 확인했다(섹션 5.3·5.4). 3·4번은 21g pod로 확정 — 20g + 3g 대비 executor당 2g, 두 테이블 합계 48g 절감.
 
