@@ -1,12 +1,12 @@
-# 하루 리소스 사용량 시각화 — as-is / to-be 비교 (엑셀 그래프)
+# 하루 리소스 사용량 시각화 — as-is / to-be 비교 (엑셀 + HTML)
 
 > **결론**: 작업 엑셀의 **as-is 시트(튜닝 전)와 to-be 시트(튜닝 후)**를 넣으면, 두 시트의 시각별 동시 CPU·메모리와 하루 총 사용량을 **나란히 비교하는 그래프 엑셀**이 나온다. 예시 데이터(hourly Compaction만 튜닝)에서 하루 CPU 총 사용량은 42,605 → 33,684코어·분(**−21%**), 그중 hourly Compaction이 17,628 → 8,707(−51%)이다. 순간 최대는 147 → 132코어(−10%)로 덜 줄어드는데, 최대 순간을 만드는 daily Compaction·append는 그대로이기 때문이다.
 >
-> 원본 엑셀은 건드리지 않는다. 결과는 같은 폴더에 `<원본이름>_리소스비교.xlsx`로 생긴다.
+> 원본 엑셀은 건드리지 않는다. 결과는 같은 폴더에 `<원본이름>_리소스비교.xlsx`(엑셀)와 `<원본이름>_리소스비교.html`(브라우저용, 마우스를 올리면 값이 보인다)로 생긴다. 글자는 전부 **맑은 고딕 10**.
 
 - 앞 단계: [Airflow job 실행 시간 집계](airflow-job-duration.md) — Duration·Start Offset을 뽑는 스크립트
-- 필요: Python 3.9 이상, `pip install openpyxl`
-- **사내 보안(DRM)이 걸린 작업 엑셀**: **Windows용 Python**에서 실행하고 `pip install xlwings`를 추가한다 → 스크립트가 엑셀을 통해 값을 읽는다 (§2.2). WSL·리눅스 Python은 Windows 엑셀을 조종할 수 없어 안 된다
+- 필요: Python 3.9 이상, `pip install openpyxl plotly` (plotly는 HTML 보고서용. 없으면 엑셀만 만든다)
+- **사내 보안(DRM)이 걸린 작업 엑셀**: **Windows용 Python**에서 실행하고 `pip install xlwings`를 추가한다 → 스크립트가 엑셀을 통해 값을 읽는다 (§2.3). WSL·리눅스 Python은 Windows 엑셀을 조종할 수 없어 안 된다
 
 ---
 
@@ -27,7 +27,7 @@
 
 | 열 | 내용 | 스크립트가 쓰나 |
 |---|---|---|
-| **A** | **job_type** (`job_durations.csv`의 `job_type` 값: `append`, `summary`, `hourly compaction`, `daily compaction`, `expired snapshot`, `delete orphan`, `rewrite manifest`, `other`) | ✅ 그래프에서 쌓는 종류 |
+| **A** | **job_type** (작업 시트에 적은 값 그대로: `append`, `summary`, `comp_range`, `comp_daily`, `exp_snap`, `del_orphan`, `rw_mani` …). **같은 종류 행끼리 병합돼 있어도 된다** — 병합 범위의 모든 행에 첫 행의 값을 채운다 | ✅ 그래프에서 쌓는 종류. 순서·색 = AS-IS 시트에 처음 나온 순서 |
 | **B** | **cron** | ✅ trigger로만 도는 테이블은 **부모 DAG의 cron**을 적는다 (§3.4). 비어 있거나 cron 식이 아니면 그 행만 실행 간격을 추정 |
 | **C** | **app name** | ✅ 결과 표의 이름. **as-is·to-be 행을 짝짓는 키**(종류 + app name) |
 | D~J | 드라이버 cpu, 드라이버 메모리, 드라이버 메모리 오버헤드, 익스큐터 cpu, 익스큐터 메모리, 익스큐터 메모리 오버헤드, 익스큐터 개수 | ❌ (K·L을 만드는 재료) |
@@ -38,10 +38,11 @@
 
 - K·L이 수식이어도 된다. 엑셀에 **저장된 계산값**을 읽는다 (엑셀에서 한 번 저장된 파일이면 값이 들어 있다)
 - 제목 행·빈 행·메모 행은 알아서 건너뛴다. **N열(Duration)과 K열(토탈 cpu)이 둘 다 숫자인 행만** job으로 본다
+- A열이 빈 행(병합도 아님)만 `기타`가 된다. 결과에 `기타`가 보이면 그 행의 A열을 확인한다
 
 ### 1.1 M~S가 비어 있는 행 — 안 돌린 job·삭제한 job
 
-app name(C열)은 있는데 Duration(N열)이 비어 있는 행은 **그 시트의 계산에서 빠지고, "실행 기록 없어 뺀 행" 목록에 찍힌다** (실행 화면과 요약 시트 맨 아래).
+Duration(N열)이 비어 있는 행은 **그 시트의 계산에서 빠진다** (따로 목록을 찍지 않는다).
 
 | 경우 | 처리 | 비교 결과 |
 |---|---|---|
@@ -49,8 +50,8 @@ app name(C열)은 있는데 Duration(N열)이 비어 있는 행은 **그 시트�
 | TO-BE에서 삭제 (AS-IS에만 값) | AS-IS에만 들어감 | `job별 비교`에 TO-BE 칸이 비고, **AS-IS 사용량 전부가 감소**로 잡힌다. 예: daily compaction 한 테이블(하루 1회 × 12.5분 × 50코어 = 625코어·분)을 TO-BE에서 비우면 차이 −625 |
 | TO-BE에서 새로 생김 (TO-BE에만 값) | TO-BE에만 들어감 | TO-BE 사용량 전부가 증가로 잡힌다 |
 
-- 목록은 **붙여넣다 빠뜨린 행**을 찾는 용도다. 목록에 있는 행이 모두 일부러 비운 행인지 한 번 확인한다
-- Duration은 있는데 K열(토탈 cpu)이 빈 행도 같은 목록에 이유와 함께 나온다
+- 붙여넣다 빠뜨린 행이 없는지는 실행 화면의 `job N개`를 작업 시트의 job 수와 맞춰 본다
+- Duration은 있는데 K열(토탈 cpu)이 빈 행도 빠진다
 - **to-be 시트의 Duration**: 튜닝이 운영에 반영되기 전이면 테스트에서 잰 값(예: Compaction 튜닝 실측)을 넣는다. 반영 후에는 `job_durations.py`로 다시 뽑아 교체한다
 - app name이 두 시트에서 다르면 `job별 비교` 시트에서 짝이 안 맞아 두 줄로 나뉜다 — 같은 job은 같은 이름으로 적는다
 
@@ -63,7 +64,7 @@ python resource_timeline.py 작업엑셀.xlsx              # 기준일 = 오늘(
 python resource_timeline.py 작업엑셀.xlsx 20260928     # 기준일 지정
 ```
 
-DRM 파일이면 Windows PowerShell에서 실행한다 (§2.2):
+DRM 파일이면 Windows PowerShell에서 실행한다 (§2.3):
 
 ```powershell
 python resource_timeline.py "C:\경로\작업엑셀.xlsx"
@@ -71,31 +72,34 @@ python resource_timeline.py "C:\경로\작업엑셀.xlsx"
 
 **기준일(선택)**: 그래프로 그릴 하루다. 매일·매시·5분마다 도는 job은 날짜와 무관하고, **3일마다 도는 rewrite manifests(`0 6 */3 * *`)만** 그날 도는지가 날짜에 따라 달라진다. 생략하면 오늘. rewrite manifests까지 넣은 그림을 보려면 도는 날(1·4·7…일)을 준다.
 
-**파일을 못 열 때**: xlsx는 내부가 zip 파일이다. zip이 아니면(사내 DRM·열기 암호·옛 xls·CSV 등) **Windows에서는 종류를 가리지 않고 엑셀을 통해 읽는다** (§2.2). 엑셀은 이 파일들을 다 열 수 있고, DRM 파일은 맨 앞이 글자(보안 제품 표식)로 시작하기도 해서 첫 바이트로 종류를 단정하지 않는다. WSL·리눅스에서는 파일 앞부분을 보여 주고 Windows에서 실행하라고 안내한다.
+**파일을 못 열 때**: xlsx는 내부가 zip 파일이다. zip이 아니면(사내 DRM·열기 암호·옛 xls·CSV 등) **Windows에서는 종류를 가리지 않고 엑셀을 통해 읽는다** (§2.3). 엑셀은 이 파일들을 다 열 수 있고, DRM 파일은 맨 앞이 글자(보안 제품 표식)로 시작하기도 해서 첫 바이트로 종류를 단정하지 않는다. WSL·리눅스에서는 파일 앞부분을 보여 주고 Windows에서 실행하라고 안내한다.
 
 | 경우 | 조치 |
 |---|---|
-| 사내 보안(DRM)·옛 .xls·CSV | Windows용 Python + xlwings로 실행하면 엑셀을 통해 읽는다 (§2.2) |
+| 사내 보안(DRM)·옛 .xls·CSV | Windows용 Python + xlwings로 실행하면 엑셀을 통해 읽는다 (§2.3) |
 | 열기 암호가 걸린 파일 | 엑셀이 암호를 묻다 멈추므로 암호를 먼저 지운다 |
 | `~$`로 시작하는 파일 | 엑셀 잠금 파일이다. 원래 파일 이름을 넣는다 |
 
 실행 화면 예 (예시 데이터):
 
 ```text
-as-is: 시트 'AS-IS' job 32개, 실행 기록 없어 뺀 행 0개, 제외 0개
-to-be: 시트 'TO-BE' job 32개, 실행 기록 없어 뺀 행 0개, 제외 0개
+as-is: 시트 'AS-IS' job 32개, 제외 0개
+to-be: 시트 'TO-BE' job 32개, 제외 0개
 cron 시간대: KST (latest_run 36건 중 36건이 KST 기준 cron과 일치) / 기준일 2026-09-28
 as-is: 최대 동시 CPU 147.0코어 / 메모리 597.6GB, 하루 42,605코어·분 (단순 합산 667.0코어 / 2,217.2GB)
 to-be: 최대 동시 CPU 132.0코어 / 메모리 568.0GB, 하루 33,684코어·분 (단순 합산 591.0코어 / 2,006.8GB)
 → 작업엑셀_리소스비교.xlsx
+→ 작업엑셀_리소스비교.html  (브라우저로 연다)
 ```
+
+`제외`는 cron도 없고 실행 간격도 못 구한 행이다(요약 시트 맨 아래에 이유와 함께 나온다).
 
 ### 2.1 결과 엑셀의 시트
 
 | 시트 | 내용 |
 |---|---|
-| **요약** | 실행 기록 없어 뺀 행 수(맨 아래에 목록), 비교 표(CPU·메모리 각각: 단순 합산 / 실제 최대 / 최대 시각 / 하루 평균 / 하루 총 사용량 — as-is, to-be, 차이, 변화율)와 그래프 4개: ①시각별 동시 CPU as-is vs to-be 선 그래프 ②같은 메모리 ③종류별 하루 CPU 사용량 막대(as-is 회색, to-be 파랑) ④같은 메모리 |
-| **종류별 누적 그래프** | job 종류별로 쌓은 면적 그래프 — as-is CPU, to-be CPU, as-is 메모리, to-be 메모리. **위아래 두 그래프의 세로축 눈금을 같게** 맞춰서 높이를 눈으로 바로 비교할 수 있다 |
+| **요약** | 비교 표(CPU·메모리 각각: 단순 합산 / 실제 최대 / 최대 시각 / 하루 평균 / 하루 총 사용량 — as-is, to-be, 차이, 변화율)와 그래프 4개: ①시각별 동시 CPU as-is vs to-be 선 그래프 ②같은 메모리 ③종류별 하루 CPU 사용량 막대(as-is 회색, to-be 파랑) ④같은 메모리 |
+| **종류별 누적 그래프** | job 종류별로 쌓은 면적 그래프(색 = 종류) — as-is CPU, to-be CPU, as-is 메모리, to-be 메모리. **위아래 두 그래프의 세로축 눈금을 같게** 맞춰서 높이를 눈으로 바로 비교할 수 있다 |
 | as-is 시각별 / to-be 시각별 | 5분 칸 = 1행(288행). 칸마다 종류별 CPU·메모리와 합계(`SUM` 수식). 그래프의 원본 데이터 |
 | as-is job별 / to-be job별 | job마다 종류·cron·하루 실행 횟수·Start Offset·Duration·총 CPU·총 메모리와 `CPU·분 / 일`(= 횟수 × Duration × CPU, 수식), 기능 요약 |
 | **시각별 비교** | 5분 칸마다 as-is·to-be CPU·메모리 합계와 차이 (시각별 시트를 참조하는 수식) |
@@ -103,22 +107,41 @@ to-be: 최대 동시 CPU 132.0코어 / 메모리 568.0GB, 하루 33,684코어·�
 | **job별 비교** | 종류 + app name으로 짝지은 job마다 Duration·총 CPU·총 메모리·하루 사용량의 as-is·to-be·차이 |
 | 최대 순간 job | as-is·to-be 각각 CPU가 가장 높았던 순간에 떠 있던 job 목록 |
 
-비교 표·차이·합계는 수식이라 엑셀이 열 때 계산한다.
+비교 표·차이·합계는 수식이라 엑셀이 열 때 계산한다. 그래프는 폭 30cm·높이 11cm, x축 글자는 2시간마다, 범례는 위, 글자는 전부 맑은 고딕 10.
 
-### 2.2 사내 보안(DRM) 파일 — 엑셀을 통해 읽기
+### 2.2 HTML 보고서 — 브라우저로 보기
+
+`_리소스비교.html`은 같은 결과를 한 장에 담은 파일이다. 더블클릭하면 브라우저(Edge·Chrome)로 열리고, **인터넷 연결 없이** 열린다(그래프 라이브러리를 파일 안에 넣었다, 약 5MB).
+
+| 순서 | 내용 |
+|---|---|
+| 1 | 핵심 숫자 4개 — 하루 총 CPU·최대 동시 CPU·하루 총 메모리·최대 동시 메모리 (to-be 값, 변화율, as-is 값) |
+| 2 | 시각별 동시 CPU·메모리 as-is(회색) vs to-be(파랑) |
+| 3 | 종류별 하루 CPU·메모리 사용량 (가로 막대) |
+| 4 | 요약 비교 표 (엑셀 요약 시트와 같은 값) |
+| 5 | 종류별 누적 CPU·메모리 — as-is(위)·to-be(아래) 같은 세로축 |
+| 6 | job별 비교 표 |
+
+- **마우스를 올리면** 그 시각의 as-is·to-be 값(누적 그래프는 종류별 값)이 한 상자에 나온다
+- **드래그하면 그 구간이 확대**되고, 더블클릭하면 원래대로. 범례의 항목을 누르면 그 선·종류를 끄고 켠다
+- 그래프 오른쪽 위 카메라 버튼 = **PNG 저장**(2배 해상도). PPT에 붙일 때 쓴다
+- plotly가 없으면 `HTML 보고서는 건너뜀 — pip install plotly`가 찍히고 엑셀만 나온다
+
+### 2.3 사내 보안(DRM) 파일 — 엑셀을 통해 읽기
 
 DRM 파일은 암호화돼 있어 Python이 직접 못 연다. 엑셀은 보안 프로그램이 풀어 주므로, **Python이 엑셀을 조종해 셀 값만 받아 온다.** 엑셀 창은 뜨지 않고, 파일은 읽기 전용으로 열었다 닫는다(원본 불변). 이미 열어 둔 엑셀 창과는 별개로 동작한다.
 
 **준비 (한 번만, Windows에서)**
 
 1. Windows용 Python 설치 — python.org에서 받아 설치(관리자 권한 없이 "Install for me only" 가능, **"Add python.exe to PATH" 체크**)
-2. PowerShell에서 `pip install openpyxl xlwings`
+2. PowerShell에서 `pip install openpyxl xlwings plotly`
 
 **실행**: PowerShell에서 `python resource_timeline.py "C:\경로\작업엑셀.xlsx"`. 첫 줄에 `엑셀을 통해 읽는다`가 찍히면 이 경로로 읽은 것이다. 이후 출력·결과 엑셀은 일반 파일과 같다.
 
 - 먼저 되는지 확인하려면 PowerShell에서 `$x = New-Object -ComObject Excel.Application; $b = $x.Workbooks.Open("C:\경로\작업엑셀.xlsx"); $b.Sheets.Item("AS-IS").Range("A1:C3").Value2; $b.Close($false); $x.Quit()` — 셀 값이 나오면 된다. 안 나오면 DRM이 엑셀 조종까지 막는 것이라 보안 해제(반출)만 남는다
 - 수식 셀(K·L 등)은 엑셀이 계산한 값을 받아 오므로 "엑셀에서 저장한 파일" 조건이 필요 없다
-- 결과 엑셀(`_리소스비교.xlsx`)은 Python이 새로 만든 파일이다. 보안 프로그램에 따라 저장 후 자동으로 DRM이 걸릴 수 있으나, 엑셀로 여는 데는 지장이 없다
+- 병합 셀도 엑셀에 병합 범위를 물어 같은 값으로 채운다 (A열 job_type 병합)
+- 결과 엑셀·HTML은 Python이 새로 만든 파일이다. 보안 프로그램에 따라 저장 후 자동으로 DRM이 걸릴 수 있다 — 엑셀은 여는 데 지장이 없고, HTML이 브라우저에서 깨져 보이면 DRM이 걸린 것이다
 
 ---
 
@@ -185,7 +208,8 @@ Airflow cron은 UTC로 적었을 수도, KST로 적었을 수도 있다. 스크�
 | `COL_DESC` | `U` | 기능 요약 열. 없으면 `None` |
 | `CRON_TZ` | `"auto"` | 판단 근거가 없을 때(daily job이 없음) `"KST"`/`"UTC"` 지정 |
 | `BUCKET_MIN` | `5` | 그래프 한 칸의 폭(분). 1440의 약수 |
-| `GROUP_ORDER`, `GROUP_COLORS` | 종류 7개 + 기타 | 종류 순서 = 그래프에 아래부터 쌓이는 순서. 색은 색각 이상 검사를 통과한 팔레트라 순서째로 바꾸지 말 것 |
+| `GROUP_COLORS` | 8색 | 종류 순서(AS-IS 시트에 처음 나온 순서)대로 배정. 9번째 종류부터 회색. 색각 이상 검사를 통과한 팔레트라 순서째로 바꾸지 말 것 |
+| `FONT`, `FONT_SIZE` | `맑은 고딕`, `10` | 결과 엑셀·HTML 전체 글꼴 |
 
 ---
 
@@ -211,8 +235,8 @@ Airflow cron은 UTC로 적었을 수도, KST로 적었을 수도 있다. 스크�
     python resource_timeline.py <작업엑셀.xlsx>              # 기준일 = 오늘
     python resource_timeline.py <작업엑셀.xlsx> 20260928     # 기준일 지정 (3일마다 도는 job 등이 달라진다)
   as-is·to-be 시트는 이름으로 찾는다 (as-is / asis / AS_IS, to-be / tobe …). 다르면 SHEET_ASIS·SHEET_TOBE에 이름을 넣는다
-결과: 같은 폴더에 <작업엑셀>_리소스비교.xlsx  (원본은 건드리지 않는다)
-필요: pip install openpyxl
+결과: 같은 폴더에 <작업엑셀>_리소스비교.xlsx + <작업엑셀>_리소스비교.html(브라우저용)  (원본은 건드리지 않는다)
+필요: pip install openpyxl plotly   (plotly가 없으면 HTML은 건너뛰고 엑셀만 만든다)
   사내 보안(DRM)이 걸린 파일은 Python이 직접 못 연다 → Windows용 Python에서 실행하면 엑셀을 통해 값을 읽는다
   (pip install xlwings 추가. WSL·리눅스에서는 엑셀을 조종할 수 없어 안 된다)
 """
@@ -226,6 +250,9 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import AreaChart, BarChart, LineChart, Reference
 from openpyxl.chart.axis import ChartLines
+from openpyxl.chart.text import RichText, Text
+from openpyxl.chart.title import Title
+from openpyxl.drawing.text import CharacterProperties, Font as DrawingFont, Paragraph, ParagraphProperties, RegularTextRun
 from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.drawing.line import LineProperties
 from openpyxl.comments import Comment
@@ -251,16 +278,16 @@ COL_DESC = "U"               # 기능 요약 (결과 표에 같이 보여 준다
 # cron을 어느 시간대로 적었나: "auto"(latest_run으로 판단) / "KST" / "UTC". 그래프는 항상 KST로 그린다
 CRON_TZ = "auto"
 KST = timezone(timedelta(hours=9))
-# job 종류 순서와 색 (앞에서부터 고정 순서로 배정, 검증된 범주형 팔레트)
-GROUP_ORDER = ["append", "summary", "hourly compaction", "daily compaction",
-               "expired snapshot", "delete orphan", "rewrite manifest", "기타"]
+# job 종류 = 작업 시트 A열(job_type) 값 그대로(append, summary, comp_range …). 순서는 AS-IS 시트에 처음 나온 순서.
+# A열이 병합돼 있으면 병합 범위의 모든 행에 같은 값을 채운다. 색은 그 순서대로 아래 팔레트에서 배정(9번째부터 회색)
 GROUP_COLORS = ["2A78D6", "EB6834", "1BAF7A", "EDA100", "E87BA4", "008300", "4A3AA7", "E34948"]
 # 그래프 한 칸의 폭(분). 칸 안에서 합계가 가장 큰 순간의 값을 그 칸의 값으로 쓴다.
 # 1로 두면 5분 주기 append가 켜졌다 꺼지는 톱니가 그대로 보여 읽기 어렵다. 1440의 약수로 (1, 5, 10, 15 …)
 BUCKET_MIN = 5
 # ─────────────────────────────────────────────────────────────────────
 
-FONT = "Arial"
+FONT = "맑은 고딕"                # 글꼴·크기는 결과 엑셀·HTML 전체에 하나로 통일
+FONT_SIZE = 10
 SAMPLES_PER_MIN = 10          # 6초 간격으로 동시 사용량을 잰다
 
 NB = 1440 // BUCKET_MIN        # 하루 칸 수
@@ -367,62 +394,30 @@ def to_utc(v):
     return None
 
 
-def classify(text, cron):
-    """구분 열이 없을 때 이름으로 job 종류를 추정한다 (job_durations.py의 job_type과 같은 규칙)."""
-    t = text.lower()
-    if "append" in t or "convert_file" in t:
-        return "append"
-    if "summary" in t:
-        return "summary"
-    if "compaction" in t:
-        f = cron.split()
-        hourly = cron.strip() == "@hourly" or (len(f) == 5 and f[1] in ("*", "*/1")) or "hourly" in t
-        return "hourly compaction" if hourly else "daily compaction"
-    if "expire" in t:
-        return "expired snapshot"
-    if "orphan" in t:
-        return "delete orphan"
-    if "manifest" in t:
-        return "rewrite manifest"
-    return "기타"
-
-
-def normalize_group(v):
-    s = str(v).strip().lower()
-    if s == "other":                             # job_durations.py의 job_type "other"
-        return "기타"
-    for g in GROUP_ORDER:
-        if s == g:
-            return g
-    return str(v).strip()
-
-
 # ── 입력 읽기 ─────────────────────────────────────────────────────────
+def sheet_rows(ws):
+    """(행 번호, [A열부터의 값]) 목록. 병합 셀은 병합 범위의 모든 칸에 왼쪽 위 칸의 값을 채운다
+    (예: A2:A9를 병합해 'append'를 한 번만 적었으면 2~9행 모두 'append')."""
+    rows = {r[0].row: [c.value for c in r] for r in ws.iter_rows(min_col=1)}
+    for rng in ws.merged_cells.ranges:
+        v = ws.cell(row=rng.min_row, column=rng.min_col).value
+        for r in range(rng.min_row, rng.max_row + 1):
+            for c in range(rng.min_col, rng.max_col + 1):
+                if r in rows and c - 1 < len(rows[r]):
+                    rows[r][c - 1] = v
+    return sorted(rows.items())
+
+
 def read_jobs(ws):
     col = lambda letter: column_index_from_string(letter) - 1
-    rows = [(r[0].row, [c.value for c in r]) for r in ws.iter_rows()]
+    rows = sheet_rows(ws)
     data = [(rn, vals) for rn, vals in rows
             if len(vals) > col(COL_DURATION) and to_number(vals[col(COL_DURATION)]) is not None
             and to_number(vals[col(COL_TOTAL_CPU)]) is not None]
     if not data:
         raise SystemExit(f"{COL_DURATION}열(Duration)과 {COL_TOTAL_CPU}열(토탈 cpu)에 숫자가 있는 행이 없다 — 열 설정을 확인. "
                          f"{COL_TOTAL_CPU}열이 수식이면 엑셀에서 열어 저장한 파일이어야 계산값이 읽힌다")
-    # 실행 기록 없어 뺀 행: app name은 있는데 Duration이 비었거나, Duration은 있는데 토탈 cpu가 빈 행
-    # (의도적으로 안 돌린 job·to-be에서 삭제한 job — 붙여넣다 빠뜨린 행도 여기 나오므로 목록으로 확인한다)
-    in_data = {rn for rn, _ in data}
-    cell = lambda vals, letter: vals[col(letter)] if len(vals) > col(letter) else None
-    no_run = []
-    for rn, vals in rows:
-        name = cell(vals, COL_NAME)
-        if rn in in_data or not isinstance(name, str) or not name.strip():
-            continue
-        dur = cell(vals, COL_DURATION)
-        if dur is None or (isinstance(dur, str) and not dur.strip()):
-            no_run.append((rn, str(cell(vals, COL_GROUP) or "").strip(), name.strip(),
-                           f"{COL_RUNS}~{COL_LATEST}열(Duration) 비어 있음"))
-        elif to_number(dur) is not None:
-            no_run.append((rn, str(cell(vals, COL_GROUP) or "").strip(), name.strip(),
-                           f"{COL_TOTAL_CPU}열(토탈 cpu) 비어 있음"))
+    # Duration(N열)이 빈 행(안 돌린 job·to-be에서 삭제한 job)은 여기서 빠진다
 
     jobs, skipped = [], []
     for rn, vals in data:
@@ -446,10 +441,9 @@ def read_jobs(ws):
                 continue
             job["every"] = every
             job["cron_text"] = f"{every}분마다 (추정)"
-        job["group"] = normalize_group(get(COL_GROUP)) if get(COL_GROUP) else classify(
-            name, job["cron_text"] if job["cron"] else ("0 * * * *" if job["every"] <= 60 else "0 0 * * *"))
+        job["group"] = str(get(COL_GROUP) or "").strip() or "기타"
         jobs.append(job)
-    return jobs, skipped, no_run
+    return jobs, skipped
 
 
 NICE_INTERVALS = [1, 2, 3, 5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440, 2880, 4320, 10080]
@@ -502,9 +496,13 @@ def fire_times(j, day, cron_tz):
 
 
 def order_groups(jobs):
-    """job 종류를 GROUP_ORDER 순서로. 목록에 없는 종류는 뒤에 이름순."""
-    return [g for g in GROUP_ORDER if any(j["group"] == g for j in jobs)] + \
-        sorted({j["group"] for j in jobs} - set(GROUP_ORDER))
+    """job 종류를 작업 시트에 처음 나온 순서로 (AS-IS → TO-BE 순으로 훑는다)."""
+    return list(dict.fromkeys(j["group"] for j in jobs))
+
+
+def group_color(groups, g):
+    i = groups.index(g)
+    return GROUP_COLORS[i] if i < len(GROUP_COLORS) else "8C8C8C"
 
 
 def simulate(jobs, day, cron_tz, groups):
@@ -560,28 +558,34 @@ def active_jobs(jobs, runs_all, t_min):
 # ── 엑셀 쓰기 ─────────────────────────────────────────────────────────
 SIDES = ("as-is", "to-be")
 SIDE_COLORS = {"as-is": "9AA0A6", "to-be": "2A78D6"}     # 튜닝 전 = 회색(기준), 튜닝 후 = 파랑
-HEAD_FILL = PatternFill("solid", fgColor="E9EEF5")
-THIN = Side(style="thin", color="C9CED6")
+INK, MUTED, GRID = "1F2328", "6B6B6B", "E3E6EA"
+HEAD_FILL = PatternFill("solid", fgColor="EEF2F7")
+THIN = Side(style="thin", color="D5DAE1")
 BORDER = Border(bottom=THIN)
-NOTE_FONT = Font(name=FONT, size=9, color="6B6B6B")
+NOTE_FONT = Font(name=FONT, size=FONT_SIZE, color=MUTED)
+BOLD_FONT = Font(name=FONT, size=FONT_SIZE, bold=True, color=INK)
 SIGNED = "+#,##0.0;-#,##0.0;0.0"
 SIGNED_PCT = "+0.0%;-0.0%;0.0%"
+CHART_W, CHART_H, CHART_ROWS = 30, 11, 23      # 그래프 폭·높이(cm), 그래프 하나가 차지하는 행 수
+LABEL_EVERY_MIN = 120                          # x축 눈금 글자 간격(분) — 2시간마다
 
 
 def style_header(ws, row, ncol, first=1):
     for c in range(first, first + ncol):
         cell = ws.cell(row=row, column=c)
-        cell.font = Font(name=FONT, bold=True, size=10)
+        cell.font = BOLD_FONT
         cell.fill = HEAD_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = BORDER
 
 
 def set_font(ws):
+    """시트의 모든 글자를 맑은 고딕 10으로 (굵기·색만 유지)."""
     for row in ws.iter_rows():
         for c in row:
-            if c.value is not None and not c.font.bold:
-                c.font = Font(name=FONT, size=c.font.size or 10, color=c.font.color)
+            if c.value is not None:
+                c.font = Font(name=FONT, size=FONT_SIZE, bold=c.font.bold,
+                              color=c.font.color if c.font.color and c.font.color.rgb not in (None, "FF000000") else INK)
 
 
 def nice_max(v):
@@ -592,65 +596,91 @@ def nice_max(v):
     return next(m * mag for m in (1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10) if v <= m * mag)
 
 
-def style_axes(ch, x_title, y_title, y_max=None):
-    ch.x_axis.title, ch.y_axis.title = x_title, y_title
+# ── 그래프 글자: 맑은 고딕 10 ──────────────────────────────────────────
+def _char(bold=False, color=INK):
+    return CharacterProperties(latin=DrawingFont(typeface=FONT), ea=DrawingFont(typeface=FONT),
+                               sz=FONT_SIZE * 100, b=bold, solidFill=color)
+
+
+def _rich(bold=False, color=INK):
+    return RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=_char(bold, color)), endParaRPr=_char(bold, color))])
+
+
+def _title(text, bold=True, color=INK):
+    para = Paragraph(pPr=ParagraphProperties(defRPr=_char(bold, color)), r=[RegularTextRun(rPr=_char(bold, color), t=text)])
+    return Title(tx=Text(rich=RichText(p=[para])), overlay=False)
+
+
+def style_chart(ch, title, y_title, y_max=None, y_fmt="#,##0"):
+    ch.title = _title(title)
+    ch.y_axis.title = _title(y_title, bold=False, color=MUTED)
     ch.x_axis.delete = ch.y_axis.delete = False
-    ch.y_axis.majorGridlines = ChartLines(spPr=GraphicalProperties(ln=LineProperties(solidFill="E3E6EA")))
+    ch.x_axis.txPr = ch.y_axis.txPr = _rich(color=MUTED)
+    ch.y_axis.numFmt = y_fmt
+    ch.y_axis.majorGridlines = ChartLines(spPr=GraphicalProperties(ln=LineProperties(solidFill=GRID)))
+    ch.x_axis.spPr = GraphicalProperties(ln=LineProperties(solidFill=GRID))
+    ch.y_axis.spPr = GraphicalProperties(ln=LineProperties(noFill=True))
+    ch.x_axis.majorTickMark = ch.y_axis.majorTickMark = "none"
     if y_max:
         ch.y_axis.scaling.min, ch.y_axis.scaling.max = 0, y_max
-    ch.legend.position = "b"
-    ch.height, ch.width = 9, 26
+    ch.legend.position = "t"
+    ch.legend.txPr = _rich()
+    ch.graphical_properties = GraphicalProperties(ln=LineProperties(noFill=True))   # 그래프 바깥 테두리 없음
+    ch.width, ch.height = CHART_W, CHART_H
 
 
 def time_axis(ch):
-    ch.x_axis.tickLblSkip = 60 // BUCKET_MIN            # 정시마다 눈금
-    ch.x_axis.tickMarkSkip = 60 // BUCKET_MIN
+    ch.x_axis.tickLblSkip = LABEL_EVERY_MIN // BUCKET_MIN
+    ch.x_axis.tickMarkSkip = LABEL_EVERY_MIN // BUCKET_MIN
+    ch.x_axis.noMultiLvlLbl = True
 
 
 def area_chart(title, ws, groups, first_col, label_col, y_title, y_max):
     ch = AreaChart()
     ch.grouping = "stacked"
-    ch.title = title
     ch.add_data(Reference(ws, min_col=first_col, max_col=first_col + len(groups) - 1, min_row=1, max_row=NB + 1),
                 titles_from_data=True)
     ch.set_categories(Reference(ws, min_col=label_col, min_row=2, max_row=NB + 1))
     for g, s in zip(groups, ch.series):
-        color = GROUP_COLORS[GROUP_ORDER.index(g)] if g in GROUP_ORDER else "8C8C8C"
-        s.graphicalProperties.solidFill = color
+        s.graphicalProperties.solidFill = group_color(groups, g)
         s.graphicalProperties.line.noFill = True
     time_axis(ch)
-    style_axes(ch, "시각 (KST)", y_title, y_max)
+    style_chart(ch, title, y_title, y_max)
     return ch
 
 
 def compare_line_chart(title, ws, cols, label_col, y_title, y_max):
     ch = LineChart()
-    ch.title = title
     for c in cols:
         ch.add_data(Reference(ws, min_col=c, min_row=1, max_row=NB + 1), titles_from_data=True)
     ch.set_categories(Reference(ws, min_col=label_col, min_row=2, max_row=NB + 1))
     for side, s in zip(SIDES, ch.series):
         s.graphicalProperties.line.solidFill = SIDE_COLORS[side]
-        s.graphicalProperties.line.width = 22860        # 1.8pt
+        s.graphicalProperties.line.width = 25400        # 2pt
         s.marker.symbol = "none"
         s.smooth = False
     time_axis(ch)
-    style_axes(ch, "시각 (KST)", y_title, y_max)
+    style_chart(ch, title, y_title, y_max)
     return ch
 
 
 def compare_bar_chart(title, ws, first_row, last_row, cols, y_title):
     ch = BarChart()
-    ch.type, ch.grouping, ch.title = "col", "clustered", title
+    ch.type, ch.grouping = "col", "clustered"
     for c in cols:
         ch.add_data(Reference(ws, min_col=c, min_row=first_row - 1, max_row=last_row), titles_from_data=True)
     ch.set_categories(Reference(ws, min_col=1, min_row=first_row, max_row=last_row))
     for side, s in zip(SIDES, ch.series):
         s.graphicalProperties.solidFill = SIDE_COLORS[side]
         s.graphicalProperties.line.noFill = True
-    ch.gapWidth = 80
-    style_axes(ch, "job 종류", y_title)
+    ch.gapWidth, ch.overlap = 60, -10
+    style_chart(ch, title, y_title)
     return ch
+
+
+def time_label(t):
+    """그래프 x축에 찍을 글자 — LABEL_EVERY_MIN마다만 (나머지 칸은 빈칸이라 글자가 겹치지 않는다)."""
+    return f"{t // 60:02d}:00" if t % LABEL_EVERY_MIN == 0 else ""
 
 
 def write_timeline(wb, side, groups, per_minute):
@@ -673,12 +703,13 @@ def write_timeline(wb, side, groups, per_minute):
             ws.cell(row=r, column=tot,
                     value=f"=SUM({get_column_letter(first)}{r}:{get_column_letter(first + g - 1)}{r})"
                     ).number_format = "#,##0.0"
-        ws.cell(row=r, column=label_col, value=f"{t // 60:02d}:00" if t % 60 == 0 else "")
+        ws.cell(row=r, column=label_col, value=time_label(t))
     style_header(ws, 1, len(headers))
+    ws.row_dimensions[1].height = 30
     ws.freeze_panes = "B2"
     ws.column_dimensions["A"].width = 11
     for c in range(2, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 14
+        ws.column_dimensions[get_column_letter(c)].width = 16
     ws["A1"].comment = Comment(f"스크립트가 cron·Start Offset·Duration으로 계산한 값이다. 6초 간격으로 잰 동시 사용량 중 "
                                f"그 {BUCKET_MIN}분 안에서 합계가 가장 컸던 순간의 값. 작업 시트가 바뀌면 스크립트를 다시 돌린다.",
                                "resource_timeline.py")
@@ -698,8 +729,9 @@ def write_jobs(wb, side, jobs, runs):
         for c, fmt in ((6, "0.0"), (7, "0.0"), (8, "#,##0.0"), (9, "#,##0.0"), (10, "#,##0"), (11, "#,##0")):
             ws.cell(row=r, column=c).number_format = fmt
     style_header(ws, 1, 12)
+    ws.row_dimensions[1].height = 30
     ws.freeze_panes = "D2"
-    for c, w in zip("ABCDEFGHIJKL", (9, 17, 34, 15, 10, 11, 11, 11, 12, 12, 14, 40)):
+    for c, w in zip("ABCDEFGHIJKL", (11, 18, 36, 16, 12, 13, 13, 13, 14, 14, 16, 44)):
         ws.column_dimensions[c].width = w
     set_font(ws)
     return len(jobs) + 1
@@ -717,10 +749,11 @@ def write_compare_timeline(wb, tl):
             ws.cell(row=r, column=col, value=f"='{side} 시각별'!{tl[side][key]}{r}").number_format = "#,##0.0"
         ws.cell(row=r, column=4, value=f"=C{r}-B{r}").number_format = SIGNED
         ws.cell(row=r, column=7, value=f"=F{r}-E{r}").number_format = SIGNED
-        ws.cell(row=r, column=8, value=f"{t // 60:02d}:00" if t % 60 == 0 else "")
+        ws.cell(row=r, column=8, value=time_label(t))
     style_header(ws, 1, 8)
+    ws.row_dimensions[1].height = 30
     ws.freeze_panes = "B2"
-    for c, w in zip("ABCDEFGH", (11, 14, 14, 12, 15, 15, 12, 11)):
+    for c, w in zip("ABCDEFGH", (11, 16, 16, 12, 17, 17, 13, 12)):
         ws.column_dimensions[c].width = w
     set_font(ws)
     return ws
@@ -738,7 +771,7 @@ def write_group_compare(wb, groups, last):
         for col, side, src in ((2, "as-is", "J"), (3, "to-be", "J"), (6, "as-is", "K"), (7, "to-be", "K")):
             ws.cell(row=r, column=col, value=f"=SUMIF({rng(side, 'B')},$A{r},{rng(side, src)})")
     tr = len(groups) + 2
-    ws.cell(row=tr, column=1, value="합계").font = Font(name=FONT, bold=True, size=10)
+    ws.cell(row=tr, column=1, value="합계").font = BOLD_FONT
     for col in (2, 3, 6, 7):
         L = get_column_letter(col)
         ws.cell(row=tr, column=col, value=f"=SUM({L}2:{L}{tr - 1})")
@@ -754,7 +787,8 @@ def write_group_compare(wb, groups, last):
             for c in range(1, 10):
                 ws.cell(row=r, column=c).border = Border(top=THIN)
     style_header(ws, 1, 9)
-    for c, w in zip("ABCDEFGHI", (18, 14, 14, 12, 11, 16, 16, 13, 12)):
+    ws.row_dimensions[1].height = 30
+    for c, w in zip("ABCDEFGHI", (20, 16, 16, 13, 12, 19, 19, 14, 13)):
         ws.column_dimensions[c].width = w
     ws.cell(row=tr + 2, column=1, value="CPU·분 / 일 = 하루 실행 횟수 × Duration × 총 CPU — 하루 동안 쓴 CPU의 양 "
                                         "(10코어로 6분 = 60코어·분). 변화율이 음수면 튜닝으로 줄었다").font = NOTE_FONT
@@ -762,13 +796,8 @@ def write_group_compare(wb, groups, last):
     return ws, tr
 
 
-def write_job_compare(wb, sides_jobs):
-    """job별 비교: (종류, app name)으로 as-is·to-be 행을 짝지어 나란히. 값은 각 job별 시트 참조."""
-    ws = wb.create_sheet("job별 비교")
-    ws.append(["종류", "app name", "기능 요약", "as-is Duration (min)", "to-be Duration (min)",
-               "as-is 총 CPU", "to-be 총 CPU", "as-is 총 메모리 (GB)", "to-be 총 메모리 (GB)",
-               "as-is CPU·분 / 일", "to-be CPU·분 / 일", "CPU·분 차이",
-               "as-is 메모리 GB·분 / 일", "to-be 메모리 GB·분 / 일", "메모리 GB·분 차이"])
+def job_pairs(sides_jobs, groups):
+    """(종류, app name)으로 as-is·to-be job을 짝짓는다. 순서 = 종류 순서 → 처음 나온 순서."""
     keys, pos = [], {}
     for side in SIDES:
         for i, j in enumerate(sides_jobs[side]):
@@ -776,11 +805,21 @@ def write_job_compare(wb, sides_jobs):
             if k not in pos:
                 pos[k] = {"desc": j["desc"]}
                 keys.append(k)
-            pos[k][side] = i + 2                       # job별 시트의 행
+            pos[k][side] = i
             pos[k]["desc"] = pos[k]["desc"] or j["desc"]
-    order = {g: n for n, g in enumerate(GROUP_ORDER)}
-    seen = {k: n for n, k in enumerate(keys)}          # 처음 나온 순서 (as-is 순서, to-be에만 있는 job은 뒤)
-    keys.sort(key=lambda k: (order.get(k[0], len(order)), seen[k]))
+    seen = {k: n for n, k in enumerate(keys)}
+    keys.sort(key=lambda k: (groups.index(k[0]), seen[k]))
+    return keys, pos
+
+
+def write_job_compare(wb, sides_jobs, groups):
+    """job별 비교: (종류, app name)으로 as-is·to-be 행을 짝지어 나란히. 값은 각 job별 시트 참조."""
+    ws = wb.create_sheet("job별 비교")
+    ws.append(["종류", "app name", "기능 요약", "as-is Duration (min)", "to-be Duration (min)",
+               "as-is 총 CPU", "to-be 총 CPU", "as-is 총 메모리 (GB)", "to-be 총 메모리 (GB)",
+               "as-is CPU·분 / 일", "to-be CPU·분 / 일", "CPU·분 차이",
+               "as-is 메모리 GB·분 / 일", "to-be 메모리 GB·분 / 일", "메모리 GB·분 차이"])
+    keys, pos = job_pairs(sides_jobs, groups)
     for i, k in enumerate(keys):
         r = i + 2
         ws.cell(row=r, column=1, value=k[0])
@@ -790,12 +829,13 @@ def write_job_compare(wb, sides_jobs):
                                    ((10, 11), "J", "#,##0"), ((13, 14), "K", "#,##0")):
             for col, side in ((ca, "as-is"), (ct, "to-be")):
                 if side in pos[k]:
-                    ws.cell(row=r, column=col, value=f"='{side} job별'!{src}{pos[k][side]}").number_format = fmt
+                    ws.cell(row=r, column=col, value=f"='{side} job별'!{src}{pos[k][side] + 2}").number_format = fmt
         ws.cell(row=r, column=12, value=f"=N(K{r})-N(J{r})").number_format = "+#,##0;-#,##0;0"
         ws.cell(row=r, column=15, value=f"=N(N{r})-N(M{r})").number_format = "+#,##0;-#,##0;0"
     style_header(ws, 1, 15)
+    ws.row_dimensions[1].height = 30
     ws.freeze_panes = "C2"
-    for c, w in zip("ABCDEFGHIJKLMNO", (17, 34, 30, 11, 11, 10, 10, 12, 12, 12, 12, 11, 13, 13, 12)):
+    for c, w in zip("ABCDEFGHIJKLMNO", (18, 36, 32, 13, 13, 12, 12, 14, 14, 14, 14, 13, 16, 16, 14)):
         ws.column_dimensions[c].width = w
     note = len(keys) + 3
     ws.cell(row=note, column=1, value="짝짓기 기준 = 종류 + app name. 한쪽에만 있는 job은 다른 쪽 칸이 비고, 차이는 빈칸을 0으로 본다"
@@ -803,17 +843,19 @@ def write_job_compare(wb, sides_jobs):
     set_font(ws)
 
 
+def peak_jobs(d):
+    pb = max(range(NB), key=lambda m: sum(d["per_minute"]["cpu"][m][x] for x in d["groups"]))
+    t = d["per_minute"]["cpu"][pb]["_sample"] / SAMPLES_PER_MIN + 0.05
+    return t, sorted(active_jobs(d["jobs"], d["spans"], t), key=lambda j: -j["cpu"])
+
+
 def write_peaks(wb, sides):
     ws = wb.create_sheet("최대 순간 job")
     r = 1
     for side in SIDES:
-        d = sides[side]
-        pb = max(range(NB), key=lambda m: sum(d["per_minute"]["cpu"][m][x] for x in d["groups"]))
-        t = d["per_minute"]["cpu"][pb]["_sample"] / SAMPLES_PER_MIN + 0.05
-        act = sorted(active_jobs(d["jobs"], d["spans"], t), key=lambda j: -j["cpu"])
+        t, act = peak_jobs(sides[side])
         ws.cell(row=r, column=1, value=f"{side} — 최대 CPU 순간({int(t) // 60:02d}:{int(t) % 60:02d})에 떠 있던 job "
-                                       f"{len(act)}개, 합계 {sum(j['cpu'] for j in act):,.1f}코어"
-                ).font = Font(name=FONT, bold=True, size=11)
+                                       f"{len(act)}개, 합계 {sum(j['cpu'] for j in act):,.1f}코어").font = BOLD_FONT
         for c, h in enumerate(["app name", "종류", "총 CPU (코어)", "총 메모리 (GB)", "기능 요약"], 1):
             ws.cell(row=r + 1, column=c, value=h)
         style_header(ws, r + 1, 5)
@@ -824,13 +866,34 @@ def write_peaks(wb, sides):
             ws.cell(row=i, column=4, value=j["mem"]).number_format = "#,##0.0"
             ws.cell(row=i, column=5, value=j["desc"] or None)
         r += len(act) + 4
-    for c, w in zip("ABCDE", (34, 18, 13, 14, 40)):
+    for c, w in zip("ABCDE", (36, 20, 15, 16, 44)):
         ws.column_dimensions[c].width = w
     set_font(ws)
 
 
+def summary_metrics(sides):
+    """요약 비교 표의 값 (엑셀은 수식, HTML은 이 값). 단위: CPU 코어 / 메모리 GB."""
+    out = {}
+    for side in SIDES:
+        d = sides[side]
+        tot = {k: [sum(d["per_minute"][k][m][g] for g in d["groups"]) for m in range(NB)] for k in ("cpu", "mem")}
+        n_runs = [len(d["runs"].get(i, [])) for i in range(len(d["jobs"]))]
+        out[side] = {}
+        for k in ("cpu", "mem"):
+            day = sum(n * j["duration"] * j[k] for n, j in zip(n_runs, d["jobs"]))
+            peak = max(tot[k])
+            pm = tot[k].index(peak) * BUCKET_MIN
+            out[side][k] = {"simple": sum(j[k] for j in d["jobs"]), "peak": peak, "peak_at": f"{pm // 60:02d}:{pm % 60:02d}",
+                            "avg": day / 1440, "day": day, "series": tot[k]}
+        out[side]["group_day"] = {k: {g: sum(n * j["duration"] * j[k] for n, j in zip(n_runs, d["jobs"]) if j["group"] == g)
+                                      for g in d["groups"]} for k in ("cpu", "mem")}
+    return out
+
+
 def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
     wb = Workbook()
+    wb._fonts[0] = Font(name=FONT, size=FONT_SIZE)            # 빈 칸에 새로 입력하는 글자도 맑은 고딕 10
+    wb._named_styles["Normal"].font = Font(name=FONT, size=FONT_SIZE)
     s = wb.active
     s.title = "요약"
     tl, last = {}, {}
@@ -842,37 +905,37 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
         last[side] = write_jobs(wb, side, sides[side]["jobs"], sides[side]["runs"])
     cmp_ws = write_compare_timeline(wb, tl)
     grp_ws, grp_total = write_group_compare(wb, groups, last)
-    write_job_compare(wb, {side: sides[side]["jobs"] for side in SIDES})
+    write_job_compare(wb, {side: sides[side]["jobs"] for side in SIDES}, groups)
     write_peaks(wb, sides)
     stack = wb.create_sheet("종류별 누적 그래프")
 
     # ── 요약
-    for c, w in zip("ABCDEF", (30, 14, 14, 16, 11, 52)):
+    s.sheet_view.showGridLines = False
+    for c, w in zip("ABCDEF", (26, 16, 16, 20, 12, 70)):
         s.column_dimensions[c].width = w
     s["A1"] = "하루 리소스 사용량 — as-is / to-be 비교"
-    s["A1"].font = Font(name=FONT, bold=True, size=14)
+    s["A1"].font = BOLD_FONT
     info = [
         ("기준일 (KST)", day.isoformat(), "3일마다 도는 job 등은 기준일에 따라 포함 여부가 달라진다"),
         ("원본", src, f"as-is = '{sides['as-is']['sheet']}' 시트, to-be = '{sides['to-be']['sheet']}' 시트"),
         ("cron 시간대", cron_tz, tz_reason),
         ("Duration 기준", {COL_DUR_AVG: "평균", COL_DUR_MEDIAN: "중앙값", COL_DUR_MAX: "최댓값"}.get(COL_DURATION, COL_DURATION),
          "스크립트 상단 COL_DURATION으로 바꾼다"),
-        ("실행 기록 없어 뺀 행", f"as-is {len(sides['as-is']['no_run'])}개 · to-be {len(sides['to-be']['no_run'])}개",
-         "Duration이 빈 행(안 돌린 job·삭제한 job). 목록은 이 시트 맨 아래 — 붙여넣다 빠뜨린 행이 없는지 확인"),
     ]
     for i, (k, v, note) in enumerate(info, start=3):
-        s.cell(row=i, column=1, value=k).font = Font(name=FONT, bold=True, size=10)
+        s.cell(row=i, column=1, value=k).font = BOLD_FONT
         s.cell(row=i, column=2, value=v)
         s.cell(row=i, column=6, value=note).font = NOTE_FONT
 
     cmp = lambda col: f"'시각별 비교'!${col}$2:${col}${NB + 1}"
     job = lambda side, col: f"SUM('{side} job별'!{col}2:{col}{last[side]})"
-    r = 9
+    r = 8
     for unit, (ca, cb), jc, tc, sc in (("CPU (코어)", ("B", "C"), "H", "J", "코어"),
                                         ("메모리 (GB)", ("E", "F"), "I", "K", "GB")):
         for c, h in enumerate([unit, "as-is", "to-be", "차이 (to-be − as-is)", "변화율", "뜻"], 1):
             s.cell(row=r, column=c, value=h)
         style_header(s, r, 6)
+        s.row_dimensions[r].height = 22
         rows = [
             ("설정값 단순 합산", f"={job('as-is', jc)}", f"={job('to-be', jc)}",
              "모든 job이 동시에 떠 있다고 가정한 값 — 실제로는 일어나지 않는다"),
@@ -882,10 +945,10 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
             ("하루 평균 사용량", f"={job('as-is', tc)}/1440", f"={job('to-be', tc)}/1440",
              "하루 총 사용량 ÷ 1,440분"),
             (f"하루 총 사용량 ({sc}·분)", f"={job('as-is', tc)}", f"={job('to-be', tc)}",
-             f"하루 실행 횟수 × Duration × 총 {'CPU' if sc == '코어' else '메모리'}의 합 — 하루 동안 쓴 양"),
+             f"하루 실행 횟수 × Duration × 총 {'CPU' if sc == '코어' else '메모리'}의 합 — 튜닝 효과는 이 값으로 본다"),
         ]
         for i, (k, fa, fb, note) in enumerate(rows, start=r + 1):
-            s.cell(row=i, column=1, value=k).font = Font(name=FONT, bold=True, size=10)
+            s.cell(row=i, column=1, value=k).font = BOLD_FONT
             if k == "최대가 나온 시각":
                 for col, src_col in ((2, ca), (3, cb)):
                     peak = f"{get_column_letter(col)}{r + 2}"
@@ -897,40 +960,26 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
                 s.cell(row=i, column=4, value=f"=C{i}-B{i}").number_format = SIGNED
                 s.cell(row=i, column=5, value=f'=IF(B{i}=0,"",D{i}/B{i})').number_format = SIGNED_PCT
             s.cell(row=i, column=6, value=note).font = NOTE_FONT
+            for c in range(1, 7):
+                s.cell(row=i, column=c).border = BORDER
+            s.row_dimensions[i].height = 20
         r += len(rows) + 2
     s.cell(row=r - 1, column=1, value="변화율이 음수면 튜닝 후 줄어든 것이다. 세부는 '종류별 비교'·'job별 비교' 시트").font = NOTE_FONT
 
     ymax_cpu = nice_max(max(sum(sides[x]["per_minute"]["cpu"][m][g] for g in groups) for x in SIDES for m in range(NB)))
     ymax_mem = nice_max(max(sum(sides[x]["per_minute"]["mem"][m][g] for g in groups) for x in SIDES for m in range(NB)))
     anchor = r + 1
-    s.add_chart(compare_line_chart("시각별 동시 CPU — as-is vs to-be", cmp_ws, (2, 3), 8, "코어", ymax_cpu), f"A{anchor}")
-    s.add_chart(compare_line_chart("시각별 동시 메모리 — as-is vs to-be", cmp_ws, (5, 6), 8, "GB", ymax_mem),
-                f"A{anchor + 19}")
-    s.add_chart(compare_bar_chart("종류별 하루 CPU 사용량 (코어·분)", grp_ws, 2, grp_total - 1, (2, 3), "코어·분"),
-                f"A{anchor + 38}")
-    s.add_chart(compare_bar_chart("종류별 하루 메모리 사용량 (GB·분)", grp_ws, 2, grp_total - 1, (6, 7), "GB·분"),
-                f"A{anchor + 57}")
-    r2 = anchor + 76
-    for side in SIDES:
-        nr = sides[side]["no_run"]
-        s.cell(row=r2, column=1, value=f"{side} ('{sides[side]['sheet']}' 시트) — 실행 기록 없어 뺀 행 {len(nr)}개"
-               ).font = Font(name=FONT, bold=True, size=11)
-        if nr:
-            for c, h in enumerate(["작업 시트 행", "종류", "app name", "이유"], 1):
-                s.cell(row=r2 + 1, column=c, value=h)
-            style_header(s, r2 + 1, 4)
-            for i, (rn, group, name, why) in enumerate(nr, start=r2 + 2):
-                s.cell(row=i, column=1, value=rn)
-                s.cell(row=i, column=2, value=group or None)
-                s.cell(row=i, column=3, value=name)
-                s.cell(row=i, column=4, value=why)
-            r2 += len(nr) + 3
-        else:
-            r2 += 2
+    charts = [compare_line_chart("시각별 동시 CPU — as-is vs to-be", cmp_ws, (2, 3), 8, "코어", ymax_cpu),
+              compare_line_chart("시각별 동시 메모리 — as-is vs to-be", cmp_ws, (5, 6), 8, "GB", ymax_mem),
+              compare_bar_chart("종류별 하루 CPU 사용량 (코어·분)", grp_ws, 2, grp_total - 1, (2, 3), "코어·분"),
+              compare_bar_chart("종류별 하루 메모리 사용량 (GB·분)", grp_ws, 2, grp_total - 1, (6, 7), "GB·분")]
+    for k, ch in enumerate(charts):
+        s.add_chart(ch, f"A{anchor + k * CHART_ROWS}")
+    r2 = anchor + len(charts) * CHART_ROWS
     for side in SIDES:
         sk = sides[side]["skipped"]
         if sk:
-            s.cell(row=r2, column=1, value=f"{side} 계산에서 뺀 행 — {len(sk)}개").font = Font(name=FONT, bold=True, size=11)
+            s.cell(row=r2, column=1, value=f"{side} 계산에서 뺀 행 — {len(sk)}개").font = BOLD_FONT
             for i, (rn, name, why) in enumerate(sk, start=r2 + 1):
                 s.cell(row=i, column=1, value=f"{rn}행 {name}")
                 s.cell(row=i, column=2, value=why)
@@ -938,13 +987,14 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
     set_font(s)
 
     # ── 종류별 누적: 같은 눈금으로 as-is·to-be 위아래
+    stack.sheet_view.showGridLines = False
     stack["A1"] = "job 종류별 누적 — 같은 세로축 눈금으로 as-is(위)·to-be(아래)를 비교한다"
-    stack["A1"].font = Font(name=FONT, bold=True, size=12)
+    stack["A1"].font = BOLD_FONT
     for i, (kind, key, unit, ymax) in enumerate((("CPU", "cpu_c", "코어", ymax_cpu), ("메모리", "mem_c", "GB", ymax_mem))):
         for k, side in enumerate(SIDES):
             ws_side = wb[f"{side} 시각별"]
             stack.add_chart(area_chart(f"{side} — 시각별 동시 {kind} ({unit})", ws_side, groups, tl[side][key],
-                                       tl[side]["label"], unit, ymax), f"A{3 + (i * 2 + k) * 19}")
+                                       tl[side]["label"], unit, ymax), f"A{3 + (i * 2 + k) * CHART_ROWS}")
     set_font(stack)
     for ws in (s, stack):
         ws.page_setup.orientation = "landscape"
@@ -954,6 +1004,206 @@ def write_workbook(path, sides, groups, day, cron_tz, tz_reason, src):
     wb.move_sheet("종류별 누적 그래프", offset=-(len(wb.sheetnames) - 2))
     wb.calculation.fullCalcOnLoad = True          # 합계·요약 수식을 엑셀이 열 때 계산한다
     wb.save(path)
+
+
+# ── HTML 보고서 (plotly) ───────────────────────────────────────────────
+HTML_CSS = """
+:root { --ink:#1F2328; --muted:#6B6B6B; --line:#E3E6EA; --head:#EEF2F7; --bg:#FFFFFF; --page:#F6F7F9;
+        --down:#1B7F4E; --up:#C0392B; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--page); color:var(--ink); font:10pt '맑은 고딕','Malgun Gothic',sans-serif; }
+main { max-width:1280px; margin:0 auto; padding:24px 16px 48px; }
+h1 { font-size:10pt; font-weight:700; margin:0 0 4px; }
+h2 { font-size:10pt; font-weight:700; margin:0 0 12px; }
+.meta { color:var(--muted); margin-bottom:20px; }
+.kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-bottom:16px; }
+.kpi, .card { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+.card { margin-bottom:16px; }
+.kpi .label { color:var(--muted); }
+.kpi .value { font-weight:700; margin:6px 0 2px; }
+.kpi .from { color:var(--muted); }
+.down { color:var(--down); } .up { color:var(--up); }
+table { width:100%; border-collapse:collapse; }
+th { background:var(--head); font-weight:700; text-align:center; padding:6px 8px; border-bottom:1px solid #D5DAE1; }
+td { padding:6px 8px; border-bottom:1px solid var(--line); }
+td.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+td.note { color:var(--muted); }
+td.desc { min-width:220px; }
+.scroll { overflow-x:auto; }
+.two { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+@media (max-width:900px) { .two { grid-template-columns:1fr; } }
+"""
+PLOT_FONT = dict(family="맑은 고딕, Malgun Gothic, sans-serif", size=13, color="#1F2328")   # 13px = 10pt
+PLOT_CONFIG = {"displaylogo": False, "responsive": True,
+               "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"],
+               "toImageButtonOptions": {"format": "png", "scale": 2}}   # 카메라 버튼 = PNG 저장 (PPT에 붙일 때)
+
+
+def write_html(path, sides, groups, day, cron_tz, tz_reason, src):
+    """같은 결과를 브라우저용 HTML 한 장으로 — 마우스를 올리면 그 시각의 값, 드래그로 확대, 범례 클릭으로 끄고 켜기.
+    plotly가 없으면 건너뛴다 (엑셀 결과는 그대로 나온다)."""
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        print("HTML 보고서는 건너뜀 — pip install plotly 후 다시 실행하면 같이 만든다")
+        return None
+    import html as h
+
+    m = summary_metrics(sides)
+    x = [datetime(2000, 1, 1) + timedelta(minutes=k * BUCKET_MIN) for k in range(NB)]
+    side_color = {k: "#" + v for k, v in SIDE_COLORS.items()}
+    unit = {"cpu": "코어", "mem": "GB"}
+    kind = {"cpu": "CPU", "mem": "메모리"}
+
+    def layout(fig, y_title, height=420, top=36, **kw):
+        fig.update_layout(font=PLOT_FONT, height=height, margin=dict(l=64, r=24, t=top, b=48),
+                          paper_bgcolor="white", plot_bgcolor="white", hoverlabel=dict(font=PLOT_FONT),
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=PLOT_FONT))
+        fig.update_layout(**kw)
+        fig.update_yaxes(title_text=y_title, rangemode="tozero", gridcolor="#E3E6EA", zeroline=False, automargin=True,
+                         tickformat=",", title_font=PLOT_FONT, tickfont=PLOT_FONT, title_standoff=12)
+        return fig
+
+    def time_x(fig):
+        fig.update_xaxes(type="date", tickformat="%H:%M", hoverformat="%H:%M", dtick=2 * 3600 * 1000,
+                         range=[x[0], x[-1] + timedelta(minutes=BUCKET_MIN)], showgrid=False,
+                         showline=True, linecolor="#E3E6EA", tickfont=PLOT_FONT,
+                         showspikes=True, spikemode="across", spikethickness=1, spikecolor="#9AA0A6", spikedash="solid")
+
+    def div(fig):
+        return fig.to_html(full_html=False, include_plotlyjs=False, config=PLOT_CONFIG)
+
+    # 1) 시각별 동시 사용량 as-is vs to-be
+    lines = {}
+    for k in ("cpu", "mem"):
+        fig = go.Figure()
+        for side in SIDES:
+            fig.add_trace(go.Scatter(x=x, y=m[side][k]["series"], name=side, mode="lines",
+                                     line=dict(color=side_color[side], width=2, shape="hv"),
+                                     hovertemplate=f"%{{y:,.1f}} {unit[k]}<extra>{side}</extra>"))
+        layout(fig, unit[k], hovermode="x unified")
+        time_x(fig)
+        lines[k] = div(fig)
+
+    # 2) 종류별 하루 사용량 (가로 막대 — 종류 이름이 길어도 겹치지 않는다)
+    bars = {}
+    for k in ("cpu", "mem"):
+        fig = go.Figure()
+        for side in SIDES:
+            fig.add_trace(go.Bar(y=groups, x=[m[side]["group_day"][k].get(g, 0) for g in groups], name=side,
+                                 orientation="h", marker=dict(color=side_color[side], line=dict(width=0)),
+                                 hovertemplate=f"%{{y}}<br>%{{x:,.0f}} {unit[k]}·분<extra>{side}</extra>"))
+        layout(fig, None, height=80 + 44 * len(groups), barmode="group", bargap=0.3, bargroupgap=0.06,
+               hovermode="y unified")
+        fig.update_yaxes(autorange="reversed", gridcolor="rgba(0,0,0,0)", showline=False, tickformat=None, ticksuffix="  ")
+        fig.update_xaxes(tickformat=",", gridcolor="#E3E6EA", zeroline=False, tickfont=PLOT_FONT, automargin=True,
+                         title_text=f"{unit[k]}·분 / 일", title_font=PLOT_FONT)
+        bars[k] = div(fig)
+
+    # 3) 종류별 누적 — as-is(위)·to-be(아래) 같은 세로축. 5분 칸 = 막대 1개 (칸 안 최댓값 순간의 종류별 값)
+    stacks = {}
+    for k in ("cpu", "mem"):
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
+                            subplot_titles=[f"{side} — 시각별 동시 {kind[k]} ({unit[k]})" for side in SIDES])
+        for row, side in enumerate(SIDES, 1):
+            pm = sides[side]["per_minute"][k]
+            for g in groups:
+                fig.add_trace(go.Bar(x=x, y=[pm[b][g] for b in range(NB)], name=g, legendgroup=g, showlegend=row == 1,
+                                     width=BUCKET_MIN * 60 * 1000, offset=0,
+                                     marker=dict(color="#" + group_color(groups, g), line=dict(width=0)),
+                                     hovertemplate=f"%{{y:,.1f}} {unit[k]}<extra>{h.escape(g)}</extra>"),
+                              row=row, col=1)
+        layout(fig, unit[k], height=760, top=64, barmode="stack", bargap=0, hovermode="x unified",
+               legend=dict(orientation="h", yanchor="bottom", y=1.06, x=0, font=PLOT_FONT))
+        y_top = max(m[side][k]["peak"] for side in SIDES) * 1.05
+        fig.update_yaxes(range=[0, y_top])                          # 위아래 같은 눈금
+        fig.update_annotations(font=PLOT_FONT)
+        time_x(fig)
+        stacks[k] = div(fig)
+
+    # 표·KPI
+    def pct(a, b):
+        return "" if not a else f"{(b - a) / a * 100:+.1f}%"
+
+    def cls(a, b):
+        return "" if a == b else ("down" if b < a else "up")
+
+    kpis = []
+    for k, key, label in (("cpu", "day", "하루 총 CPU (코어·분)"), ("cpu", "peak", "최대 동시 CPU (코어)"),
+                          ("mem", "day", "하루 총 메모리 (GB·분)"), ("mem", "peak", "최대 동시 메모리 (GB)")):
+        a, b = m["as-is"][k][key], m["to-be"][k][key]
+        kpis.append(f'<div class="kpi"><div class="label">{label}</div>'
+                    f'<div class="value">{b:,.1f} <span class="{cls(a, b)}">{pct(a, b)}</span></div>'
+                    f'<div class="from">as-is {a:,.1f}</div></div>')
+
+    rows_def = [("simple", "설정값 단순 합산", "모든 job이 동시에 떠 있다고 가정한 값 — 실제로는 일어나지 않는다"),
+                ("peak", "실제 최대 동시 사용량", "하루 중 가장 많이 겹친 순간. 클러스터에 확보해야 하는 양"),
+                ("peak_at", "최대가 나온 시각", f"{BUCKET_MIN}분 칸의 시작 시각"),
+                ("avg", "하루 평균 사용량", "하루 총 사용량 ÷ 1,440분"),
+                ("day", "하루 총 사용량 ({u}·분)", "하루 실행 횟수 × Duration × 총 {k}의 합 — 튜닝 효과는 이 값으로 본다")]
+    tables = []
+    for k in ("cpu", "mem"):
+        body = []
+        for key, label, note in rows_def:
+            a, b = m["as-is"][k][key], m["to-be"][k][key]
+            label, note = label.format(u=unit[k]), note.format(k=kind[k])
+            if key == "peak_at":
+                body.append(f"<tr><td>{label}</td><td class='num'>{a}</td><td class='num'>{b}</td>"
+                            f"<td></td><td></td><td class='note'>{note}</td></tr>")
+            else:
+                body.append(f"<tr><td>{label}</td><td class='num'>{a:,.1f}</td><td class='num'>{b:,.1f}</td>"
+                            f"<td class='num {cls(a, b)}'>{b - a:+,.1f}</td><td class='num {cls(a, b)}'>{pct(a, b)}</td>"
+                            f"<td class='note'>{note}</td></tr>")
+        tables.append(f"<div class='scroll'><table><tr><th>{kind[k]} ({unit[k]})</th><th>as-is</th><th>to-be</th>"
+                      f"<th>차이</th><th>변화율</th><th>뜻</th></tr>{''.join(body)}</table></div>")
+
+    keys, pos = job_pairs({side: sides[side]["jobs"] for side in SIDES}, groups)
+    jrows = []
+    for key in keys:
+        cells = [h.escape(key[0]), h.escape(key[1])]
+        vals = {}
+        for side in SIDES:
+            i = pos[key].get(side)
+            if i is None:
+                vals[side] = None
+                continue
+            j = sides[side]["jobs"][i]
+            n = len(sides[side]["runs"].get(i, []))
+            vals[side] = (j["duration"], j["cpu"], j["mem"], n * j["duration"] * j["cpu"])
+        for idx, fmt in ((0, "{:,.1f}"), (1, "{:,.1f}"), (2, "{:,.1f}"), (3, "{:,.0f}")):
+            for side in SIDES:
+                cells.append(fmt.format(vals[side][idx]) if vals[side] else "")
+        a = vals["as-is"][3] if vals["as-is"] else 0
+        b = vals["to-be"][3] if vals["to-be"] else 0
+        tds = "".join(f"<td>{c}</td>" for c in cells[:2]) + "".join(f"<td class='num'>{c}</td>" for c in cells[2:])
+        jrows.append(f"<tr>{tds}<td class='num {cls(a, b)}'>{b - a:+,.0f}</td>"
+                     f"<td class='note desc'>{h.escape(pos[key]['desc'] or '')}</td></tr>")
+    job_table = ("<div class='scroll'><table><tr><th>종류</th><th>app name</th>"
+                 "<th>as-is Duration (min)</th><th>to-be Duration (min)</th><th>as-is 총 CPU</th><th>to-be 총 CPU</th>"
+                 "<th>as-is 총 메모리 (GB)</th><th>to-be 총 메모리 (GB)</th><th>as-is CPU·분 / 일</th>"
+                 "<th>to-be CPU·분 / 일</th><th>CPU·분 차이</th><th>기능 요약</th></tr>" + "".join(jrows) + "</table></div>")
+
+    import plotly.offline
+    dur = {COL_DUR_AVG: "평균", COL_DUR_MEDIAN: "중앙값", COL_DUR_MAX: "최댓값"}.get(COL_DURATION, COL_DURATION)
+    page = f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>리소스 사용량 비교</title>
+<style>{HTML_CSS}</style><script>{plotly.offline.get_plotlyjs()}</script></head><body><main>
+<h1>하루 리소스 사용량 — as-is / to-be 비교</h1>
+<div class="meta">기준일 {day.isoformat()} (KST) · 원본 {h.escape(src)} (as-is '{h.escape(sides['as-is']['sheet'])}',
+to-be '{h.escape(sides['to-be']['sheet'])}') · cron 시간대 {cron_tz} · Duration {dur} · 값은 {BUCKET_MIN}분 칸 안의 최댓값</div>
+<div class="kpis">{''.join(kpis)}</div>
+<div class="card"><h2>시각별 동시 CPU — as-is vs to-be</h2>{lines['cpu']}</div>
+<div class="card"><h2>시각별 동시 메모리 — as-is vs to-be</h2>{lines['mem']}</div>
+<div class="two"><div class="card"><h2>종류별 하루 CPU 사용량 (코어·분)</h2>{bars['cpu']}</div>
+<div class="card"><h2>종류별 하루 메모리 사용량 (GB·분)</h2>{bars['mem']}</div></div>
+<div class="card"><h2>요약 비교</h2>{tables[0]}<div style="height:12px"></div>{tables[1]}</div>
+<div class="card"><h2>종류별 누적 — CPU</h2>{stacks['cpu']}</div>
+<div class="card"><h2>종류별 누적 — 메모리</h2>{stacks['mem']}</div>
+<div class="card"><h2>job별 비교 (짝 = 종류 + app name)</h2>{job_table}</div>
+</main></body></html>"""
+    path.write_text(page, encoding="utf-8")
+    return path
 
 
 def open_workbook(src):
@@ -972,7 +1222,7 @@ def open_workbook(src):
     shown = head.decode("latin-1").encode("unicode_escape").decode("ascii")
     raise SystemExit(f"'{src.name}'은 Python이 직접 열 수 없는 파일이다 (파일 앞부분: {shown}) — "
                      f"사내 보안(DRM)·열기 암호·옛 xls·CSV 중 하나다. Windows용 Python에서 실행하면 엑셀을 통해 읽는다: "
-                     f"pip install openpyxl xlwings → python resource_timeline.py <파일>. WSL·리눅스에서는 안 된다")
+                     f"pip install openpyxl xlwings plotly → python resource_timeline.py <파일>. WSL·리눅스에서는 안 된다")
 
 
 def read_via_excel(src):
@@ -999,10 +1249,33 @@ def read_via_excel(src):
                 for j, v in enumerate(row):
                     if v is not None:
                         ws.cell(row=used.row + i, column=used.column + j, value=v)
+            copy_merged(sh, used, len(values), len(values[0]) if values else 0, ws)
         book.close()
     finally:
         app.quit()
     return wb
+
+
+def copy_merged(sh, used, nrows, ncols, ws):
+    """병합 셀은 엑셀이 왼쪽 위 칸에만 값을 준다 → 병합 범위의 모든 칸에 그 값을 채운다 (A열 job_type 병합 등).
+    열마다 병합 여부를 한 번 묻고(False = 병합 없음), 병합이 있는 열만 칸 단위로 병합 범위를 확인한다."""
+    done = set()
+    for c in range(used.column, used.column + ncols):
+        col = sh.range((used.row, c), (used.row + nrows - 1, c))
+        if col.merge_cells is False:
+            continue
+        for r in range(used.row, used.row + nrows):
+            if (r, c) in done:
+                continue
+            cell = sh.range((r, c))
+            if not cell.merge_cells:
+                continue
+            area = cell.merge_area
+            v = ws.cell(row=area.row, column=area.column).value
+            for rr in range(area.row, area.row + area.shape[0]):
+                for cc in range(area.column, area.column + area.shape[1]):
+                    done.add((rr, cc))
+                    ws.cell(row=rr, column=cc, value=v)
 
 
 def find_sheets(sheetnames):
@@ -1031,13 +1304,11 @@ def main():
     names = find_sheets(wb.sheetnames)
     sides = {}
     for side in SIDES:
-        jobs, skipped, no_run = read_jobs(wb[names[side]])
+        jobs, skipped = read_jobs(wb[names[side]])
         guessed = sum(1 for j in jobs if j["every"])
-        print(f"{side}: 시트 '{names[side]}' job {len(jobs)}개, 실행 기록 없어 뺀 행 {len(no_run)}개, 제외 {len(skipped)}개"
+        print(f"{side}: 시트 '{names[side]}' job {len(jobs)}개, 제외 {len(skipped)}개"
               + (f", cron 없어 간격 추정 {guessed}개" if guessed else ""))
-        for rn, group, name, why in no_run:
-            print(f"    - {rn}행 {name} ({group or '종류 없음'}) — {why}")
-        sides[side] = {"sheet": names[side], "jobs": jobs, "skipped": skipped, "no_run": no_run}
+        sides[side] = {"sheet": names[side], "jobs": jobs, "skipped": skipped}
     cron_tz, reason = detect_cron_tz(sides["as-is"]["jobs"] + sides["to-be"]["jobs"])
     print(f"cron 시간대: {cron_tz} ({reason}) / 기준일 {day}")
     groups = order_groups(sides["as-is"]["jobs"] + sides["to-be"]["jobs"])
@@ -1046,6 +1317,7 @@ def main():
         sides[side].update(groups=groups, per_minute=per_minute, runs=runs, spans=spans)
     out = src.with_name(f"{src.stem}_리소스비교.xlsx")
     write_workbook(out, sides, groups, day, cron_tz, reason, src.name)
+    html_out = write_html(src.with_name(f"{src.stem}_리소스비교.html"), sides, groups, day, cron_tz, reason, src.name)
     for side in SIDES:
         pm, jobs, runs = sides[side]["per_minute"], sides[side]["jobs"], sides[side]["runs"]
         peak_cpu = max(sum(pm["cpu"][m][g] for g in groups) for m in range(NB))
@@ -1053,7 +1325,7 @@ def main():
         cpu_min = sum(len(runs.get(i, [])) * j["duration"] * j["cpu"] for i, j in enumerate(jobs))
         print(f"{side}: 최대 동시 CPU {peak_cpu:,.1f}코어 / 메모리 {peak_mem:,.1f}GB, 하루 {cpu_min:,.0f}코어·분 "
               f"(단순 합산 {sum(j['cpu'] for j in jobs):,.1f}코어 / {sum(j['mem'] for j in jobs):,.1f}GB)")
-    print(f"→ {out}")
+    print(f"→ {out}" + (f"\n→ {html_out}  (브라우저로 연다)" if html_out else ""))
 
 
 if __name__ == "__main__":
