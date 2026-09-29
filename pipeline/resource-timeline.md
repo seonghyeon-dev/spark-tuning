@@ -38,7 +38,7 @@ python resource_timeline.py 작업엑셀.xlsx              # 기준일 자동 �
 python resource_timeline.py 작업엑셀.xlsx 20261001     # 기준일 지정
 ```
 
-**기준일**: 그래프를 그릴 하루. 지정하지 않으면 오늘부터 31일 안에서 모든 job이 실행되는 첫날을 고른다. 3일 주기 job(rw_mani `5 2 */3 * *` = 매달 1·4·7…31일)을 포함하기 위해서다. 날짜를 지정하면 그날 실행되지 않는 job 수를 출력한다.
+**기준일**: 그래프를 그릴 하루. 지정하지 않으면 오늘부터 31일 안에서 모든 job이 실행되는 첫날을 고른다. 3일 주기 job(rw_mani `0 6 */3 * *` = 매달 1·4·7…31일 06:00)을 포함하기 위해서다. 날짜를 지정하면 그날 실행되지 않는 job 수를 출력한다.
 
 출력 예 (예시 데이터):
 
@@ -460,7 +460,7 @@ def runs_on(j, day, cron_tz):
 
 
 def pick_day(jobs, cron_tz, start):
-    """start부터 31일 안에서 모든 job이 한 번 이상 도는 첫날. 3일마다 도는 rw_mani(예: 5 2 */3 * *)까지 그림에 넣으려고.
+    """start부터 31일 안에서 모든 job이 한 번 이상 도는 첫날. 3일마다 도는 rw_mani(예: 0 6 */3 * *)까지 그림에 넣으려고.
     그런 날이 없으면 start."""
     for k in range(31):
         d = start + timedelta(days=k)
