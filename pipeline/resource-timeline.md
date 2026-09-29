@@ -101,7 +101,7 @@ xlsx가 아닌 파일(DRM·xls·CSV 등)은 Windows에서 엑셀을 통해 읽�
 | 1 | 주요 결과 |
 | 2 | 시간대별 사용량 (as-is 회색, to-be 파랑, 차이 음영, 최대값 표시) |
 | 3 | 종류별 평균 사용량 (변경된 종류만 변화율 표시) |
-| 4 | 종류별 누적 사용량 |
+| 4 | 종류별 누적 사용량 (범례는 오른쪽 세로 배치) |
 | 5 | 최대 사용 시점의 실행 job |
 | 6 | job별 비교 (종류 필터, 머리글 정렬) |
 | 7 | 용어 |
@@ -1290,8 +1290,9 @@ def write_html(path, sides, groups, day, day_note, cron_tz, tz_reason, src, M):
                                          stackgroup=side, mode="lines", line=dict(width=0.6, color="white"),
                                          fillcolor="#" + group_color(groups, g),
                                          hovertemplate=f"%{{y:,.1f}} {u}<extra>{esc(g)}</extra>"), row=n, col=1)
-        base(fig, 640, hovermode="x unified", margin=dict(l=8, r=16, t=64, b=8))
-        fig.update_layout(legend=dict(y=1.06))
+        base(fig, 640, hovermode="x unified", margin=dict(l=8, r=16, t=40, b=8))
+        # 범례는 오른쪽 세로 배치 — 위에 두면 종류가 많을 때 두 줄로 늘어나 'as-is' 제목을 가린다
+        fig.update_layout(legend=dict(orientation="v", x=1.01, xanchor="left", y=1, yanchor="top"))
         fig.update_annotations(font=PLOT_FONT, yshift=2)
         time_x(fig)
         fig.update_xaxes(showticklabels=True)
