@@ -4,7 +4,7 @@
 |------|------|
 | 목적 | 하루 동안 시각별로 실제 동시에 떠 있는 core·memory를 그리기 위해, job별 **Duration**과 **Start Offset**을 최근 100회 실측으로 구한다 |
 | 대상 | append·Compaction·maintenance 등 Spark pod를 띄우는 task 전부 |
-| 방법 | Airflow 3.x REST API v2 (Python 스크립트) |
+| 방법 | Airflow 3.x REST API v2 (Python 스크립트). 메타 DB 직접 조회(SQL)는 쓰지 않는다 (사용자 결정 2026-09-28) |
 | 검증 | Airflow 3.2.2 OpenAPI 명세로 endpoint·파라미터·응답 필드 확인. 운영과 같은 구조의 DAG(append 2종, summary, hourly·daily Compaction mapped task, maintenance 3종)를 가짜 Airflow API 서버에 넣고 결과를 손으로 센 값과 대조. 기간 지정(일·시·분 단위)도 손으로 센 실행 횟수와 일치 (2026-09-28) |
 
 ---
@@ -476,7 +476,7 @@ if __name__ == "__main__":
 | 필터 | 이유 |
 |------|------|
 | `run_id_prefix_pattern=scheduled` | **cron으로 돈 실행만.** 재처리 DAG가 trigger한 Compaction(20시간치면 10분 이상)은 run_id가 `manual__`로 시작해 빠진다. 이게 섞이면 평균이 튄다 |
-| 단, 수동 append 테이블(`TRIGGER_TABLE`)은 이 필터를 끈다 | 스케줄 없이(None) 수직분할 4개 append DAG의 trigger로만 도는 append 테이블은 실행이 전부 `manual__` 등이라 위 필터에 전부 걸려 **CSV에서 통째로 빠진다**. 그 테이블의 **append task(`append_data`)만** 실행 종류를 가리지 않는다. 같은 테이블의 Compaction·expired snapshot·delete orphan·rewrite manifest는 다른 job과 똑같이 cron 실행만 센다 |
+| 단, 수동 append 테이블(`TRIGGER_TABLE`)은 이 필터를 끈다 | 스케줄 없이(None) 수직분할 4개 append DAG의 trigger로만 도는 append 테이블은 실행이 전부 `manual__` 등이라 위 필터에 전부 걸려 **CSV에서 통째로 빠진다**. 그 테이블의 **append task(`append_data`)만** 실행 종류를 가리지 않는다. 같은 테이블의 Compaction·expired snapshot·delete orphan·rewrite manifest는 다른 job과 똑같이 cron 실행만 센다. 예전 코드는 테이블명을 모든 dag_id·task_id에서 찾아 delete orphan task의 수동 실행까지 섞였다(가짜 서버에서 Duration 2.0 → 16.0분으로 재현 후 수정) |
 | `state=success` | 실패한 실행은 중간에 끊겨 duration이 짧게 잡힌다 |
 | `order_by=-run_after` | 최신순. 앞에서부터 N회만 쓴다 |
 | mapped task는 테이블별로 N회 | 한 DAG 실행에 테이블 4개가 있으므로 페이지를 넘기며 테이블마다 100회를 채운다 |

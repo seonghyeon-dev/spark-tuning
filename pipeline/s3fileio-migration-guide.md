@@ -820,7 +820,9 @@ Trino의 Iceberg 커넥터는 **자체 파일시스템 구현**(`fs.native-s3.en
 
 **즉 두 설정이 공존해야 한다.** 한쪽만 바꾸고 다른 쪽을 지우는 실수가 이 전환에서 가장 흔한 사고다.
 
-### 4.5 [최대 위험] AWS SDK v2 checksum과 MinIO 버전 궁합 ⚠️ 미검증 — 반드시 사전 확인
+### 4.5 [최대 위험] AWS SDK v2 checksum과 MinIO 버전 궁합
+
+> **확인 완료 (2026-08-27 운영 전환)**: 현 MinIO에서 checksum 문제 없음. 아래는 전환 전 분석이며, Spark 4.1(S3A도 SDK v2) 업그레이드 때 다시 게이트가 된다 (섹션 9.8).
 
 Iceberg 1.10.1은 **AWS SDK v2 BOM 2.33.0**을 쓴다 ✅ (`gradle/libs.versions.toml`). SDK v2는 **2.30 이후 요청 checksum 계산이 기본 활성화**(`requestChecksumCalculation = WHEN_SUPPORTED`)되어, `PutObject`/`DeleteObjects` 등에 CRC32 체크섬 헤더/트레일러를 붙인다. 📘
 
@@ -1444,6 +1446,7 @@ spark.sql.catalog.<카탈로그>.s3.delete.num-threads=8
 
 # ── Phase 2(Compaction) 진입 시 함께 (섹션 5.1.3) ─────────────
 #   spark.sql.catalog.<카탈로그>.s3.multipart.part-size-bytes=67108864
+#   (결정: 우선 미명시 = 기본 32MB로 테스트한 뒤 판단. 64MB는 S3A 현재 동작과 같게 맞출 때의 값)
 
 # ── 기존 S3A 설정은 그대로 유지 (섹션 4.4) ────────────────────
 spark.hadoop.fs.s3a.endpoint=...
@@ -1591,6 +1594,7 @@ maintenance Job에서 **executor와 driver의 역할이 다르다.** ✅ 소스 
 | `driver memory` | 1g | **1g 유지** | `collectAsList()`가 담는 것은 경로 문자열이다. 파일 4만 개라도 수십 MB 수준 |
 | `executor cores` | 4 | **4 유지** | 전환 A/B의 교란 변수를 만들지 않는다 |
 | `executor instances` | 4 | **4 유지 → 측정 후 조정** | 아래 참조 |
+| `executor memory` | 4g | **4g 유지** | 전환 A/B의 교란 변수를 만들지 않는다 |
 | `s3.delete.num-threads` | — | **8 (명시)** | 기본값이 `availableProcessors()`라 예측이 어렵다 (아래 참조) |
 
 **`driver cores`를 올리지 않아도 되는 이유**: 전환 후 삭제 요청은 파일 4만 개 기준 `DeleteObjects` 40건(batch 1000)이다. 스레드 8개면 5라운드, 요청당 1~2초로 잡아도 10초 안쪽이다. 현재 6~12분에 비하면 무시할 수준이라 **코어를 늘려 얻을 것이 없다.** (스레드 풀 크기는 코어 수와 무관하게 지정할 수 있고, 네트워크 대기 중인 스레드는 CPU를 쓰지 않는다.)
@@ -1882,7 +1886,7 @@ executor 4개 × 4코어 = 16코어인데 90%가 놀고 있다. 전환 전에는
 
 | 항목 | 내용 | 우선순위 |
 |------|------|----------|
-| **MinIO 버전과 SDK 2.33 checksum 호환성** | Phase 0의 게이트. 이게 막히면 MinIO 업그레이드가 선행되어야 한다 (섹션 4.5) | **최우선** |
+| ~~MinIO 버전과 SDK 2.33 checksum 호환성~~ | ✅ 운영 전환(2026-08-27)에서 문제 없음 확인. Spark 4.1 업그레이드 때 원천 avro read까지 SDK v2가 되므로 다시 확인 (섹션 9.8) | 완료 |
 | **실제 삭제 파일 수** | 섹션 1.4의 추정치를 실측으로 대체해야 보고가 된다. `mc admin trace` 또는 driver 로그의 `Deleted N total files` | 높음 |
 | **읽기/쓰기 성능 영향** | Compaction `dcu/GB` A/B (섹션 5.3). 노이즈 기준선 ±15% | 높음 |
 | **`s3.delete.num-threads` 적정값** | 기본값(driver 코어 수)은 너무 작다. 8로 시작하되 MinIO 순간 부하를 보며 조정 | 중간 |
@@ -1891,7 +1895,7 @@ executor 4개 × 4코어 = 16코어인데 90%가 놀고 있다. 전환 전에는
 | ~~driver Pod의 `limits.cpu` 설정 여부~~ | ✅ 확인 완료 — Compaction은 `coreLimit=1`, **expire snapshots는 미설정**(노드 코어 × 4 = 삭제 스레드). `coreLimit=1` 적용 예정이나 **baseline 계측 후에** 적용할 것 (섹션 5.1.2) | 완료 |
 | **maintenance Job의 executor 수** | 삭제는 driver에서만 일어나므로 축소 여지가 있으나, **전환과 동시에 바꾸면 A/B 판정이 불가능하다.** 전환 후 Spark UI로 stage 구간을 보고 조정 (섹션 5.1.2) | 중간 (전환 후) |
 | **`/tmp`의 성격과 ephemeral-storage limit** | Phase 1에는 무관(데이터 파일을 쓰지 않음). Phase 2/3 진입 전 확인 (섹션 4.6) | 중간 (Phase 2 전) |
-| **다른 문서의 Spark 버전 기재** | 현재 운영은 **Spark 3.5.8**(임시), 목표가 4.x다. 다른 가이드들이 4.1.1을 현재 값처럼 적고 있어 구분 표기가 필요하다 (섹션 5.0.2) | 중간(문서 정합성) |
+| ~~다른 문서의 Spark 버전 기재~~ | ✅ 운영(3.5.8)과 목표(4.1.1) 구분 표기 완료 (2026-09-05) (섹션 5.0.2) | 완료 |
 | **Spark 4 복귀 시 조합** | Iceberg 1.10.1은 **Spark 4.1 미지원**(`spark/v4.0`까지만 존재). 당시 maintenance 함수 오류가 이 때문인지 확인하고, Spark 4.0.x 재시도를 검토 (섹션 5.0.3) | 중간(후속) |
 | **`s3.multipart.part-size-bytes` 조정 효과** | 64MB로 맞추면 S3A 현재 동작과 동일해진다. 그 이상은 A/B 필요 (섹션 5.1.3) | 낮음 (Phase 2) |
 | **Spark 4.1.1 ↔ iceberg-spark-runtime 4.0 조합** | 현재 어떤 runtime jar를 쓰는지 확인하고 `iceberg-aws-bundle` 버전을 정확히 맞출 것 | 중간 |
@@ -1977,7 +1981,7 @@ executor 4개 × 4코어 = 16코어인데 90%가 놀고 있다. 전환 전에는
 
 **업그레이드에 찬성한다. 특히 Iceberg 1.11.0이 막혀 있던 Spark 4 문제의 직접적인 해답이다.**
 
-다만 **FileIO 전환과 동시에 진행하지 않는다.** 두 변경을 겹치면 전환 효과를 측정할 수 없다 (섹션 9.5).
+다만 **FileIO 전환과 동시에 진행하지 않는다.** 두 변경을 겹치면 전환 효과를 측정할 수 없다 (섹션 9.6).
 
 ### 9.2 검증된 사실
 

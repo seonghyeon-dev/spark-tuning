@@ -5,7 +5,7 @@
 > 예시 데이터(hourly Compaction만 튜닝) 결과: CPU 평균 사용량 29.6 → 23.4코어(−21%), 감소분 전량 comp_range. CPU 최대 사용량은 147 → 132코어(−10%)로 감소 폭이 작다. 최대 사용 시점의 62%를 설정 변경이 없는 append·comp_daily가 차지하기 때문이다.
 
 - 앞 단계: [Airflow job 실행 시간 집계](airflow-job-duration.md) (Duration·Start Offset 추출)
-- 필요: Python 3.9 이상, `pip install openpyxl plotly` (plotly가 없으면 엑셀만 생성)
+- 필요: Python 3.9 이상(사용자 환경 3.12, openpyxl 3.1.5), `pip install openpyxl plotly` (plotly가 없으면 엑셀만 생성)
 - DRM 파일: Windows용 Python + `pip install xlwings` (§2.1). WSL·리눅스에서는 불가
 
 ---
@@ -27,7 +27,7 @@
 
 - 병합된 셀은 병합 범위의 모든 행에 같은 값을 채운다
 - N열(Duration)과 K열(토탈 cpu)이 모두 숫자인 행만 계산한다. Duration이 빈 행(미실행·삭제 job)은 제외되고, 한쪽 시트에만 있는 job은 `job별 비교`에서 다른 쪽을 0으로 계산한다
-- to-be Duration은 운영 반영 전이면 테스트 실측값, 반영 후에는 `job_durations.py`로 다시 추출한 값을 쓴다
+- as-is = 튜닝 전 기간, to-be = 튜닝 적용 후 기간의 Airflow 이력을 `job_durations.py`로 각각 추출한 값이다. 실제 사례(2026-09-29): 튜닝은 빅테이블 hourly Compaction DAG만 했고 운영 적용 후 이력이 to-be다. 튜닝하지 않은 job은 설정이 같아 두 시트의 차이는 실행 시간 편차뿐이다
 
 ---
 
@@ -64,6 +64,7 @@ xlsx가 아닌 파일(DRM·xls·CSV 등)은 Windows에서 엑셀을 통해 읽�
 2. `pip install openpyxl xlwings plotly`
 3. PowerShell에서 `python resource_timeline.py "C:\경로\작업엑셀.xlsx"`
 
+- 검증 범위: 여기서는 엑셀을 흉내 낸 가짜 xlwings로만 확인했다. 사용자 PowerShell COM 테스트(아래)는 성공(2026-09-28)했고, 실제 엑셀 경유 실행은 사용자 첫 실행이 검증이다
 - 사전 확인: `$x = New-Object -ComObject Excel.Application; $b = $x.Workbooks.Open("C:\경로\작업엑셀.xlsx"); $b.Sheets.Item("AS-IS").Range("A1:C3").Value2; $b.Close($false); $x.Quit()`에서 셀 값이 출력되면 사용 가능
 - 수식 셀은 엑셀이 계산한 값을 읽는다. 병합 셀도 병합 범위를 확인해 채운다
 - 열기 암호가 걸린 파일은 암호를 먼저 해제한다. `~$`로 시작하는 파일은 엑셀 잠금 파일이다
@@ -93,7 +94,7 @@ xlsx가 아닌 파일(DRM·xls·CSV 등)은 Windows에서 엑셀을 통해 읽�
 
 ### 3.2 HTML (`_resource_diff.html`)
 
-인터넷 연결 없이 브라우저로 열린다(그래프 라이브러리 포함, 약 5MB).
+인터넷 연결 없이 브라우저로 열린다(그래프 라이브러리 포함, 약 5MB). 보고는 HTML 기준, 엑셀은 근거 자료(5분 단위 원본 값·job별 계산 수식)로 함께 보관한다. 엑셀 그래프 대안으로 PPT 차트(엑셀과 같은 차트 기능)와 Grafana(서버·데이터 소스가 필요한 실시간 감시용)를 검토했으나 HTML을 택했다.
 
 | 순서 | 내용 |
 |---|---|
@@ -116,6 +117,8 @@ xlsx가 아닌 파일(DRM·xls·CSV 등)은 Windows에서 엑셀을 통해 읽�
 ## 4. 지표와 계산
 
 ### 4.1 지표
+
+복합 단위(코어·분, 코어·시간)는 쓰지 않는다. 모든 지표를 코어·GB 단위로 맞춰 설정값과 바로 비교한다 (2026-09-29).
 
 | 지표 | 정의 | 예 |
 |---|---|---|
