@@ -110,6 +110,7 @@ xlsx가 아닌 파일(DRM·xls·CSV 등)은 Windows에서 엑셀을 통해 읽�
 - CPU / 메모리 버튼으로 2~6의 그래프·표를 전환한다
 - 그래프에 마우스를 올리면 해당 5분 단위 값이 표시되고, 드래그하면 확대된다(더블클릭으로 복귀)
 - 그래프 우측 상단 카메라 버튼으로 PNG 저장, `인쇄 / PDF` 버튼으로 CPU·메모리 전체를 인쇄
+- 시간 그래프의 x축은 00:00~23:55로 고정한다. 자동 범위로 두면 00:00 근처의 최대값 표시 상자까지 담으려고 00:00 왼쪽에 빈 칸이 생긴다. 양 끝 3시간 안의 최대값 표시는 그래프 안쪽을 향한다 (2026-09-29)
 - HTML 선은 곡선(`SMOOTH`)으로 그리며 표시 값은 계산값 그대로다. 엑셀 그래프는 곡선 옵션이 급변 구간을 실제보다 크게 휘게 그려 직선으로 둔다
 
 ---
@@ -1235,8 +1236,9 @@ def write_html(path, sides, groups, day, day_note, cron_tz, tz_reason, src, M):
         return fig
 
     def time_x(fig, **kw):
-        fig.update_xaxes(type="category", tickmode="array", tickvals=ticks, ticktext=tick_text, showline=True,
-                         linecolor="#E5E7EB", showspikes=True, spikemode="across", spikesnap="cursor",
+        # 범위 고정 — 자동이면 00:00 근처 최대값 표시 상자까지 담으려고 00:00 왼쪽에 빈 칸을 만든다
+        fig.update_xaxes(type="category", range=[0, NB - 1], autorange=False, tickmode="array", tickvals=ticks,
+                         ticktext=tick_text, showline=True, linecolor="#E5E7EB", showspikes=True, spikemode="across", spikesnap="cursor",
                          spikethickness=1, spikecolor="#9AA0A6", spikedash="solid", **kw)
 
     for k in ("cpu", "mem"):
@@ -1258,9 +1260,13 @@ def write_html(path, sides, groups, day, day_note, cron_tz, tz_reason, src, M):
             left, right = sorted([("as-is", pa), ("to-be", pb)], key=lambda x: x[1]["peak_bucket"])
             marks = [(m["peak_bucket"], m["peak"], f"{s} 최대 {m['peak']:,.0f}{u}", ax)
                      for (s, m), ax in ((left, -50), (right, 50))]
-        for b, y, text, ax in marks:
+        edge = NB // 8                                                   # 양 끝 3시간 안이면 상자를 안쪽으로
+        marks = [(b, y, text, abs(ax) if b < edge else -abs(ax) if b >= NB - edge else ax) for b, y, text, ax in marks]
+        for i, (b, y, text, ax) in enumerate(marks):
+            same = i and (ax > 0) == (marks[0][3] > 0)                   # 둘이 같은 쪽을 보면 높이를 달리한다
             fig.add_annotation(x=xs[b], y=y, text=text, showarrow=True, arrowhead=0, arrowwidth=1, arrowcolor="#9AA0A6",
-                               ax=ax, ay=-26, font=PLOT_FONT, bgcolor="white", bordercolor="#E5E7EB", borderpad=3)
+                               ax=ax, ay=-56 if same else -26, xanchor="left" if ax > 0 else "right", font=PLOT_FONT, bgcolor="white",
+                               bordercolor="#E5E7EB", borderpad=3)
         base(fig, 380, hovermode="x unified", legend_traceorder="normal")
         time_x(fig)
         fig.update_yaxes(range=[0, top], ticksuffix=f" {u}")
