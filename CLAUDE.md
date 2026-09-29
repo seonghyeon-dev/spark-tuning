@@ -210,14 +210,13 @@
 
 ## 작업 10: 일일 리소스 사용량 시각화 — 완료
 
-- **as-is / to-be (사용자 정정 2026-09-29)**: 튜닝은 **빅테이블 hourly Compaction DAG만** 했고 **운영 적용 완료**. as-is = 튜닝 전 기간의 Airflow 이력, to-be = 튜닝 적용 후부터 조회 시점까지의 Airflow 이력. **둘 다 실측**이다(테스트값·예상값 아님). 나머지 job은 설정이 같아 차이는 실행 시간 편차뿐
+- **as-is / to-be (사용자 정정 2026-09-29)**: 튜닝은 **빅테이블 hourly Compaction DAG만** 했고 **운영 적용 완료**. as-is = 튜닝 전 기간의 Airflow 이력, to-be = 튜닝 적용 후부터 조회 시점까지의 Airflow 이력. **둘 다 실측**이다(테스트값·예상값 아님). **append cron도 바뀌었다**(사용자 2026-09-29): as-is는 일부 5분, 나머지 10·15·20분 주기 → to-be는 append 전부 5분. append의 리소스 설정은 같다. rewrite manifests(rw_mani) 운영 cron = `0 6 */3 * *` (작업 4 설계와 일치)
 - **집계** `job_durations.py` (Airflow REST API v2만, SQL 방법 삭제): Duration(task 시작~끝), Start Offset(cron 예정 시각 → 실제 시작), `scheduled` 실행만(재처리 trigger 제외). 예외 `TRIGGER_TABLE`·`TRIGGER_PARENT_DAG`: 수직분할 append 종료 후 trigger되는 테이블 1개의 `append_data` task만 부모 cron 기준으로 집계 (값은 사용자가 비공개로 입력, 저장소는 빈 값). rewrite manifests dag_id = `iceberg_rewrite_manifests`
 - **시각화** `resource_timeline.py`: 작업 엑셀 `AS-IS`·`TO-BE` 시트(같은 파일의 `AS-IS(x)`·`DIFF`는 무시) → `<원본>_resource_diff.xlsx`·`.html`. 열: A job_type(병합) · B cron · C app name · K 토탈 cpu · L 토탈 메모리 · M~S = CSV F~L · T 기능 요약(병합)
 - **지표**: 평균 사용량 = 실행 횟수 × 1회 실행 시간(분) × 코어 ÷ 1,440분 (분당 평균 사용 코어, 튜닝 효과 판단 기준) · 최대 사용량 = 동시 사용 최댓값(클러스터 확보 기준). 동시 사용량은 6초 간격(입력 정밀도 0.1분 = 6초)으로 재고, 그래프는 5분 단위 최댓값
 - 보고는 HTML 기준, 엑셀은 근거 자료로 함께 보관
 - 결과 문구 (사용자 2026-09-29): 보고서체. '붐빈다'(→ 최대 사용), 초보 설명('파랑이 회색보다 낮은 만큼'), '순간의 값을 이었다', 쓸모없는 안내·생성 도구 문구 금지
 - 사용자 작업 엑셀은 사내 DRM → Windows Python + xlwings로 엑셀 경유 읽기 (WSL 불가). 실제 엑셀 경유 읽기는 사용자 첫 실행으로만 검증 가능
-- 사용자 작업 시트의 rw_mani cron은 `5 2 */3 * *`로 작업 4 설계(06:00)와 다르다 — 어느 쪽이 운영값인지 미확인
 
 ## 파일 구조
 
