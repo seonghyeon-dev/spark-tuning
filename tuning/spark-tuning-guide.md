@@ -21,7 +21,7 @@
 
 - [1. 개요](#1-개요) — 워크플로우, 문서 범위, 테이블 스키마
 - [2. 리소스 설정](#2-리소스-설정) — driver-cores/memory, executor-cores/memory, num-executors
-- [3. 성능 설정](#3-성능-설정) — shuffle.partitions, parallelismFirst
+- [3. 성능 설정](#3-성능-설정) — shuffle.partitions, parallelismFirst, Sort Order 없는 테이블의 distribution-mode
 - [4. 설정 근거 요약 및 벤치마크 결과](#4-설정-근거-요약-및-벤치마크-결과) — 요약표, 벤치마크, 모니터링, 트러블슈팅
 - [5. 용어집](#5-용어집)
 - [6. 참고 자료](#6-참고-자료)
@@ -273,7 +273,7 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 | 1 | collect (skipped) | - | - | - | - |
 | 2 | collect (메타데이터) | - | - | 163.9KiB | - |
 | 3 | 파일 목록 조회 (5355 paths) | - | - | - | - |
-| 4 | append (avro 읽기) | 7.9GiB | - | - | - |
+| 4 | append (range 경계 샘플링, avro 전체 읽기) | 7.9GiB | - | - | - |
 | 5 | append (shuffle 준비) | 7.9GiB | **9.2GiB** | - | - |
 | 6 | append (skipped) | - | - | - | - |
 | 7 | append (Iceberg 쓰기) | - | - | **9.2GiB** | 6.5GiB |
@@ -288,6 +288,13 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 | **기본값** | `true` |
 | **권장값** | `true` (기본값 유지, 별도 설정 불필요) |
 | 근거 수준 | ✅ 벤치마크 검증 완료 |
+
+> **⚠️ 정정 (2026-09-30, 재검증 중)**: 아래 "동작 비교"와 "`false`가 느린 이유"의 메커니즘 설명은 틀렸다. 벤치마크 수치(44초 vs 53~57초)는 유효하다.
+>
+> - Iceberg append에서 AQE 목표 크기는 Spark 기본 64MB가 아니라 Iceberg가 넘기는 advisory **384MB**(128MB × shuffle 압축비 3.0)다.
+> - `true`: 목표 = `min(384MB, shuffle ÷ 총 executor core)`. 1MB만 보는 것이 아니다. 그래서 executor 수가 출력 파일 수를 정한다.
+> - `false`: 목표 = 384MB. 9.2GiB ÷ 384MB로 약 28 task가 된 것이며, 키 조합 수와는 무관하다. AQE는 rebalance 경로에서 큰 partition을 분할할 수 있다.
+> - 상세 계산과 재검증 절차: [append Job 튜닝 테스트 절차](append-tuning-test.md) §1
 
 **true vs false 동작 비교**
 
@@ -355,6 +362,14 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 | `spark.sql.adaptive.coalescePartitions.parallelismFirst` | `true` | 병렬성 우선 여부 |
 | `spark.sql.adaptive.advisoryPartitionSizeInBytes` | `64MB` | 파티션 병합 시 목표 크기 |
 | `spark.sql.adaptive.coalescePartitions.minPartitionSize` | `1MB` | 병합 후 최소 파티션 크기 |
+
+### 3.3 참고: Sort Order가 없는 테이블은 `hash`가 유리하다
+
+빅테이블은 Sort Order(`sort_a`, `sort_b`)가 있어 `range`를 쓴다(고정). Sort Order가 없는 테이블은 다음 이유로 `hash`가 유리하다. Iceberg 1.10.1 소스로 확인한 결론이며, 실측은 하지 않았다.
+
+- `range`의 정렬 키는 "파티션 컬럼 + Sort Order"다(`SortOrderUtil.buildSortOrder`). Sort Order가 없으면 파티션 컬럼만 남아 파일 배치가 `hash`와 같아진다.
+- `range`는 경계를 정하는 샘플링 job이 입력 전체를 한 번 더 읽는다(§3.1 Stage 4). 결과는 같은데 이 비용만 더 든다.
+- Iceberg 1.2 이후 `write.distribution-mode`를 지정하지 않은 파티션 테이블은 `hash`로 동작한다(`SparkWriteConf`). Sort Order가 없는데 `range`를 명시한 테이블만 바꾸면 된다.
 
 ---
 

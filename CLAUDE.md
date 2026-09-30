@@ -93,7 +93,7 @@
 
 | # | 작업 | 상태 | 문서 |
 |---|------|------|------|
-| 1 | Spark 튜닝 (append Job) | 완료, 재검증 대기 | `tuning/spark-tuning-guide.md` |
+| 1 | Spark 튜닝 (append Job) | 재검증 중 (빅테이블 4개) | `tuning/spark-tuning-guide.md`, `tuning/append-tuning-test.md` |
 | 2 | Iceberg 스키마 설계 | 확정 | `schema/iceberg-schema-design-guide.md`, `schema/read-performance-test.md` |
 | 3 | Trino 쿼리 가이드 | 완료 | `schema/trino-query-guide.md` |
 | 4 | 재처리 DAG | 운영 배포 | `pipeline/reprocessing-dag-design.md`, `pipeline/reprocess-flow.md`, `pipeline/dags/iceberg_reprocess.py` |
@@ -110,7 +110,11 @@
 - 대기: 파티션·Sort Order 최종 확정(작업 2 완료) 후 벤치마크 재검증
 - **재개 (2026-09-30, 빅테이블 4개)**: 테스트는 SparkApplication CRD 직접 apply + 테스트용 복제 테이블 + 운영 5분치 고정 입력. duration은 DataFlint UI, Airflow 집계는 운영 적용 후. 여러 batch 크기는 DA로 추후 테스트(사용자)
 - ⚠️ `parallelismFirst=true`(기본값)면 AQE 목표 크기 = `min(advisory 384MB, shuffle ÷ 총 core)` → **executor 수가 append 출력 파일 수를 정한다**. 리소스만 바꿔도 Compaction 입력이 바뀐다
-- ⚠️ 가이드 §3.2의 parallelismFirst 메커니즘 설명(1MB/64MB 기준, 분할 불가)은 틀렸다. range 분배는 샘플링 job 때문에 avro를 두 번 읽는다. `shuffle.partitions` 200은 파일 수에 영향 없음
+- ⚠️ 가이드 §3.2의 parallelismFirst 메커니즘 설명(1MB/64MB 기준, 분할 불가)은 틀렸다(정정 박스 추가). range 분배는 샘플링 job 때문에 avro를 두 번 읽는다. `shuffle.partitions` 200은 파일 수에 영향 없음
+- **현재 운영 설정 (사용자 2026-09-30, 빅테이블 4개 공통)**: driver 1 core/2g, executor 4 core/8g/**overhead 4g**. executor 수 = `get_jobs`의 `ceil(avro 총크기 ÷ 128MB × 1.5 ÷ 4)`(Spark DA 아님), 최근 10회 최대 1번 14·2번 8·3번 12·4번 12. `parallelismFirst`·`shuffle.partitions`·advisory·`spark.io.compression.codec` 기본값. 앱 인자 `tableName`, `inputFileName`(목록 텍스트 파일 경로), `batchId`. 앱 쓰기 옵션은 `snapshot-property.batch_id`뿐
+- **`write.distribution-mode=range` 고정** (사용자 2026-09-30). 비교 후보는 L0(현재) / L1(`parallelismFirst=false`) / L2(false + advisory 192MB)
+- 1번 가설 대조: 14대 × 4 = 56 core ↔ 실측 batch당 파일 58.6개. 튜닝 결과는 `get_jobs` 계수(1.5)로 환산해 반영
+- Sort Order 없는 테이블은 `hash`가 유리(소스 확인, 미실측). 가이드 §3.3
 
 ## 작업 2: Iceberg 스키마 설계
 
@@ -243,6 +247,7 @@
 │   └── schema/recreate-table-tmp-id/intent.md
 ├── tuning/
 │   ├── spark-tuning-guide.md          # Spark 튜닝 가이드 (append Job)
+│   ├── append-tuning-test.md          # append Job 튜닝 테스트 절차 (빅테이블, CRD 직접 apply)
 │   ├── compaction-tuning-guide.md     # Compaction 튜닝 가이드 (hourly, 상세)
 │   ├── compaction-tuning-report.md    # Compaction 튜닝 결과 (보고용 요약)
 │   └── trino-iceberg-partition-pruning.md  # Trino Partition Pruning 검증 (조회 경로 근거)
