@@ -108,6 +108,9 @@
 
 - 7개 설정 확정 (가이드 §4.1: 3개는 벤치마크 검증, 4개는 일반 관행)
 - 대기: 파티션·Sort Order 최종 확정(작업 2 완료) 후 벤치마크 재검증
+- **재개 (2026-09-30, 빅테이블 4개)**: 테스트는 SparkApplication CRD 직접 apply + 테스트용 복제 테이블 + 운영 5분치 고정 입력. duration은 DataFlint UI, Airflow 집계는 운영 적용 후. 여러 batch 크기는 DA로 추후 테스트(사용자)
+- ⚠️ `parallelismFirst=true`(기본값)면 AQE 목표 크기 = `min(advisory 384MB, shuffle ÷ 총 core)` → **executor 수가 append 출력 파일 수를 정한다**. 리소스만 바꿔도 Compaction 입력이 바뀐다
+- ⚠️ 가이드 §3.2의 parallelismFirst 메커니즘 설명(1MB/64MB 기준, 분할 불가)은 틀렸다. range 분배는 샘플링 job 때문에 avro를 두 번 읽는다. `shuffle.partitions` 200은 파일 수에 영향 없음
 
 ## 작업 2: Iceberg 스키마 설계
 
@@ -142,7 +145,7 @@
 | Iceberg | rewrite 전략 | `sort` (미적용 시 조회 40% 저하, 필수) |
 | | `max-concurrent-file-group-rewrites` | **12** (재처리 시간 수 × 4, 상한 16) |
 | | `max-file-group-size-bytes` | 기본값 100GB |
-| | `target-file-size-bytes` | 512MB (출력 파일 크기의 유일한 손잡이) |
+| | `target-file-size-bytes` | 512MB (Compaction 출력 파일 크기를 정하는 유일한 설정) |
 | | `rewrite-all` / `partial-progress` | `true` / `false` |
 | | `advisory-partition-size` / `parallelismFirst` | 삭제 / 삭제 가능 (무효) |
 | Spark | driver cpu | 2 |
@@ -199,6 +202,7 @@
 
 ## 작업 9: Iceberg 테이블 재생성 + `tmp_id`(NOT NULL) 추가 — 운영 적용 중
 
+- **대상은 빅테이블 4개와 다른 테이블이다** (사용자 정정 2026-09-29). intent의 "Sort Order 미적용"은 이 테이블 얘기이고, 빅테이블 4개는 파티션 2개·Sort Order 2개·`range` 적용 상태다
 - `intent/`는 사이트 게시 제외(`mkdocs.yml`)라 링크 대신 경로 텍스트로 적는다
 - 절차서는 **의도적으로 짧게 유지**한다 (1회성, 사용자 2026-09-09). 검증 로직·모드·매니페스트를 늘리지 말 것. 코드 변경은 "변경 전/후" 대비로 전달
 - 앱: `RecreateTable <backup|load> <테이블명>`, 임시 = `<테이블명>_tmp`. DROP/CREATE는 spark-sql 수동. Scala 2.12.18 / Spark 3.5.8 / Iceberg 1.10.1 컴파일 검증
