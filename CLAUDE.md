@@ -114,6 +114,7 @@
 - **`write.distribution-mode=range` 고정** (사용자 2026-09-30). 비교 후보는 L0(현재) / L1(`parallelismFirst=false`) / L2(false + advisory 192MB)
 - 1번 가설 대조: 14대 × 4 = 56 core ↔ 실측 batch당 파일 58.6개. 튜닝 결과는 `get_jobs` 계수(1.5)로 환산해 반영
 - **5분 입력 규모 실측 (2026-09-30, 두 DB 평균 합)**: 1번 avro 2,691개·4.04GiB(공식 13대), 2번 2,579개·2.56GiB(8대), 3번 3.96GiB(12대), 4번 3.88GiB(12대). DB2는 5분당 row 4개 수준. 상세 `append-tuning-test.md` §3.2
+- 측정용 메타데이터 조회(job별 row 수·파일 수·크기)는 **Trino**로 한다(사용자 2026-09-30). `summary[...]` 대신 `element_at`, `$entries`는 `status <> 2` (`append-tuning-test.md` §5.2, Trino 482 검증)
 - Sort Order 없는 테이블은 `hash`가 유리(소스 확인, 미실측). 가이드 §3.3
 
 ## 작업 2: Iceberg 스키마 설계

@@ -247,51 +247,57 @@ spec:
 - duration, dcu, idle cores, spill, task error rate, executor 유실
 - stage별 시간. 샘플링 stage는 input이 avro 크기와 같고 shuffle write가 없는 stage다(2026-03 벤치마크의 Stage 4).
 
-### 5.2 append job별 row 수·파일 수·크기 (spark-sql)
+### 5.2 append job별 row 수·파일 수·크기 (Trino)
 
-append job 1회 = snapshot 1개다. job은 `batchId`로 넣은 `snapshot-property.batch_id`(snapshot summary의 `batch_id`)로 구분한다. `.files`에는 snapshot 연결 컬럼이 없어서 job별 집계에 쓸 수 없다.
+append job 1회 = snapshot 1개다. job은 `batchId`로 넣은 `snapshot-property.batch_id`(snapshot summary의 `batch_id`)로 구분한다. `$files`에는 snapshot 연결 컬럼이 없어서 job별 집계에 쓸 수 없다.
 
-**① job별 합계** (`.snapshots`)
+**① job별 합계** (`$snapshots`)
 
 ```sql
-SELECT summary['batch_id']                                              AS batch_id,
+SELECT element_at(summary, 'batch_id')                                     AS batch_id,
        snapshot_id,
-       CAST(summary['added-records'] AS BIGINT)                         AS row_cnt,
-       CAST(summary['added-data-files'] AS INT)                         AS files,
-       ROUND(CAST(summary['added-files-size'] AS BIGINT) / POWER(1024, 3), 3) AS gb,
-       ROUND(CAST(summary['added-files-size'] AS BIGINT)
-             / CAST(summary['added-data-files'] AS INT) / POWER(1024, 2), 1) AS avg_mb
-FROM iceberg.<db>.<테이블1>_tune.snapshots
-WHERE summary['batch_id'] LIKE 'tune-t1-%'
+       CAST(element_at(summary, 'added-records') AS BIGINT)                AS row_cnt,
+       CAST(element_at(summary, 'added-data-files') AS INTEGER)            AS files,
+       ROUND(CAST(element_at(summary, 'added-files-size') AS BIGINT) / POWER(1024, 3), 3) AS gb,
+       ROUND(CAST(element_at(summary, 'added-files-size') AS BIGINT)
+             / CAST(element_at(summary, 'added-data-files') AS DOUBLE) / POWER(1024, 2), 1) AS avg_mb
+FROM iceberg.<db>."<테이블1>_tune$snapshots"
+WHERE element_at(summary, 'batch_id') LIKE 'tune-t1-%'
 ORDER BY committed_at;
 ```
 
 - `row_cnt`: 같은 고정 입력이면 모든 회차에서 같아야 한다. 다르면 입력이 바뀐 것이므로 그 회차는 비교에서 뺀다.
 - dcu/GB의 GB는 `gb`(이번 job의 parquet 출력 크기)를 쓴다.
+- `summary['batch_id']`로 쓰면 안 된다. Trino는 map에 없는 key를 `[]`로 읽으면 `Key not present in map` 오류로 쿼리 전체가 실패한다. batch_id가 없는 snapshot(Compaction, 수동 INSERT 등)이 하나라도 있으면 실패하므로 `element_at`을 쓴다.
 
-**② job별 파일 크기 분포** (`.entries`)
+**② job별 파일 크기 분포** (`$entries`)
 
 ```sql
-SELECT s.summary['batch_id']                                           AS batch_id,
-       COUNT(*)                                                        AS files,
-       SUM(e.data_file.record_count)                                   AS row_cnt,
-       ROUND(MIN(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)  AS min_mb,
-       ROUND(AVG(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)  AS avg_mb,
-       ROUND(MAX(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)  AS max_mb
-FROM iceberg.<db>.<테이블1>_tune.entries e
-JOIN iceberg.<db>.<테이블1>_tune.snapshots s
+SELECT element_at(s.summary, 'batch_id')                                   AS batch_id,
+       COUNT(*)                                                            AS files,
+       SUM(e.data_file.record_count)                                       AS row_cnt,
+       ROUND(MIN(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)      AS min_mb,
+       ROUND(AVG(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)      AS avg_mb,
+       ROUND(MAX(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)      AS max_mb
+FROM iceberg.<db>."<테이블1>_tune$entries" e
+JOIN iceberg.<db>."<테이블1>_tune$snapshots" s
   ON e.snapshot_id = s.snapshot_id
 WHERE e.status <> 2
-  AND s.summary['batch_id'] LIKE 'tune-t1-%'
-GROUP BY s.summary['batch_id']
-ORDER BY batch_id;
+  AND element_at(s.summary, 'batch_id') LIKE 'tune-t1-%'
+GROUP BY element_at(s.summary, 'batch_id')
+ORDER BY 1;
 ```
 
 - 조건은 `status <> 2`(삭제 제외)다. `status = 1`(ADDED)로 쓰면 append가 쌓여 manifest가 합쳐진 뒤 예전 job이 빠진다. 합쳐진 manifest에서는 예전 파일이 `EXISTING`(0)으로 바뀌고, 파일을 추가한 job의 `snapshot_id`는 그대로 남는다.
 - ②의 `files`·`row_cnt`는 ①과 같아야 한다.
-- `.entries`는 현재 snapshot에 살아 있는 파일만 보여 준다. Compaction으로 다시 쓰인 파일은 빠진다. 테스트 테이블은 Compaction을 돌리기 전까지 해당 없다.
+- `$entries`는 현재 snapshot에 살아 있는 파일만 보여 준다. Compaction으로 다시 쓰인 파일은 빠진다. 테스트 테이블은 Compaction을 돌리기 전까지 해당 없다.
 
-**검증** (2026-09-30, 로컬 Spark 3.5.8 + Iceberg 1.10.1): 파티션 `hours(ts)`·`par_a`, Sort Order `sort_a`·`sort_b`, `range` 테이블에 batch_id를 붙여 6회 append했다. `commit.manifest.min-count-to-merge=3`으로 manifest 합치기를 일으킨 상태에서 ①과 ②의 row 수·파일 수가 6개 job 모두 실제 넣은 값과 일치했다. 같은 상태에서 `status = 1`은 6개 중 4개 job을 놓쳤다.
+**검증** (2026-09-30, Trino 482)
+
+- 로컬 Spark 3.5.8 + Iceberg 1.10.1로 파티션 `hours(ts)`·`par_a`, Sort Order `sort_a`·`sort_b`, `range` 테이블을 만들고 batch_id를 붙여 6회 append했다(row 2만~12만, job당 파일 4개). `commit.manifest.min-count-to-merge=3`으로 manifest 합치기를 일으켰다.
+- 이 테이블을 Trino 482에 등록하고 위 SQL을 그대로 실행했다. ①·② 모두 6개 job의 row 수·파일 수가 실제 넣은 값과 일치했다.
+- 같은 상태에서 `status = 1`은 6개 중 4개 job을 놓쳤다.
+- batch_id 없는 snapshot을 하나 추가하자 `summary['batch_id']` 방식은 `Key not present in map: batch_id`로 실패했고, `element_at` 방식은 6개 job을 그대로 반환했다.
 
 ### 5.3 driver 로그: AQE 목표 크기
 
