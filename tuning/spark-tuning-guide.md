@@ -7,7 +7,7 @@
 | 작성 목적 | Spark Job의 리소스 및 성능 설정에 대한 근거 기반 가이드 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
-| 최종 수정일 | 2026-03-16 |
+| 최종 수정일 | 2026-09-30 (§3.2 정정, §3.3 추가) |
 
 ### 근거 수준 라벨
 
@@ -190,6 +190,8 @@ avro → Iceberg append는 데이터를 메모리에 장기 보관하지 않으�
 > Executor Pod 실제 메모리 = `executor-memory` + `memoryOverhead`
 > `memoryOverhead` 기본값 = `executor-memory × 0.10` (최소 384MB)
 > 예) 8g 설정 시 → Pod 메모리 ≈ 8g + 819MB ≈ 8.8g
+>
+> 운영 빅테이블 append는 `memoryOverhead` 4g를 명시한다(pod당 12g, 2026-09-30 확인). 재검증 대상이다([테스트 절차](append-tuning-test.md) §8).
 
 ---
 
@@ -246,7 +248,7 @@ num_executors = max(num_executors, 1)
 > | **읽기 파티션** | `spark.sql.files.maxPartitionBytes` | 128MB | `spark.read` 단계. small file들을 묶어 하나의 파티션으로 생성 |
 > | **셔플 파티션** | `spark.sql.shuffle.partitions` | 200 | shuffle 발생 시 파티션 수 결정 |
 >
-> 이 워크플로우에서는 Iceberg의 `write.distribution-mode=range`에 의해 파티션 키 + write ordering 기준 범위 기반 데이터 재분배가 발생하며, 벤치마크에서 **9.2GiB 규모의 shuffle이 확인**되었다 (Stage 5→7, 1.3절 참고).
+> 이 워크플로우에서는 Iceberg의 `write.distribution-mode=range`에 의해 파티션 키 + write ordering 기준 범위 기반 데이터 재분배가 발생하며, 벤치마크에서 **9.2GiB 규모의 shuffle이 확인**되었다 (Stage 5→7, 3.1절 참고).
 
 ### 3.1 spark.sql.shuffle.partitions
 
@@ -293,7 +295,7 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 >
 > - Iceberg append에서 AQE 목표 크기는 Spark 기본 64MB가 아니라 Iceberg가 넘기는 advisory **384MB**(128MB × shuffle 압축비 3.0)다.
 > - `true`: 목표 = `min(384MB, shuffle ÷ 총 executor core)`. 1MB만 보는 것이 아니다. 그래서 executor 수가 출력 파일 수를 정한다.
-> - `false`: 목표 = 384MB. 9.2GiB ÷ 384MB로 약 28 task가 된 것이며, 키 조합 수와는 무관하다. AQE는 rebalance 경로에서 큰 partition을 분할할 수 있다.
+> - `false`: 목표 = 384MB. 9.2GiB ÷ 384MB = 약 25이고, 약 47MB짜리 range 구간을 384MB 이하로 묶다 보니 실측 28 task가 됐다. 키 조합 수와는 무관하다. AQE는 rebalance 경로에서 큰 partition을 분할할 수 있다.
 > - 상세 계산과 재검증 절차: [append Job 튜닝 테스트 절차](append-tuning-test.md) §1
 
 **true vs false 동작 비교**
@@ -458,7 +460,7 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 | **AQE** | Adaptive Query Execution. Spark 3.2부터 기본 활성화 (운영 3.5.8·목표 4.1.1 모두 해당). 런타임에 shuffle 파티션 병합, 조인 전략 변경 등을 자동 수행 |
 | **PARALLELISM_FACTOR** | num-executors 산정식의 여유 계수. Spark 옵션이 아닌 Airflow `get_jobs` task의 코드 상수 (현재 1.5) |
 | **coalescePartitions** | AQE의 기능. shuffle 후 작은 파티션들을 자동으로 병합하여 태스크 수를 줄임 |
-| **advisoryPartitionSizeInBytes** | AQE 파티션 병합 시 목표 크기 (기본 64MB). 이미 초과한 파티션은 분할 불가 |
+| **advisoryPartitionSizeInBytes** | AQE 파티션 병합 시 목표 크기 (Spark 기본 64MB). Iceberg append에서는 Iceberg가 넘기는 384MB가 쓰인다 (§3.2 정정 박스) |
 | **write.distribution-mode** | Iceberg 쓰기 전 데이터 재분배 방식. `range`는 파티션 키 + write ordering 기준 범위 분배 |
 | **memoryOverhead** | JVM 외부 메모리 (off-heap, 네이티브 라이브러리 등). K8S Pod 메모리 = executor-memory + memoryOverhead |
 | **Compaction** | Iceberg `rewrite_data_files` 프로시저. small file을 병합하여 읽기 성능 최적화 |

@@ -28,13 +28,13 @@
 | 단계 | 값 |
 |------|----|
 | parquet 출력 | 3,157MB |
-| shuffle 크기 | 3,157MB × 1.41 = 약 4.45GB (1.41 = 2026-03 벤치마크의 shuffle 9.2GiB ÷ 출력 6.5GiB) |
+| shuffle 크기 | 3,157MB × 1.41 = 약 4.45GB (1.41 = 2026-03 벤치마크의 shuffle 9.2GiB ÷ 출력 6.5GiB, A안 스키마 값. 현행 값은 L0 실행의 shuffle write ÷ 출력으로 다시 잰다) |
 | 총 core | 운영 14대 × 4 = 56 |
 | 목표 크기 | 4.45GB ÷ 56 = 약 79MB. 384MB보다 작으므로 79MB가 쓰인다 |
 | 결과 | 쓰기 task 약 56개 → 파일 약 58개, 파일당 79MB ÷ 1.41 = 약 56MB |
 | 실측 (2026-08-11) | batch당 58.6개, 파일당 53.9MB |
 
-- 파일 수(58.6)가 총 core 수(56)와 거의 같다. 나머지 2~3개는 파티션(`hour(ts)`, `par_a`) 경계에 걸친 task가 파일을 하나 더 쓴 것이다.
+- 파일 수(58.6)가 총 core 수(56)와 거의 같다. 단 56은 최근 10회 최대 executor 수 기준이고, 58.6은 2026-08-11 batch 12개의 평균이다. 당시 batch별 executor 수는 기록이 없으므로 §5.3 로그로 확인한다. 나머지 2~3개는 파티션(`hour(ts)`, `par_a`) 경계에 걸친 task가 파일을 하나 더 쓴 것이다.
 - `false`로 바꾸면 목표가 advisory 384MB로 고정된다. 4.45GB ÷ 384MB로 쓰기 task는 약 12개, 경계를 더해 batch당 파일은 약 12~16개가 된다. 이때 파일 크기는 advisory가 정하고 executor 수와는 무관해진다.
 - `spark.sql.shuffle.partitions`(200)는 range 분배의 초기 구간 수일 뿐이다. AQE가 위 목표 크기로 다시 합치거나 쪼개므로 파일 수에 영향이 없다. 기본값을 유지한다.
 - `write.distribution-mode=range`는 고정이다(비교 대상 아님). range는 경계를 정하는 샘플링 job이 avro 전체를 한 번 더 읽는다. stage별 시간을 볼 때 이 stage를 따로 적는다.
@@ -137,10 +137,10 @@ spec:
 | 후보 | `parallelismFirst` | advisory | 1번 예상 (batch당) |
 |------|------|------|------|
 | **L0** (현재) | 미지정 (= `true`) | 미지정 (= 384MB) | 약 58개 × 54MB, 쓰기 task 약 56개 |
-| **L1** | `false` | 미지정 (= 384MB) | 약 12~16개 × 약 250MB, 쓰기 task 약 12개 |
+| **L1** | `false` | 미지정 (= 384MB) | 약 12~16개 × 약 270MB, 쓰기 task 약 12개 |
 | **L2** | `false` | `201326592` (192MB) | 약 24~28개 × 약 136MB, 쓰기 task 약 24개 |
 
-- L2 값 계산: 4.45GB ÷ 192MB = 약 24 task, 파일당 192MB ÷ 1.41 = 약 136MB
+- L1 파일 크기: 384MB ÷ 1.41 = 약 272MB. L2 값 계산: 4.45GB ÷ 192MB = 약 24 task, 파일당 192MB ÷ 1.41 = 약 136MB
 - L1이 필수 조건을 통과하고 dcu/GB가 L0보다 낮으면 L2는 생략한다. L1의 쓰기 stage가 길어 필수 조건을 못 맞추면 L2를 돌린다.
 - 실행 순서: L0 → L1 → L0 → L1 ... 순으로 번갈아 5회씩 돌린다. 시간대별 클러스터 부하가 한 후보에만 몰리지 않게 하기 위해서다.
 - L0 5회의 편차 (최댓값 − 최솟값) ÷ 평균을 이번 테스트의 노이즈 기준선으로 쓴다.
@@ -239,9 +239,9 @@ kubectl logs -n <ns> append-tune-t1-l0-r1-driver \
 
 1. **리소스 비교**: §4에서 고른 설정으로 비교한다. 순서는 executor 수(3지점) → memory(spill 0인 최솟값) → memoryOverhead(4g → 3g → 2g, task error rate로 판정) → `spark.kubernetes.allocation.batch.size`
    - 채택한 executor 수는 `get_jobs` 공식의 계수(현재 1.5)로 환산해 운영에 반영한다.
-   - 예: avro 4.78GB batch에서 10대가 최적이면 계수 = 10 × 4 ÷ (4,780 ÷ 128) = 약 1.07
+   - 계산 예시(가상 값): avro 4,700MB batch는 현재 공식으로 ceil(4,700 ÷ 128 × 1.5 ÷ 4) = 14대다. 이 batch에서 10대가 최적이면 계수 = 10 × 4 ÷ (4,700 ÷ 128) = 약 1.09
 2. **시간당 합계 검증**: batch 12개를 적재한 뒤 테스트 테이블에 hourly Compaction(운영 설정)을 1회 돌린다.
    - 비교 지표: append dcu × 12 + Compaction dcu
-   - 입력 파일이 커지면 ratio 0.13의 전제(GB당 task 약 9개)가 바뀐다. 설계서 §4.4·§8.3 절차로 다시 맞춘다.
+   - 입력 파일이 커지면 ratio 0.13의 전제(GB당 task 약 9개)가 바뀐다. 파일이 커지는 방향은 영향이 작다고 추정돼 있다(설계서 §4.5·§9). 실측 대수를 설계서 §4.4 역산 방법으로 확인한다.
 3. **2·3·4번 테이블 확장**: 1번 결과로 시작값을 잡고 테이블당 2~3회 확인한다. memory는 테이블별로 정한다.
 4. **운영 적용 후**: Airflow duration은 `job_durations.py`(`pipeline/airflow-job-duration.md`)로 집계한다.
