@@ -93,7 +93,7 @@
 
 | # | 작업 | 상태 | 문서 |
 |---|------|------|------|
-| 1 | Spark 튜닝 (append Job) | 완료, 재검증 대기 | `tuning/spark-tuning-guide.md` |
+| 1 | Spark 튜닝 (append Job) | 재검증 중 (빅테이블 4개) | `tuning/spark-tuning-guide.md`, `tuning/append-tuning-test.md` |
 | 2 | Iceberg 스키마 설계 | 확정 | `schema/iceberg-schema-design-guide.md`, `schema/read-performance-test.md` |
 | 3 | Trino 쿼리 가이드 | 완료 | `schema/trino-query-guide.md` |
 | 4 | 재처리 DAG | 운영 배포 | `pipeline/reprocessing-dag-design.md`, `pipeline/reprocess-flow.md`, `pipeline/dags/iceberg_reprocess.py` |
@@ -107,7 +107,13 @@
 ## 작업 1: Spark 튜닝 가이드 (append Job)
 
 - 7개 설정 확정 (가이드 §4.1: 3개는 벤치마크 검증, 4개는 일반 관행)
-- 대기: 파티션·Sort Order 최종 확정(작업 2 완료) 후 벤치마크 재검증
+- **재개 (2026-09-30, 빅테이블 4개)**: 테스트는 SparkApplication CRD 직접 apply + 테스트용 복제 테이블 + 운영 5분치 고정 입력. duration은 DataFlint UI, Airflow 집계는 운영 적용 후. 여러 batch 크기는 DA로 추후 테스트(사용자)
+- ⚠️ `parallelismFirst=true`(기본값)면 AQE 목표 크기 = `min(advisory 384MB, shuffle ÷ 총 core)` → **executor 수가 append 출력 파일 수를 정한다**. 리소스만 바꿔도 Compaction 입력이 바뀐다
+- ⚠️ 가이드 §3.2의 parallelismFirst 메커니즘 설명(1MB/64MB 기준, 분할 불가)은 틀렸다(정정 박스 추가). range 분배는 샘플링 job 때문에 avro를 두 번 읽는다. `shuffle.partitions` 200은 파일 수에 영향 없음
+- **현재 운영 설정 (사용자 2026-09-30, 빅테이블 4개 공통)**: driver 1 core/2g, executor 4 core/8g/**overhead 4g**. executor 수 = `get_jobs`의 `ceil(avro 총크기 ÷ 128MB × 1.5 ÷ 4)`(Spark DA 아님), 최근 10회 최대 1번 14·2번 8·3번 12·4번 12. `parallelismFirst`·`shuffle.partitions`·advisory·`spark.io.compression.codec` 기본값. 앱 인자 `tableName`, `inputFileName`(목록 텍스트 파일 경로), `batchId`. 앱 쓰기 옵션은 `snapshot-property.batch_id`뿐
+- **`write.distribution-mode=range` 고정** (사용자 2026-09-30). 비교 후보는 L0(현재) / L1(`parallelismFirst=false`) / L2(false + advisory 192MB)
+- 1번 가설 대조: 14대 × 4 = 56 core ↔ 실측 batch당 파일 58.6개. 튜닝 결과는 `get_jobs` 계수(1.5)로 환산해 반영
+- Sort Order 없는 테이블은 `hash`가 유리(소스 확인, 미실측). 가이드 §3.3
 
 ## 작업 2: Iceberg 스키마 설계
 
@@ -142,7 +148,7 @@
 | Iceberg | rewrite 전략 | `sort` (미적용 시 조회 40% 저하, 필수) |
 | | `max-concurrent-file-group-rewrites` | **12** (재처리 시간 수 × 4, 상한 16) |
 | | `max-file-group-size-bytes` | 기본값 100GB |
-| | `target-file-size-bytes` | 512MB (출력 파일 크기의 유일한 손잡이) |
+| | `target-file-size-bytes` | 512MB (Compaction 출력 파일 크기를 정하는 유일한 설정) |
 | | `rewrite-all` / `partial-progress` | `true` / `false` |
 | | `advisory-partition-size` / `parallelismFirst` | 삭제 / 삭제 가능 (무효) |
 | Spark | driver cpu | 2 |
@@ -199,6 +205,7 @@
 
 ## 작업 9: Iceberg 테이블 재생성 + `tmp_id`(NOT NULL) 추가 — 운영 적용 중
 
+- **대상은 빅테이블 4개와 다른 테이블이다** (사용자 정정 2026-09-29). intent의 "Sort Order 미적용"은 이 테이블 얘기이고, 빅테이블 4개는 파티션 2개·Sort Order 2개·`range` 적용 상태다
 - `intent/`는 사이트 게시 제외(`mkdocs.yml`)라 링크 대신 경로 텍스트로 적는다
 - 절차서는 **의도적으로 짧게 유지**한다 (1회성, 사용자 2026-09-09). 검증 로직·모드·매니페스트를 늘리지 말 것. 코드 변경은 "변경 전/후" 대비로 전달
 - 앱: `RecreateTable <backup|load> <테이블명>`, 임시 = `<테이블명>_tmp`. DROP/CREATE는 spark-sql 수동. Scala 2.12.18 / Spark 3.5.8 / Iceberg 1.10.1 컴파일 검증
@@ -239,6 +246,7 @@
 │   └── schema/recreate-table-tmp-id/intent.md
 ├── tuning/
 │   ├── spark-tuning-guide.md          # Spark 튜닝 가이드 (append Job)
+│   ├── append-tuning-test.md          # append Job 튜닝 테스트 절차 (빅테이블, CRD 직접 apply)
 │   ├── compaction-tuning-guide.md     # Compaction 튜닝 가이드 (hourly, 상세)
 │   ├── compaction-tuning-report.md    # Compaction 튜닝 결과 (보고용 요약)
 │   └── trino-iceberg-partition-pruning.md  # Trino Partition Pruning 검증 (조회 경로 근거)

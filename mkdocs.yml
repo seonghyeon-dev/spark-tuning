@@ -105,6 +105,7 @@ nav:
   - 프로젝트 현황: CLAUDE.md
   - 튜닝:
       - Spark 튜닝 가이드 (append Job): tuning/spark-tuning-guide.md
+      - append Job 튜닝 테스트 절차 (빅테이블): tuning/append-tuning-test.md
       - Compaction 튜닝 가이드 (hourly): tuning/compaction-tuning-guide.md
       - Compaction 튜닝 결과 (보고용): tuning/compaction-tuning-report.md
       - Trino Partition Pruning 검증: tuning/trino-iceberg-partition-pruning.md
