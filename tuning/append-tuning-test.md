@@ -247,13 +247,16 @@ spec:
 - duration, dcu, idle cores, spill, task error rate, executor 유실
 - stage별 시간. 샘플링 stage는 input이 avro 크기와 같고 shuffle write가 없는 stage다(2026-03 벤치마크의 Stage 4).
 
-### 5.2 출력 파일 수·크기 (spark-sql)
+### 5.2 append job별 row 수·파일 수·크기 (spark-sql)
 
-batch별 파일 수, 크기, 평균:
+append job 1회 = snapshot 1개다. job은 `batchId`로 넣은 `snapshot-property.batch_id`(snapshot summary의 `batch_id`)로 구분한다. `.files`에는 snapshot 연결 컬럼이 없어서 job별 집계에 쓸 수 없다.
+
+**① job별 합계** (`.snapshots`)
 
 ```sql
 SELECT summary['batch_id']                                              AS batch_id,
        snapshot_id,
+       CAST(summary['added-records'] AS BIGINT)                         AS row_cnt,
        CAST(summary['added-data-files'] AS INT)                         AS files,
        ROUND(CAST(summary['added-files-size'] AS BIGINT) / POWER(1024, 3), 3) AS gb,
        ROUND(CAST(summary['added-files-size'] AS BIGINT)
@@ -263,22 +266,32 @@ WHERE summary['batch_id'] LIKE 'tune-t1-%'
 ORDER BY committed_at;
 ```
 
-batch별 최소·최대 파일 크기:
+- `row_cnt`: 같은 고정 입력이면 모든 회차에서 같아야 한다. 다르면 입력이 바뀐 것이므로 그 회차는 비교에서 뺀다.
+- dcu/GB의 GB는 `gb`(이번 job의 parquet 출력 크기)를 쓴다.
+
+**② job별 파일 크기 분포** (`.entries`)
 
 ```sql
-SELECT e.snapshot_id,
-       COUNT(*)                                                    AS files,
-       ROUND(MIN(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1) AS min_mb,
-       ROUND(MAX(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1) AS max_mb
+SELECT s.summary['batch_id']                                           AS batch_id,
+       COUNT(*)                                                        AS files,
+       SUM(e.data_file.record_count)                                   AS row_cnt,
+       ROUND(MIN(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)  AS min_mb,
+       ROUND(AVG(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)  AS avg_mb,
+       ROUND(MAX(e.data_file.file_size_in_bytes) / POWER(1024, 2), 1)  AS max_mb
 FROM iceberg.<db>.<테이블1>_tune.entries e
-WHERE e.status = 1
-  AND e.snapshot_id IN (SELECT snapshot_id
-                        FROM iceberg.<db>.<테이블1>_tune.snapshots
-                        WHERE summary['batch_id'] LIKE 'tune-t1-%')
-GROUP BY e.snapshot_id;
+JOIN iceberg.<db>.<테이블1>_tune.snapshots s
+  ON e.snapshot_id = s.snapshot_id
+WHERE e.status <> 2
+  AND s.summary['batch_id'] LIKE 'tune-t1-%'
+GROUP BY s.summary['batch_id']
+ORDER BY batch_id;
 ```
 
-- dcu/GB의 GB는 위 `gb`(이번 batch의 parquet 출력 크기)를 쓴다. 후보 간 입력이 같으므로 dcu 자체를 비교해도 결과는 같다.
+- 조건은 `status <> 2`(삭제 제외)다. `status = 1`(ADDED)로 쓰면 append가 쌓여 manifest가 합쳐진 뒤 예전 job이 빠진다. 합쳐진 manifest에서는 예전 파일이 `EXISTING`(0)으로 바뀌고, 파일을 추가한 job의 `snapshot_id`는 그대로 남는다.
+- ②의 `files`·`row_cnt`는 ①과 같아야 한다.
+- `.entries`는 현재 snapshot에 살아 있는 파일만 보여 준다. Compaction으로 다시 쓰인 파일은 빠진다. 테스트 테이블은 Compaction을 돌리기 전까지 해당 없다.
+
+**검증** (2026-09-30, 로컬 Spark 3.5.8 + Iceberg 1.10.1): 파티션 `hours(ts)`·`par_a`, Sort Order `sort_a`·`sort_b`, `range` 테이블에 batch_id를 붙여 6회 append했다. `commit.manifest.min-count-to-merge=3`으로 manifest 합치기를 일으킨 상태에서 ①과 ②의 row 수·파일 수가 6개 job 모두 실제 넣은 값과 일치했다. 같은 상태에서 `status = 1`은 6개 중 4개 job을 놓쳤다.
 
 ### 5.3 driver 로그: AQE 목표 크기
 
@@ -321,10 +334,10 @@ kubectl logs -n <ns> append-tune-t1-l0-r1-driver \
 
 ## 7. 기록표
 
-| 후보 | 회차 | instances | duration | dcu | gb | dcu/GB | idle cores | spill | task error | 유실 | files | avg_mb | min_mb | max_mb | actual target size | 샘플링 stage | 기동 |
-|------|------|-----------|----------|-----|----|--------|-----------|-------|-----------|------|-------|--------|--------|--------|-------------------|-------------|------|
-| L0 | 1 | | | | | | | | | | | | | | | | |
-| L1 | 1 | | | | | | | | | | | | | | | | |
+| 후보 | 회차 | instances | duration | dcu | row_cnt | gb | dcu/GB | idle cores | spill | task error | 유실 | files | avg_mb | min_mb | max_mb | actual target size | 샘플링 stage | 기동 |
+|------|------|-----------|----------|-----|---------|----|--------|-----------|-------|-----------|------|-------|--------|--------|--------|-------------------|-------------|------|
+| L0 | 1 | | | | | | | | | | | | | | | | | |
+| L1 | 1 | | | | | | | | | | | | | | | | | |
 
 ---
 
