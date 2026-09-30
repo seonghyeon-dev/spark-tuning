@@ -88,14 +88,76 @@ DESCRIBE TABLE EXTENDED iceberg.<db>.<테이블1>_tune;
 SHOW TBLPROPERTIES iceberg.<db>.<테이블1>_tune;
 ```
 
-### 3.2 고정 입력
+### 3.2 입력 규모 산정 (JOB_HISTORY, Oracle)
+
+고정 입력을 고르기 전에 5분 구간별 JOB_HISTORY row 수, avro 파일 수, 크기를 잰다. `get_jobs`의 조회 상한 200 row(변동 가능)는 1회 조회의 상한일 뿐이고 5분치 규모가 아니다.
+
+- 가정: 시간 컬럼 `dt`(문자열 `YYYYMMDDHH24MISSFF3`, 예 `20260930132700886`), 파일 목록 JSON 컬럼 `param`(`{"table": ..., "files": [{"name": ..., "size": "2262129"}, ...]}`, `size`는 바이트)
+- 맨 위 `p`의 값 3개만 바꿔서 실행한다. JSON 컬럼 이름이 `param`이 아니면 `j.param` 한 곳을 바꾼다.
+- DB 2개에서 각각 실행한다. 같은 `bucket_5m`끼리 두 DB 값을 더한 것이 그 5분의 전체 입력이다.
+- `bucket_5m`이 `202609291325`이면 13:25:00.000~13:29:59.999 구간이다.
+- `JSON_TABLE`은 Oracle 12.1.0.2 이상에서 동작한다.
+
+**① 요약: 5분 구간별 min / avg / max**
+
+```sql
+WITH p AS (                                   -- 여기만 수정
+  SELECT 'TABLE_1'            AS tbl,         -- 대상 테이블명 (table_name 값)
+         '20260929000000000'  AS dt_from,     -- 조회 시작 (포함)
+         '20260930000000000'  AS dt_to        -- 조회 끝 (미포함)
+    FROM dual
+),
+per_row AS (                                  -- JOB_HISTORY row 1개당 파일 수·크기
+  SELECT j.ROWID                    AS rid,
+         MIN(j.dt)                  AS dt,
+         COUNT(*)                   AS n_files,
+         SUM(TO_NUMBER(f.fsize))    AS size_bytes
+    FROM p, JOB_HISTORY j,
+         JSON_TABLE(j.param, '$.files[*]'
+                    COLUMNS (fsize VARCHAR2(20) PATH '$.size')) f
+   WHERE j.table_name = p.tbl
+     AND j.dt >= p.dt_from
+     AND j.dt <  p.dt_to
+   GROUP BY j.ROWID
+),
+per_5m AS (                                   -- dt의 분을 5로 내림해 5분 구간으로 묶음
+  SELECT SUBSTR(dt, 1, 10) || LPAD(FLOOR(TO_NUMBER(SUBSTR(dt, 11, 2)) / 5) * 5, 2, '0') AS bucket_5m,
+         COUNT(*)         AS n_rows,
+         SUM(n_files)     AS n_files,
+         SUM(size_bytes)  AS size_bytes
+    FROM per_row
+   GROUP BY SUBSTR(dt, 1, 10) || LPAD(FLOOR(TO_NUMBER(SUBSTR(dt, 11, 2)) / 5) * 5, 2, '0')
+)
+SELECT COUNT(*)                                   AS buckets,
+       MIN(n_rows)   AS rows_min,  ROUND(AVG(n_rows))   AS rows_avg,  MAX(n_rows)   AS rows_max,
+       MIN(n_files)  AS files_min, ROUND(AVG(n_files))  AS files_avg, MAX(n_files)  AS files_max,
+       ROUND(MIN(size_bytes) / POWER(1024, 3), 2) AS gb_min,
+       ROUND(AVG(size_bytes) / POWER(1024, 3), 2) AS gb_avg,
+       ROUND(MAX(size_bytes) / POWER(1024, 3), 2) AS gb_max
+  FROM per_5m;
+```
+
+**② 구간별 목록 (고정 입력 batch를 고를 때)**
+
+①의 마지막 `SELECT ... FROM per_5m;`만 아래로 바꾼다.
+
+```sql
+SELECT bucket_5m, n_rows, n_files,
+       ROUND(size_bytes / POWER(1024, 3), 2) AS size_gb
+  FROM per_5m
+ ORDER BY bucket_5m;
+```
+
+- 고정 입력은 ①의 avg에 가까운 구간을 고른다. min·max 구간은 이후 여러 batch 크기 테스트에 쓴다.
+
+### 3.3 고정 입력
 
 - 운영 1시간치(5분 batch 12개)의 `inputFileName` 목록 파일을 테스트용 S3 경로에 복사한다. 목록 형식은 바꾸지 않는다.
 - 2단계(후보 비교)는 batch 1개(`t1_batch01`)만 반복해서 쓴다. 12개 전체는 Compaction 합계 검증(§8)에서 쓴다.
 - 복사 전에 목록 속 원천 avro가 테스트 기간 동안 지워지지 않는지 확인한다.
 - 그 batch의 운영 executor 수(Airflow XCom `num_executors`)를 기록해 둔다. 이 값이 L0의 `instances`다.
 
-### 3.3 SparkApplication YAML
+### 3.4 SparkApplication YAML
 
 운영 YAML을 복사해서 아래 표시한 곳만 바꾼다. image, mainClass, jar, 볼륨, DataFlint 등 나머지는 운영 그대로 둔다.
 
@@ -122,7 +184,7 @@ spec:
     memory: "2g"
   executor:
     cores: 4
-    instances: 14                             # §3.2에서 기록한 운영 값
+    instances: 14                             # §3.3에서 기록한 운영 값
     memory: "8g"
     memoryOverhead: "4g"
 ```
