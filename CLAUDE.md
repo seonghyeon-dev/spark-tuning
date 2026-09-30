@@ -51,7 +51,7 @@
 ### 기존 시스템 (as-is)
 
 - Hive 테이블 (ORC, HDFS 블록 128MB), 파티션 `dt` 1개
-- **수직분할 4개 테이블 = '빅테이블'** (사용자 명명 2026-09-29). Iceberg 대상 TABLE_A는 그중 1개. hourly Compaction 튜닝 대상 1~4번 테이블과 같다. 같은 원천이라 시간당 row 수(약 340만)가 같고 컬럼 폭만 다르다
+- **수직분할 4개 테이블 = '빅테이블'** (사용자 명명 2026-09-29). Iceberg 대상 TABLE_A는 그중 1개. hourly Compaction 튜닝 대상 1~4번 테이블과 같다. 같은 원천이라 시간당 row 수(약 340만)가 같고 컬럼 폭만 다르다. 단 append 입력 기준 1번은 2·3·4번 데이터에 다른 종류 데이터가 더해져 row·avro 수가 약 4% 많다(사용자 2026-09-30)
 
 ### 대상 테이블 (TABLE_A)
 
@@ -113,6 +113,7 @@
 - **현재 운영 설정 (사용자 2026-09-30, 빅테이블 4개 공통)**: driver 1 core/2g, executor 4 core/8g/**overhead 4g**. executor 수 = `get_jobs`의 `ceil(avro 총크기 ÷ 128MB × 1.5 ÷ 4)`(Spark DA 아님), 최근 10회 최대 1번 14·2번 8·3번 12·4번 12. `parallelismFirst`·`shuffle.partitions`·advisory·`spark.io.compression.codec` 기본값. 앱 인자 `tableName`, `inputFileName`(목록 텍스트 파일 경로), `batchId`. 앱 쓰기 옵션은 `snapshot-property.batch_id`뿐
 - **`write.distribution-mode=range` 고정** (사용자 2026-09-30). 비교 후보는 L0(현재) / L1(`parallelismFirst=false`) / L2(false + advisory 192MB)
 - 1번 가설 대조: 14대 × 4 = 56 core ↔ 실측 batch당 파일 58.6개. 튜닝 결과는 `get_jobs` 계수(1.5)로 환산해 반영
+- **5분 입력 규모 실측 (2026-09-30, 두 DB 평균 합)**: 1번 avro 2,691개·4.04GiB(공식 13대), 2번 2,579개·2.56GiB(8대), 3번 3.96GiB(12대), 4번 3.88GiB(12대). DB2는 5분당 row 4개 수준. 상세 `append-tuning-test.md` §3.2
 - Sort Order 없는 테이블은 `hash`가 유리(소스 확인, 미실측). 가이드 §3.3
 
 ## 작업 2: Iceberg 스키마 설계
