@@ -81,7 +81,7 @@
 
 ### 워크플로우
 
-- Airflow DAG → avro read → Iceberg append (약 5분 주기, 5분치 ≈ Job History 200 rows. 벤치마크는 10분 주기 ~8GB)
+- Airflow DAG → avro read → Iceberg append (약 5분 주기. 벤치마크는 10분 주기 ~8GB). `get_jobs`의 JOB_HISTORY 조회 상한 200 row(변동 가능)는 1회 조회 상한일 뿐 5분치 row 수가 아니다(사용자 정정 2026-09-30). 5분치 규모는 `tuning/append-tuning-test.md` §3.2 SQL로 잰다. JOB_HISTORY row당 avro 약 25개(사용자)
 - Compaction: hourly `45 * * * *`(직전 1시간치) + daily `0 1 * * *`(전일치), 모든 전략에서 필수
 
 ### 참고 공식 문서
