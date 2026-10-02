@@ -301,26 +301,31 @@ ORDER BY 1;
 
 ### 5.3 driver 로그: AQE 목표 크기
 
+driver pod에는 컨테이너가 2개(`spark-kubernetes-driver`, `monitoring`)라서 `-c`로 driver 컨테이너를 지정한다.
+
 ```bash
-kubectl logs -n <ns> append-tune-t1-l0-r1-driver | grep "actual target size"
+kubectl logs -n <ns> append-tune-t1-l0-r1-driver -c spark-kubernetes-driver | grep "actual target size"
 ```
 
-- 출력 예: `advisory target size: 402653184, actual target size 83886080, ...`
+- 출력 형식: `INFO ShufflePartitionsUtil: For shuffle(0), advisory target size: 402653184, actual target size 83886080, minimum partition size: 1048576`
 - L0에서 `actual target size`가 advisory(402653184 = 384MB)보다 작으면 core 수가 목표를 줄였다는 뜻이다. §1의 계산이 맞는지 이 값으로 확인한다.
 - L1에서는 두 값이 같아야 한다.
+- INFO 레벨 로그다. 아무것도 안 나오면 driver의 log4j 레벨이 WARN 이상인지 확인한다.
+- 검증 (2026-10-02, 로컬 Spark 3.5.8 + Iceberg 1.10.1): 같은 구조의 테이블에 append 1회 실행 시 위 형식으로 출력됨을 확인했다(advisory 402653184).
 
 ### 5.4 기동 시간
 
 ```bash
 # driver pod 생성 → driver 컨테이너 시작
 kubectl get pod -n <ns> append-tune-t1-l0-r1-driver \
-  -o jsonpath='{.metadata.creationTimestamp}{"  "}{.status.containerStatuses[0].state.terminated.startedAt}{"\n"}'
+  -o jsonpath='{.metadata.creationTimestamp}{"  "}{.status.containerStatuses[?(@.name=="spark-kubernetes-driver")].state.terminated.startedAt}{"\n"}'
 
 # SparkContext 시작 → 마지막 executor 등록
-kubectl logs -n <ns> append-tune-t1-l0-r1-driver \
+kubectl logs -n <ns> append-tune-t1-l0-r1-driver -c spark-kubernetes-driver \
   | grep -E "Running Spark version|Registered executor" | sed -n '1p;$p'
 ```
 
+- `containerStatuses`는 컨테이너 이름으로 고른다. 순서(`[0]`)로 고르면 `monitoring` 컨테이너 값이 나올 수 있다.
 - 두 구간의 합을 기동 시간으로 기록한다.
 - 현재 `spark.kubernetes.allocation.batch.size`는 기본값 5다. 14대면 5·5·4대로 1초 간격 3라운드에 나눠 요청한다.
 
