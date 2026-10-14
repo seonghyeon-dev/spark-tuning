@@ -15,7 +15,8 @@
 - 코드는 2벌이다. Spark 3.5.8은 SQL `MERGE INTO`(§3.1), Spark 4.x는 `Dataset.mergeInto` API(§3.2)를 쓴다. 3.5.8에는 MERGE용 Scala API가 없다.
 - SQL 버전은 Spark 4.1.1에서도 그대로 동작한다. 업그레이드 때 코드를 바꾸지 않아도 되고, API 버전으로 바꾸면 SQL 문자열과 escape 처리가 없어진다.
 - MERGE에 `tmp_id1 IN (이번 batch 값)` 조건을 넣는다. 넣지 않으면 `tmp_id1`이 파티션 컬럼이어도 대상 테이블 전체를 읽는다. Spark 3.5.8과 4.1.1 모두 같았다(로컬 실측 21개 → 1개).
-- `s.tmp_key > t.tmp_key`일 때만 update한다. 재처리 DAG이 다음날 올리는 과거 데이터가 최신 row를 덮어쓰지 않고, 같은 batch를 다시 실행해도 결과가 바뀌지 않는다.
+- 최신 판단은 `ts`로 한다. `tmp_key`와 같은 시각이라 결과가 같고, 성능은 같거나 낫다(§4.5).
+- `s.ts > t.ts`일 때만 update한다. 재처리 DAG이 다음날 올리는 과거 데이터가 최신 row를 덮어쓰지 않고, 같은 batch를 다시 실행해도 결과가 바뀌지 않는다.
 - 재처리 DAG이 쓰는 batch_id 영수증은 `CommitMetadata.withCommitProperties`로 snapshot summary에 남긴다. 두 버전 모두 같다.
 - 테이블은 `write.merge.mode=merge-on-read`로 만든다.
 
@@ -26,7 +27,7 @@
 | 1 | S3의 avro 경로 목록 파일 read | 동일 |
 | 2 | 목록의 avro 파일 read → DataFrame | 동일 |
 | 4 | 컬럼명 변환 | 동일 (3단계 앞으로 이동) |
-| 3 | 키별로 `tmp_key`가 가장 큰 row 1개만 남김 | 신규 |
+| 3 | 키별로 `ts`가 가장 큰 row 1개만 남김 | 신규 |
 | 5 | Iceberg MERGE (upsert) | `append()` 대체 |
 
 컬럼명 변환을 중복 제거 앞으로 옮겼다. 중복 제거는 컬럼 이름과 무관해서 결과가 같고, 이렇게 하면 키 컬럼 이름을 변환 후 이름 하나로만 관리한다. 원래 순서를 지키려면 `latestByKey`에는 원천 이름을, `upsert`의 `UpsertSpec`에는 변환 후 이름을 넣는다.
@@ -50,12 +51,12 @@ import org.apache.spark.storage.StorageLevel
 
 object UpsertJob {
 
-  /** 테이블별 upsert 키. 컬럼명은 변환 후 이름. pruneCol = 키 중 파티션 컬럼 */
+  /** 테이블별 upsert 키. 컬럼명은 변환 후 이름. orderCol = 최신 판단 컬럼, pruneCol = 키 중 파티션 컬럼 */
   case class UpsertSpec(keyCols: Seq[String], orderCol: String, pruneCol: String)
 
   val upsertSpecs: Map[String, UpsertSpec] = Map(
-    "<테이블1>" -> UpsertSpec(Seq("tmp_id1"), "tmp_key", "tmp_id1"),
-    "<테이블2>" -> UpsertSpec(Seq("tmp_id1", "tmp_id2"), "tmp_key", "tmp_id1")
+    "<테이블1>" -> UpsertSpec(Seq("tmp_id1"), "ts", "tmp_id1"),
+    "<테이블2>" -> UpsertSpec(Seq("tmp_id1", "tmp_id2"), "ts", "tmp_id1")
   )
 
   /** 키별로 orderCol 값이 가장 큰 row 1개만 남긴다. 동률이면 아무 row나 1개 */
@@ -125,12 +126,12 @@ import org.apache.spark.storage.StorageLevel
 
 object UpsertJob {
 
-  /** 테이블별 upsert 키. 컬럼명은 변환 후 이름. pruneCol = 키 중 파티션 컬럼 */
+  /** 테이블별 upsert 키. 컬럼명은 변환 후 이름. orderCol = 최신 판단 컬럼, pruneCol = 키 중 파티션 컬럼 */
   case class UpsertSpec(keyCols: Seq[String], orderCol: String, pruneCol: String)
 
   val upsertSpecs: Map[String, UpsertSpec] = Map(
-    "<테이블1>" -> UpsertSpec(Seq("tmp_id1"), "tmp_key", "tmp_id1"),
-    "<테이블2>" -> UpsertSpec(Seq("tmp_id1", "tmp_id2"), "tmp_key", "tmp_id1")
+    "<테이블1>" -> UpsertSpec(Seq("tmp_id1"), "ts", "tmp_id1"),
+    "<테이블2>" -> UpsertSpec(Seq("tmp_id1", "tmp_id2"), "ts", "tmp_id1")
   )
 
   /** 키별로 orderCol 값이 가장 큰 row 1개만 남긴다. 동률이면 아무 row나 1개 */
@@ -190,23 +191,16 @@ object UpsertJob {
 
 ### 4.1 키별 최신 row 선택 (`latestByKey`)
 
-키가 같은 row끼리 묶어 `tmp_key` 내림차순으로 번호를 매기고 1번만 남긴다.
+키가 같은 row끼리 묶어 `ts` 내림차순으로 번호를 매기고 1번만 남긴다.
 
-| 입력 row | `tmp_id1` | `tmp_key` | 번호 | 결과 |
-|---------|-----------|-----------|------|------|
-| 1 | X | `20261014225900000` | 2 | 버림 |
-| 2 | X | `20261014235900000` | 1 | 채택 |
+| 입력 row | `tmp_id1` | `ts` | 번호 | 결과 |
+|---------|-----------|------|------|------|
+| 1 | X | `2026-10-14 22:59:00.000` | 2 | 버림 |
+| 2 | X | `2026-10-14 23:59:00.000` | 1 | 채택 |
 
-**`tmp_key`를 문자열로 비교해도 시간 순서와 같다.** `tmp_key`는 `YYYYMMDDHHmmSSSSS` 17자리 고정 길이이고, 큰 단위(연)부터 작은 단위(밀리초) 순으로 놓여 있다. 문자열 비교는 앞자리부터 한 글자씩 비교하므로 처음 다른 자리가 곧 시간의 대소다.
+**최신 판단에 `tmp_key` 대신 `ts`를 쓴다.** `tmp_key`(`YYYYMMDDHHmmSSSSS` 문자열)와 `ts`(timestamp_ntz)는 타입만 다르고 같은 시각을 가리킨다(사용자 확인 2026-10-14). 어느 쪽으로 판단해도 고르는 row가 같다. `ts`를 쓰면 `tmp_key`가 17자리 고정 형식이어야 한다는 전제가 필요 없고, 성능은 같거나 낫다(§4.5).
 
-| 비교 | 처음 다른 자리 | 결과 |
-|------|----------------|------|
-| `20261014235900000` vs `20261015000100000` | 8번째 자리 (일 `4` < `5`) | 10-15 00:01이 최신 |
-| `20261015000100000` vs `20261015000100001` | 17번째 자리 (밀리초 `0` < `1`) | 1밀리초 뒤가 최신 |
-
-자리수가 17자리가 아닌 값이 섞이면 이 성질이 깨진다(예: `202610150001` 12자리). 형식은 고정이라 변환 없이 문자열로 비교한다.
-
-- `tmp_key`까지 같은 row가 오면 둘 중 하나를 남긴다(사용자 확인: 발생하지 않고, 발생해도 아무거나 무방).
+- `ts`까지 같은 row가 오면 둘 중 하나를 남긴다(사용자 확인: 발생하지 않고, 발생해도 아무거나 무방).
 - 이 단계는 생략할 수 없다. 같은 키가 source에 2개 있으면 MERGE가 에러로 실패한다.
 
 ### 4.2 MERGE 조건
@@ -215,19 +209,19 @@ object UpsertJob {
 MERGE INTO <테이블> t
 USING upsert_src s
 ON t.tmp_id1 = s.tmp_id1 AND t.tmp_id1 IN ('X', ...)
-WHEN MATCHED AND s.tmp_key > t.tmp_key THEN UPDATE SET *
+WHEN MATCHED AND s.ts > t.ts THEN UPDATE SET *
 WHEN NOT MATCHED THEN INSERT *
 ```
 
 Spark 4 API 버전도 같은 조건을 `Column`으로 만든다 (§4.4).
 
-**`s.tmp_key > t.tmp_key`: 과거 데이터가 최신을 덮어쓰지 않게 한다**
+**`s.ts > t.ts`: 과거 데이터가 최신을 덮어쓰지 않게 한다**
 
 1. 10-14 23:59 버전 X가 batch 실패로 FAILURE가 된다.
 2. 10-15 00:01 버전 X가 다음 batch에서 적재된다. 테이블에는 00:01 버전이 있다.
 3. 다음날 04:00 재처리 DAG이 23:59 버전을 다시 올린다.
 
-조건이 없으면 3에서 23:59 버전이 00:01 버전을 덮어쓴다. 조건이 있으면 `20261014235900000 > 20261015000100000`이 거짓이라 무시된다. 같은 batch를 두 번 실행해도 두 번째는 `tmp_key`가 같아 update가 0건이므로 Airflow retry로 인한 중복도 생기지 않는다.
+조건이 없으면 3에서 23:59 버전이 00:01 버전을 덮어쓴다. 조건이 있으면 `2026-10-14 23:59 > 2026-10-15 00:01`이 거짓이라 무시된다. 같은 batch를 두 번 실행해도 두 번째는 `ts`가 같아 update가 0건이므로 Airflow retry로 인한 중복도 생기지 않는다.
 
 **`t.tmp_id1 IN (...)`: 대상 테이블 읽기 범위를 줄인다**
 
@@ -238,14 +232,14 @@ MERGE는 source와 대상 테이블을 join한다. ON이 `t.tmp_id1 = s.tmp_id1`
 | `t.tmp_id1 = s.tmp_id1`만 | 21개 읽음 | 21개 읽음 |
 | `IN` 조건 추가 | 1개 읽음 | 1개 읽음 |
 
-- 하한 조건은 두지 않는다. 같은 키면 보관 중인 전체 데이터에서 최신 `tmp_key`로 upsert한다(사용자 확인). 그래서 `tmp_id1` 값 하나당 읽는 범위는 그 값의 `days(ts)` 파티션 전체이고, 보관이 3개월이므로 최대 약 90일치다.
+- 하한 조건은 두지 않는다. 같은 키면 보관 중인 전체 데이터에서 최신 `ts`의 row로 upsert한다(사용자 확인). 그래서 `tmp_id1` 값 하나당 읽는 범위는 그 값의 `days(ts)` 파티션 전체이고, 보관이 3개월이므로 최대 약 90일치다.
 - 값 수집과 MERGE가 avro를 두 번 읽지 않도록 source를 `persist`한다. 캐시 크기는 중복 제거 후 batch 데이터 크기다.
 - SQL 버전은 값에 `'`나 `\`가 있어도 깨지지 않도록 escape한다. API 버전은 값이 SQL 문자열을 거치지 않아 escape가 필요 없다. 두 버전 모두 `Q'1\x` 키로 update가 정상 동작함을 확인했다.
 - batch가 0 row면 MERGE를 하지 않는다. snapshot이 생기지 않으므로 재처리 DAG이 이 batch를 다시 올리는데, 0 row라 결과는 같다.
 
 **`ts`는 ON에 넣지 않는다**
 
-`tmp_key`는 `ts`와 같은 시간 값이므로 같은 키의 새 버전은 `ts`도 바뀐다. 10-14 23:59 버전과 10-15 00:01 버전은 `days(ts)` 파티션이 다르다. ON에 `ts` 조건을 넣으면 10-14 row를 찾지 못해 10-15 row가 새로 insert되고 X가 2건이 된다. 지금 코드는 10-14 row를 지우고 10-15 row를 10-15 파티션에 넣는다 (§6.2 b2).
+`ts`는 최신 판단(`WHEN MATCHED` 조건)에만 쓰고, 같은 row를 찾는 ON 조건에는 넣지 않는다. 같은 키의 새 버전은 `ts`가 바뀐다. 10-14 23:59 버전과 10-15 00:01 버전은 `days(ts)` 파티션이 다르다. ON에 `ts` 조건을 넣으면 10-14 row를 찾지 못해 10-15 row가 새로 insert되고 X가 2건이 된다. 지금 코드는 10-14 row를 지우고 10-15 row를 10-15 파티션에 넣는다 (§6.2 b2).
 
 ### 4.3 batch_id 영수증
 
@@ -264,6 +258,33 @@ update·insert가 0건인 MERGE(같은 batch 재실행)도 snapshot이 생기고
 | MERGE 실행 | `spark.sql(mergeSql)` | `.mergeInto(...).whenMatched(...).updateAll().whenNotMatched().insertAll().merge()` |
 
 API 버전은 대상 컬럼을 테이블 이름으로 가리킨다. `tableName`이 `db.table`이든 `catalog.db.table`이든 그대로 쓰면 된다. source 별칭 `s`가 테이블 이름과 같으면 안 된다.
+
+### 4.5 `ts`와 `tmp_key` 비교 (성능)
+
+결과는 같고, 성능은 `ts`가 같거나 낫다. 차이가 나는 곳은 중복 제거 정렬이고, 그것도 batch 안에 같은 키의 row가 많을 때만이다.
+
+| 항목 | `tmp_key` (string 17자) | `ts` (timestamp_ntz) | 차이 |
+|------|------------------------|----------------------|------|
+| 최신 판단 결과 (500만 row) | | | 차이 0건 |
+| 값 1개 비교 | 17바이트 문자열 비교 | 8바이트 정수 비교 | `ts`가 가벼움 |
+| 중복 제거 시간, 키당 row 5,000개 | 7.3~8.1초 | 4.8~5.9초 | `ts` 약 30% 빠름 (평균 7.7초 → 5.2초) |
+| 중복 제거 시간, 키당 row 2개 | 7.3~7.8초 | 7.5~8.8초 | 차이 없음 (반복 간 편차 범위) |
+| 파일 저장 크기 (zstd) | 26.8MB | 26.5MB | 거의 같음 |
+
+측정: 로컬 `local[2]`, Spark 3.5.8 + Iceberg 1.10.1, 500만 row(3일 × `tmp_id1` 20종, `ts`는 하루 안 임의 밀리초). 중복 제거는 warm-up 1회 뒤 3회 반복했다.
+
+**중복 제거: 키당 row 수에 따라 차이가 갈린다**
+
+`latestByKey`는 row를 키로 먼저 정렬하고, 키가 같은 row끼리만 최신 판단 컬럼을 비교한다.
+
+- 키당 row가 2개면 최신 판단 컬럼을 비교할 일이 거의 없다. 그래서 컬럼 타입을 바꿔도 시간이 같았다.
+- 키당 row가 5,000개면 정렬 비교 대부분이 최신 판단 컬럼에서 일어난다. 17바이트 문자열 비교가 8바이트 정수 비교로 바뀌어 약 30% 빨라졌다.
+
+실제 5분 batch에서 같은 키가 몇 번 겹치는지는 측정하지 않았다. 겹침이 적으면 차이도 작다.
+
+**MERGE: 대상 테이블에서 읽는 컬럼이 바뀌지만 크기가 거의 같다**
+
+MERGE는 대상 테이블에서 키 컬럼과 조건 컬럼만 읽는다(로컬 실행 계획: `tmp_id1`, `tmp_id2`, 조건 컬럼, `_file`, `_pos`). 조건을 `ts`로 바꾸면 `tmp_key` 대신 `ts`를 읽는다. 두 컬럼의 파일 저장 크기는 500만 row에서 26.8MB와 26.5MB로 row당 약 5.3바이트다. 밀리초 단위 값은 압축 후 크기가 비슷해서, 읽는 양에는 차이가 없다.
 
 ## 5. 테이블 설정
 
