@@ -16,6 +16,7 @@
 - SQL 버전은 Spark 4.1.1에서도 그대로 동작한다. 업그레이드 때 코드를 바꾸지 않아도 되고, API 버전으로 바꾸면 SQL 문자열과 escape 처리가 없어진다.
 - MERGE에 `tmp_id1 IN (이번 batch 값)` 조건을 넣는다. 넣지 않으면 `tmp_id1`이 파티션 컬럼이어도 대상 테이블 전체를 읽는다. Spark 3.5.8과 4.1.1 모두 같았다(로컬 실측 21개 → 1개).
 - 최신 판단은 `ts`로 한다. `tmp_key`와 같은 시각이라 결과가 같고, 성능은 같거나 낫다(§4.5).
+- update는 `tmp_id1`, `tmp_id2`를 뺀 나머지 컬럼 전부를 source 값으로 바꾼다. 테이블1은 `tmp_id2`가 키가 아니므로, 새 버전의 `tmp_id2`가 달라도 기존 값을 유지한다(§4.2).
 - `s.ts > t.ts`일 때만 update한다. 재처리 DAG이 다음날 올리는 과거 데이터가 최신 row를 덮어쓰지 않고, 같은 batch를 다시 실행해도 결과가 바뀌지 않는다.
 - 재처리 DAG이 쓰는 batch_id 영수증은 `CommitMetadata.withCommitProperties`로 snapshot summary에 남긴다. 두 버전 모두 같다.
 - 테이블은 `write.merge.mode=merge-on-read`로 만든다.
@@ -51,12 +52,17 @@ import org.apache.spark.storage.StorageLevel
 
 object UpsertJob {
 
-  /** 테이블별 upsert 키. 컬럼명은 변환 후 이름. orderCol = 최신 판단 컬럼, pruneCol = 키 중 파티션 컬럼 */
-  case class UpsertSpec(keyCols: Seq[String], orderCol: String, pruneCol: String)
+  /** 테이블별 upsert 설정. 컬럼명은 변환 후 이름
+    *  keyCols      같은 row를 찾는 키
+    *  orderCol     최신 판단 컬럼
+    *  pruneCol     키 중 파티션 컬럼 (대상 테이블 읽기 범위를 줄인다)
+    *  noUpdateCols update하지 않는 컬럼. 나머지 컬럼은 전부 source 값으로 갱신 */
+  case class UpsertSpec(keyCols: Seq[String], orderCol: String, pruneCol: String,
+                        noUpdateCols: Seq[String])
 
   val upsertSpecs: Map[String, UpsertSpec] = Map(
-    "<테이블1>" -> UpsertSpec(Seq("tmp_id1"), "ts", "tmp_id1"),
-    "<테이블2>" -> UpsertSpec(Seq("tmp_id1", "tmp_id2"), "ts", "tmp_id1")
+    "<테이블1>" -> UpsertSpec(Seq("tmp_id1"), "ts", "tmp_id1", Seq("tmp_id1", "tmp_id2")),
+    "<테이블2>" -> UpsertSpec(Seq("tmp_id1", "tmp_id2"), "ts", "tmp_id1", Seq("tmp_id1", "tmp_id2"))
   )
 
   /** 키별로 orderCol 값이 가장 큰 row 1개만 남긴다. 동률이면 아무 row나 1개 */
@@ -77,6 +83,9 @@ object UpsertJob {
       val pruneVals = src.select(spec.pruneCol).distinct().collect().map(_.getString(0))
       if (pruneVals.isEmpty) return
 
+      // update할 컬럼 = 전체 컬럼 - noUpdateCols
+      val updateCols = src.columns.toSeq.filterNot(spec.noUpdateCols.contains)
+
       val inList = pruneVals
         .map(v => "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'")
         .mkString(", ")
@@ -84,13 +93,14 @@ object UpsertJob {
       val view = "upsert_src"
       src.createOrReplaceTempView(view)
 
+      val set = updateCols.map(c => s"`$c` = s.`$c`").mkString(", ")
       val on = (spec.keyCols.map(k => s"t.$k = s.$k") :+
         s"t.${spec.pruneCol} IN ($inList)").mkString(" AND ")
       val mergeSql =
         s"""MERGE INTO $tableName t
            |USING $view s
            |ON $on
-           |WHEN MATCHED AND s.${spec.orderCol} > t.${spec.orderCol} THEN UPDATE SET *
+           |WHEN MATCHED AND s.${spec.orderCol} > t.${spec.orderCol} THEN UPDATE SET $set
            |WHEN NOT MATCHED THEN INSERT *""".stripMargin
 
       CommitMetadata.withCommitProperties(
@@ -126,12 +136,17 @@ import org.apache.spark.storage.StorageLevel
 
 object UpsertJob {
 
-  /** 테이블별 upsert 키. 컬럼명은 변환 후 이름. orderCol = 최신 판단 컬럼, pruneCol = 키 중 파티션 컬럼 */
-  case class UpsertSpec(keyCols: Seq[String], orderCol: String, pruneCol: String)
+  /** 테이블별 upsert 설정. 컬럼명은 변환 후 이름
+    *  keyCols      같은 row를 찾는 키
+    *  orderCol     최신 판단 컬럼
+    *  pruneCol     키 중 파티션 컬럼 (대상 테이블 읽기 범위를 줄인다)
+    *  noUpdateCols update하지 않는 컬럼. 나머지 컬럼은 전부 source 값으로 갱신 */
+  case class UpsertSpec(keyCols: Seq[String], orderCol: String, pruneCol: String,
+                        noUpdateCols: Seq[String])
 
   val upsertSpecs: Map[String, UpsertSpec] = Map(
-    "<테이블1>" -> UpsertSpec(Seq("tmp_id1"), "ts", "tmp_id1"),
-    "<테이블2>" -> UpsertSpec(Seq("tmp_id1", "tmp_id2"), "ts", "tmp_id1")
+    "<테이블1>" -> UpsertSpec(Seq("tmp_id1"), "ts", "tmp_id1", Seq("tmp_id1", "tmp_id2")),
+    "<테이블2>" -> UpsertSpec(Seq("tmp_id1", "tmp_id2"), "ts", "tmp_id1", Seq("tmp_id1", "tmp_id2"))
   )
 
   /** 키별로 orderCol 값이 가장 큰 row 1개만 남긴다. 동률이면 아무 row나 1개 */
@@ -152,6 +167,9 @@ object UpsertJob {
       val pruneVals = src.select(spec.pruneCol).distinct().collect().map(_.getString(0))
       if (pruneVals.isEmpty) return
 
+      // update할 컬럼 = 전체 컬럼 - noUpdateCols
+      val updateCols = src.columns.toSeq.filterNot(spec.noUpdateCols.contains)
+
       // 대상 테이블 컬럼은 테이블 이름으로, source 컬럼은 별칭 s로 가리킨다
       def t(c: String): Column = col(s"$tableName.$c")
       def s(c: String): Column = col(s"s.$c")
@@ -164,7 +182,8 @@ object UpsertJob {
         new java.util.concurrent.Callable[Unit] {
           def call(): Unit = src.as("s")
             .mergeInto(tableName, on)
-            .whenMatched(s(spec.orderCol) > t(spec.orderCol)).updateAll()
+            .whenMatched(s(spec.orderCol) > t(spec.orderCol))
+            .update(updateCols.map(c => c -> s(c)).toMap)
             .whenNotMatched().insertAll()
             .merge()
         },
@@ -209,7 +228,7 @@ object UpsertJob {
 MERGE INTO <테이블> t
 USING upsert_src s
 ON t.tmp_id1 = s.tmp_id1 AND t.tmp_id1 IN ('X', ...)
-WHEN MATCHED AND s.ts > t.ts THEN UPDATE SET *
+WHEN MATCHED AND s.ts > t.ts THEN UPDATE SET tmp_key = s.tmp_key, ts = s.ts, ...  -- tmp_id1, tmp_id2 제외
 WHEN NOT MATCHED THEN INSERT *
 ```
 
@@ -222,6 +241,19 @@ Spark 4 API 버전도 같은 조건을 `Column`으로 만든다 (§4.4).
 3. 다음날 04:00 재처리 DAG이 23:59 버전을 다시 올린다.
 
 조건이 없으면 3에서 23:59 버전이 00:01 버전을 덮어쓴다. 조건이 있으면 `2026-10-14 23:59 > 2026-10-15 00:01`이 거짓이라 무시된다. 같은 batch를 두 번 실행해도 두 번째는 `ts`가 같아 update가 0건이므로 Airflow retry로 인한 중복도 생기지 않는다.
+
+**update 컬럼: `tmp_id1`, `tmp_id2`를 뺀 나머지 전부**
+
+`UpsertSpec.noUpdateCols`에 둔 컬럼은 update하지 않고, 나머지 컬럼은 전부 source 값으로 바꾼다. 두 테이블 모두 `Seq("tmp_id1", "tmp_id2")`다. 컬럼 목록은 source DataFrame에서 만들므로 컬럼이 추가돼도 코드를 고칠 필요가 없다. insert는 모든 컬럼을 넣는다.
+
+| 테이블 | 기존 row | 새 버전 | update 결과 |
+|--------|----------|---------|-------------|
+| 테이블1 (키 `tmp_id1`) | Y / `tmp_id2`=1 / 10-14 23:59 / `y-old` | Y / `tmp_id2`=9 / 10-15 00:01 / `y-new` | Y / `tmp_id2`=**1** / 10-15 00:01 / `y-new` |
+| 테이블2 (키 `tmp_id1`, `tmp_id2`) | Y/1 | Y/9 | 키가 달라 Y/9가 새 row로 insert |
+
+- 테이블1: `UPDATE SET *`(전 컬럼 갱신)이었다면 `tmp_id2`가 9로 바뀐다. 지금 코드는 1을 유지한다.
+- 테이블2: `tmp_id1`, `tmp_id2`가 키라서 match된 row는 두 값이 원래 같다. 갱신 여부와 무관하게 결과가 같다.
+- `ts`는 갱신 대상이다. `ts`가 바뀌면 row가 새 `days(ts)` 파티션으로 옮겨진다(위 Y는 10-14 → 10-15).
 
 **`t.tmp_id1 IN (...)`: 대상 테이블 읽기 범위를 줄인다**
 
@@ -255,7 +287,8 @@ update·insert가 0건인 MERGE(같은 batch 재실행)도 snapshot이 생기고
 | source 전달 | temp view `upsert_src` | `src.as("s")` |
 | 대상 컬럼 참조 | 별칭 `t.<컬럼>` | 테이블 이름 `<tableName>.<컬럼>` (API에 대상 별칭이 없음) |
 | `IN` 값 | SQL 문자열에 넣으므로 escape 필요 | `isin(...)`으로 값 전달, escape 불필요 |
-| MERGE 실행 | `spark.sql(mergeSql)` | `.mergeInto(...).whenMatched(...).updateAll().whenNotMatched().insertAll().merge()` |
+| update 컬럼 지정 | `UPDATE SET \`컬럼\` = s.\`컬럼\`, ...` | `.update(Map(컬럼 -> s(컬럼), ...))` |
+| MERGE 실행 | `spark.sql(mergeSql)` | `.mergeInto(...).whenMatched(...).update(...).whenNotMatched().insertAll().merge()` |
 
 API 버전은 대상 컬럼을 테이블 이름으로 가리킨다. `tableName`이 `db.table`이든 `catalog.db.table`이든 그대로 쓰면 된다. source 별칭 `s`가 테이블 이름과 같으면 안 된다.
 
@@ -329,9 +362,10 @@ TBLPROPERTIES (
 | b1 | X 3건 (10-14 22:59 1건, 23:59 2건) | 23:59 버전 1건만 insert |
 | b2 | X 10-15 00:01 | 10-14 row 삭제 표시(position delete 1건), 00:01 row를 10-15 파티션에 insert. X는 1건. 대상 1개 파일만 읽음 |
 | b3 | b2 재실행 | 변경 0건, snapshot summary에 `batch_id=b3` 기록 |
+| by1, by2 | Y: `tmp_id2`=1 (10-14 23:59) → `tmp_id2`=9 (10-15 00:01) | `tmp_id2`=1 유지, 나머지 컬럼은 새 값. 10-15 파티션으로 이동 |
 | bq, bq2 | `Q'1\x` 키 10-14 23:59 → 10-15 00:01 | update 정상, 중복 없음 |
 
-테이블2 (키 `tmp_id1`, `tmp_id2`)도 같은 시나리오에서 결과가 같았다. 추가로 X/2의 하루 전 버전(`stale`)이 기존 row를 덮어쓰지 않았다. `IN` 조건이 없을 때 대상 데이터 파일을 전부(61개 중 61개) 읽었고, 있을 때 1개만 읽었다.
+테이블2 (키 `tmp_id1`, `tmp_id2`)도 같은 시나리오에서 결과가 같았다. 단 by1·by2는 키가 달라 Y/1, Y/9 2건이 됐다. 추가로 X/2의 하루 전 버전(`stale`)이 기존 row를 덮어쓰지 않았다. `IN` 조건이 없을 때 대상 데이터 파일을 전부(61개 중 61개) 읽었고, 있을 때 1개만 읽었다.
 
 ## 7. 미확인·후속
 
