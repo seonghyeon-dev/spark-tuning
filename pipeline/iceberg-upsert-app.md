@@ -407,14 +407,7 @@ TBLPROPERTIES (
 
 ## 8. 로컬 테스트 (avro → 중복 제거까지)
 
-Iceberg 적재(5단계) 직전까지를 로컬 Spark만으로 검사한다. Iceberg·S3는 필요 없다. 테스트는 두 종류다.
-
-| 구분 | 클래스 | 입력 | 확인 방식 | 잡는 것 |
-|------|--------|------|-----------|---------|
-| 단위 테스트 | `LatestByKeyTest` | 코드에 적은 작은 입력 (row 2~6개) | 결과가 미리 정한 정답과 같은지 | 중복 제거 로직 자체의 오류 |
-| 실데이터 검증 | `UpsertPrepareTest` | `src/test/resources/avro`의 실제 avro | 정답을 모르므로 지켜져야 할 성질(키별 1건, 키별 최신 등)을 검사 | 실제 데이터·목록 파일·컬럼명 변환에서 생기는 문제 |
-
-두 테스트 모두 통과해도 확인한 값을 로그로 남긴다(ScalaTest `info`). 통과·실패만 보지 않고, 중복 제거 전후 값을 눈으로 대조할 수 있다(§8.4).
+Iceberg 적재(5단계) 직전까지, 즉 `prepare`의 결과를 실제 avro 파일로 검사한다. Iceberg·S3 없이 로컬 Spark만으로 돈다. 통과해도 확인한 값을 로그로 남겨 중복 제거 전후를 눈으로 대조할 수 있다(§8.4).
 
 ### 8.1 파일 위치
 
@@ -422,17 +415,13 @@ Iceberg 적재(5단계) 직전까지를 로컬 Spark만으로 검사한다. Iceb
 src/
 ├── main/scala/UpsertJob.scala              # §3 코드
 └── test/
-    ├── resources/avro/*.avro               # 실데이터 검증용 avro 파일 (같은 테이블 것)
-    └── scala/
-        ├── LocalSpark.scala                # 공통: 로컬 SparkSession, 로그용 표 출력
-        ├── LatestByKeyTest.scala           # 단위 테스트
-        └── UpsertPrepareTest.scala         # 실데이터 검증
+    ├── resources/avro/*.avro               # 테스트할 avro 파일 (같은 테이블 것)
+    └── scala/UpsertPrepareTest.scala       # 아래 §8.3 코드
 ```
 
-- avro 파일은 한 테이블 것만 넣고, `UpsertPrepareTest`의 `tableName`을 그 테이블로 맞춘다.
-- `UpsertPrepareTest`가 avro 경로 목록 파일(운영의 `inputFileName`과 같은 형식)을 임시로 만들어 `prepare`에 넘긴다. 1단계(목록 read)부터 검증된다.
+- avro 파일은 한 테이블 것만 넣고, 테스트 코드의 `tableName`을 그 테이블로 맞춘다.
+- 테스트가 avro 경로 목록 파일(운영의 `inputFileName`과 같은 형식)을 임시로 만들어 `prepare`에 넘긴다. 1단계(목록 read)부터 검증된다.
 - `renameColumns`가 실제 변환 함수를 호출해야 4단계까지 검증된다.
-- 단위 테스트만 돌리려면 `mvn test -Dsuites=LatestByKeyTest`, 전부는 `mvn test`.
 
 ### 8.2 빌드 설정 (Maven)
 
@@ -501,142 +490,6 @@ pom.xml에 두 가지를 추가한다. ScalaTest 의존성과, 테스트 JVM에 
 
 ### 8.3 테스트 코드
 
-**LocalSpark.scala** (공통)
-
-```scala
-import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.functions.col
-import org.scalatest.{BeforeAndAfterAll, Suite}
-
-/** 테스트용 로컬 SparkSession과 DataFrame 출력 도우미 */
-trait LocalSpark extends BeforeAndAfterAll { self: Suite =>
-
-  protected var spark: SparkSession = _
-
-  override def beforeAll(): Unit = {
-    spark = SparkSession.builder()
-      .master("local[2]")
-      .appName(getClass.getSimpleName)
-      .config("spark.ui.enabled", "false")
-      .config("spark.sql.shuffle.partitions", "4")
-      .config("spark.sql.session.timeZone", "UTC")  // 운영 Pod TZ와 맞춘다
-      .getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
-    super.beforeAll()
-  }
-
-  override def afterAll(): Unit =
-    try super.afterAll() finally if (spark != null) spark.stop()
-
-  /** DataFrame 앞 n행을 표 문자열로 만든다. 테스트 로그(info)에 쓴다 */
-  protected def table(df: DataFrame, n: Int = 20): String = {
-    val cols = df.columns.toSeq
-    // 문자열로 바꿔서 찍는다 (timestamp가 초 단위까지 일정하게 보이도록)
-    val rows = df.select(cols.map(c => col(c).cast("string")): _*).take(n).toSeq
-      .map(r => cols.indices.map(i => String.valueOf(r.get(i))))
-    val widths = cols.indices.map(i => (cols(i) +: rows.map(_(i))).map(_.length).max)
-    def line(vs: Seq[String]) = vs.zip(widths).map { case (v, w) => v.padTo(w, ' ') }.mkString(" | ")
-    (line(cols) +: line(widths.map("-" * _)) +: rows.map(line)).mkString("\n")
-  }
-}
-```
-
-**LatestByKeyTest.scala** (단위 테스트)
-
-```scala
-import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
-
-import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.functions._
-import org.scalatest.funsuite.AnyFunSuite
-
-/** 단위 테스트: 정답을 아는 작은 입력으로 latestByKey(3단계)만 검사한다. avro 파일 불필요 */
-class LatestByKeyTest extends AnyFunSuite with LocalSpark {
-
-  private val fmt = DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS")
-
-  /** (tmp_id1, tmp_id2, ts, v) → DataFrame. tmp_key는 ts에서 만든다 */
-  private def rows(data: (String, String, String, String)*): DataFrame = {
-    val s = spark
-    import s.implicits._
-    data.map { case (id1, id2, ts, v) =>
-      val t = LocalDateTime.parse(ts)
-      (id1, id2, t.format(fmt), t, v)
-    }.toDF("tmp_id1", "tmp_id2", "tmp_key", "ts", "v")
-  }
-
-  /** latestByKey 결과의 (키..., v)가 기대값과 같은지 본다. 입력·결과를 로그로 남긴다 */
-  private def check(input: DataFrame, keys: Seq[String], expected: Set[Seq[String]]): Unit = {
-    val out = UpsertJob.latestByKey(input, keys, "ts")
-    val sortCols = keys.map(col) :+ col("ts").desc
-    info("입력\n" + table(input.orderBy(sortCols: _*)))
-    info("결과\n" + table(out.orderBy(sortCols: _*)))
-    val actual = out.select((keys :+ "v").map(col): _*).collect().map(_.toSeq.map(String.valueOf)).toSet
-    assert(actual == expected)
-    assert(out.columns.toSeq == input.columns.toSeq, "컬럼 구성이 바뀜")
-  }
-
-  test("테이블2 키(tmp_id1, tmp_id2): 키별 최신 1건, 늦게 도착한 과거 버전은 버림") {
-    val in = rows(
-      ("A", "1", "2026-10-14T23:59:00.123", "a1-old"),
-      ("A", "1", "2026-10-15T00:01:00.456", "a1-new"),
-      ("A", "2", "2026-10-14T23:59:00.000", "a2"),
-      ("B", "1", "2026-10-14T10:00:00.000", "b1-old"),
-      ("B", "1", "2026-10-14T10:05:00.000", "b1-new"),
-      ("B", "1", "2026-10-14T10:03:00.000", "b1-late-arrival"))
-    check(in, Seq("tmp_id1", "tmp_id2"),
-      Set(Seq("A", "1", "a1-new"), Seq("A", "2", "a2"), Seq("B", "1", "b1-new")))
-  }
-
-  test("테이블1 키(tmp_id1): tmp_id2 컬럼 없이 키별 최신 1건") {
-    val in = rows(
-      ("A", "1", "2026-10-14T23:59:00.000", "a-old"),
-      ("A", "2", "2026-10-15T00:01:00.000", "a-new"),
-      ("B", "1", "2026-10-14T10:00:00.000", "b")).drop("tmp_id2")
-    check(in, Seq("tmp_id1"), Set(Seq("A", "a-new"), Seq("B", "b")))
-  }
-
-  test("밀리초 차이(.455 vs .456)도 최신을 고른다") {
-    val in = rows(
-      ("A", "1", "2026-10-15T00:01:00.456", "new"),
-      ("A", "1", "2026-10-15T00:01:00.455", "old"))
-    check(in, Seq("tmp_id1", "tmp_id2"), Set(Seq("A", "1", "new")))
-  }
-
-  test("날짜 경계(23:59:59.999 vs 다음날 00:00:00.000)") {
-    val in = rows(
-      ("A", "1", "2026-10-14T23:59:59.999", "old"),
-      ("A", "1", "2026-10-15T00:00:00.000", "new"))
-    check(in, Seq("tmp_id1", "tmp_id2"), Set(Seq("A", "1", "new")))
-  }
-
-  test("중복이 없으면 입력 그대로") {
-    val in = rows(
-      ("A", "1", "2026-10-14T10:00:00.000", "a"),
-      ("B", "1", "2026-10-14T10:00:00.000", "b"))
-    check(in, Seq("tmp_id1", "tmp_id2"), Set(Seq("A", "1", "a"), Seq("B", "1", "b")))
-  }
-
-  test("ts까지 같으면 둘 중 1건만 남긴다") {
-    val in = rows(
-      ("A", "1", "2026-10-14T10:00:00.000", "x"),
-      ("A", "1", "2026-10-14T10:00:00.000", "y"))
-    val out = UpsertJob.latestByKey(in, Seq("tmp_id1", "tmp_id2"), "ts")
-    info("결과\n" + table(out))
-    assert(out.count() == 1)
-  }
-
-  test("upsertSpecs: 테이블별 키와 최신 판단 컬럼") {
-    assert(UpsertJob.upsertSpecs("<테이블1>").keyCols == Seq("tmp_id1"))
-    assert(UpsertJob.upsertSpecs("<테이블2>").keyCols == Seq("tmp_id1", "tmp_id2"))
-    assert(UpsertJob.upsertSpecs.values.forall(_.orderCol == "ts"))
-  }
-}
-```
-
-**UpsertPrepareTest.scala** (실데이터 검증)
-
 ```scala
 import java.io.File
 import java.nio.charset.StandardCharsets.UTF_8
@@ -644,13 +497,13 @@ import java.nio.file.Files
 
 import scala.collection.JavaConverters._
 
-import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
+import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
-/** 실데이터 검증: src/test/resources/avro 의 avro로 1~4단계(Iceberg 적재 직전)를 검사한다.
-  * 정답을 미리 알 수 없으므로 "지켜져야 하는 성질"을 검사하고, 입력·결과 값을 로그로 남긴다 */
-class UpsertPrepareTest extends AnyFunSuite with LocalSpark {
+/** src/test/resources/avro 의 avro로 1~4단계(Iceberg 적재 직전)를 검사하고 입력·결과 값을 로그로 남긴다 */
+class UpsertPrepareTest extends AnyFunSuite with BeforeAndAfterAll {
 
   // 테스트할 테이블. avro 파일이 어느 테이블 것인지에 맞춰 바꾼다
   private val tableName = "<테이블2>"
@@ -660,16 +513,25 @@ class UpsertPrepareTest extends AnyFunSuite with LocalSpark {
   private val sampleKeys = 5
   private val extraShowCols = Seq("tmp_key")
 
+  private var spark: SparkSession = _
   private var avroFiles: Seq[String] = _
   private var readFiles: Seq[String] = _  // readAvro가 실제로 읽은 파일 (cache 전에 받아 둔다)
-  private var read: DataFrame = _      // 1·2단계 결과 (컬럼명 변환 전)
-  private var input: DataFrame = _     // 1·2·4단계 결과 (중복 제거 전)
-  private var prepared: DataFrame = _  // 1~4단계 결과 (MERGE에 넘길 source)
+  private var read: DataFrame = _         // 1·2단계 결과 (컬럼명 변환 전)
+  private var input: DataFrame = _        // 1·2·4단계 결과 (중복 제거 전)
+  private var prepared: DataFrame = _     // 1~4단계 결과 (MERGE에 넘길 source)
 
   private def keys = spec.keyCols.map(col)
 
   override def beforeAll(): Unit = {
-    super.beforeAll()
+    spark = SparkSession.builder()
+      .master("local[2]")
+      .appName("upsert-prepare-test")
+      .config("spark.ui.enabled", "false")
+      .config("spark.sql.shuffle.partitions", "4")
+      .config("spark.sql.session.timeZone", "UTC")  // 운영 Pod TZ와 맞춘다
+      .getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+
     val dir = new File(getClass.getResource("/avro").toURI)
     avroFiles = dir.listFiles().filter(_.getName.endsWith(".avro")).map(_.toURI.toString).sorted.toSeq
     require(avroFiles.nonEmpty, s"avro 파일이 없다: $dir")
@@ -683,6 +545,18 @@ class UpsertPrepareTest extends AnyFunSuite with LocalSpark {
     readFiles = read.inputFiles.toSeq
     input = UpsertJob.renameColumns(read).cache()
     prepared = UpsertJob.prepare(spark, inputFileName, spec).cache()
+  }
+
+  override def afterAll(): Unit = if (spark != null) spark.stop()
+
+  /** DataFrame 앞 n행을 표 문자열로 만든다 (로그용) */
+  private def table(df: DataFrame, n: Int = 20): String = {
+    val cols = df.columns.toSeq
+    val rows = df.select(cols.map(c => col(c).cast("string")): _*).take(n).toSeq
+      .map(r => cols.indices.map(i => String.valueOf(r.get(i))))
+    val widths = cols.indices.map(i => (cols(i) +: rows.map(_(i))).map(_.length).max)
+    def line(vs: Seq[String]) = vs.zip(widths).map { case (v, w) => v.padTo(w, ' ') }.mkString(" | ")
+    (line(cols) +: line(widths.map("-" * _)) +: rows.map(line)).mkString("\n")
   }
 
   test("1·2단계: 목록 파일의 avro를 모두 읽는다") {
@@ -712,9 +586,8 @@ class UpsertPrepareTest extends AnyFunSuite with LocalSpark {
 
   test("3단계: 키별로 1건만 남는다") {
     def dupKeys(df: DataFrame) = df.groupBy(keys: _*).count().where(col("count") > 1)
-    val before = dupKeys(input)
     val maxPerKey = input.groupBy(keys: _*).count().agg(max("count")).first().getLong(0)
-    info(s"중복 키: 중복 제거 전 ${before.count()}개 (키당 최대 $maxPerKey 건) → 후 ${dupKeys(prepared).count()}개")
+    info(s"중복 키: 중복 제거 전 ${dupKeys(input).count()}개 (키당 최대 $maxPerKey 건) → 후 ${dupKeys(prepared).count()}개")
     assert(dupKeys(prepared).count() == 0)
   }
 
@@ -762,41 +635,6 @@ class UpsertPrepareTest extends AnyFunSuite with LocalSpark {
 
 ### 8.4 검사 항목과 로그
 
-**단위 테스트 (`LatestByKeyTest`)**
-
-| 테스트 | 입력 | 정답 |
-|--------|------|------|
-| 테이블2 키 | A/1 2건, A/2 1건, B/1 3건(늦게 도착한 과거 버전 포함) | A/1 `a1-new`, A/2 `a2`, B/1 `b1-new` |
-| 테이블1 키 (`tmp_id2` 컬럼 없음) | A 2건, B 1건 | A `a-new`, B `b` |
-| 밀리초 차이 | `.455`, `.456` | `.456` |
-| 날짜 경계 | 23:59:59.999, 다음날 00:00:00.000 | 다음날 00:00:00.000 |
-| 중복 없음 | A/1, B/1 | 입력 그대로 |
-| `ts` 동률 | 같은 `ts` 2건 | 1건만 남음 |
-| `upsertSpecs` | 테이블별 설정 | 키·최신 판단 컬럼이 의도대로인지 |
-
-각 테스트는 입력과 결과를 표로 남긴다.
-
-```
-- 테이블2 키(tmp_id1, tmp_id2): 키별 최신 1건, 늦게 도착한 과거 버전은 버림
-  + 입력
-tmp_id1 | tmp_id2 | tmp_key           | ts                      | v
-------- | ------- | ----------------- | ----------------------- | ---------------
-A       | 1       | 20261015000100456 | 2026-10-15 00:01:00.456 | a1-new
-A       | 1       | 20261014235900123 | 2026-10-14 23:59:00.123 | a1-old
-A       | 2       | 20261014235900000 | 2026-10-14 23:59:00     | a2
-B       | 1       | 20261014100500000 | 2026-10-14 10:05:00     | b1-new
-B       | 1       | 20261014100300000 | 2026-10-14 10:03:00     | b1-late-arrival
-B       | 1       | 20261014100000000 | 2026-10-14 10:00:00     | b1-old
-  + 결과
-tmp_id1 | tmp_id2 | tmp_key           | ts                      | v
-------- | ------- | ----------------- | ----------------------- | ------
-A       | 1       | 20261015000100456 | 2026-10-15 00:01:00.456 | a1-new
-A       | 2       | 20261014235900000 | 2026-10-14 23:59:00     | a2
-B       | 1       | 20261014100500000 | 2026-10-14 10:05:00     | b1-new
-```
-
-**실데이터 검증 (`UpsertPrepareTest`)**
-
 | 테스트 | 확인 내용 | 로그 | 실패하면 |
 |--------|-----------|------|----------|
 | 1·2단계 | 목록의 avro를 빠짐없이 읽는다 | 파일별 row 수 | 목록 파일 형식·경로 문제 |
@@ -808,7 +646,7 @@ B       | 1       | 20261014100500000 | 2026-10-14 10:05:00     | b1-new
 | 컬럼 구성 | 입력과 컬럼이 같다 (`_rn` 없음) | 결과 컬럼 목록 | `INSERT *`가 컬럼 불일치로 실패한다 |
 | `ts` = `tmp_key` | `ts`를 `yyyyMMddHHmmssSSS`로 바꾼 값이 `tmp_key`와 같다 | 다른 row 수, 예시 5건 | `ts`로 최신 판단하는 전제가 깨진다 |
 
-중복 제거 전후는 "최신 row" 테스트 로그에서 본다. 중복이 있던 키를 최대 5개(`sampleKeys`) 골라 입력 버전을 전부 보여 주고, 결과에 남은 버전을 `채택`으로 표시한다. 키·`ts` 외에 보고 싶은 컬럼은 `extraShowCols`에 넣는다.
+중복 제거 전후는 "최신 row" 테스트 로그에서 본다. 중복이 있던 키를 최대 5개(`sampleKeys`) 골라 입력 버전을 전부 보여 주고, 결과에 남은 버전을 `채택`으로 표시한다. 키·`ts` 외에 보고 싶은 컬럼은 `extraShowCols`에 넣는다. 로그는 IntelliJ 테스트 실행 창에서는 각 테스트 아래에, `mvn test`에서는 콘솔에 찍힌다.
 
 ```
 - 1·2단계: 목록 파일의 avro를 모두 읽는다
@@ -833,22 +671,17 @@ B       | 1       | 2026-10-14 10:03:00     | 20261014100300000 | 제거
 B       | 1       | 2026-10-14 10:00:00     | 20261014100000000 | 제거
 ```
 
-로그는 IntelliJ 테스트 실행 창에서는 각 테스트 아래에, `mvn test`에서는 콘솔에 테스트 이름과 함께 찍힌다.
-
 ### 8.5 로컬 검증
 
-Spark 3.5.8 / Scala 2.12.18 / ScalaTest 3.2.19 / Maven 3.9.11 / Java 21. §8.2 pom 설정으로 `mvn test`를 실행했다. 실데이터 검증은 테스트용 avro 3개(8 row, 같은 키가 파일 사이·파일 안에 중복, 늦게 도착한 과거 버전 포함)로 돌렸다.
+Spark 3.5.8 / Scala 2.12.18 / ScalaTest 3.2.19 / Maven 3.9.11 / Java 21. §8.2 pom 설정으로 `mvn test`를 실행했다. 테스트용 avro 3개(8 row, 같은 키가 파일 사이·파일 안에 중복, 늦게 도착한 과거 버전 포함)로 돌렸다.
 
 | 조건 | 결과 |
 |------|------|
-| 정상 코드 | 15개 통과 (단위 7, 실데이터 8) |
-| 결함 1: `prepare`에서 중복 제거를 뺌 (ScalaTest Runner로 직접 실행, 이전 버전 테스트) | 실데이터 4개 실패 (키별 1건·남은 건수·최신 row 등) |
-| 결함 2: 가장 오래된 버전을 고르게 바꿈 (`desc` → `asc`) | 5개 실패 (단위 4, 실데이터 "최신 row" 1) |
+| 정상 코드 | 8개 통과, 8 row → 5 row |
+| `prepare`에서 중복 제거를 고의로 뺌 (ScalaTest Runner로 직접 실행) | 4개 실패 (키별 1건·남은 건수·최신 row 등) |
 | `argLine` 없음 | `sun.nio.ch.DirectBuffer` 접근 오류로 실행 중단 |
 | `argLine`에 `sun.nio.ch` 1개 | 통과 |
 | surefire 설정 없음 (기본값) | surefire 0건 실행 후 통과, ScalaTest만 실행 |
-
-결함 2에서 실데이터 검증의 "키별 1건"·"남은 건수"는 통과한다. 오래된 버전이라도 키별로 1건씩은 남기 때문이다. 이런 로직 오류는 정답을 정해 둔 단위 테스트가 잡는다. 두 종류를 같이 두는 이유다.
 
 ### 8.6 오류: `Missing class: com/fasterxml/jackson/core/exc/StreamConstraintsException`
 
