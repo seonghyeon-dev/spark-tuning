@@ -509,7 +509,7 @@ class UpsertPrepareTest extends AnyFunSuite with BeforeAndAfterAll {
   private val tableName = "<테이블2>"
   private val spec = UpsertJob.upsertSpecs(tableName)
 
-  // 중복 키 로그에 키·ts 외에 함께 보여 줄 컬럼
+  // 채택/제거 로그에 키·ts 외에 함께 보여 줄 컬럼
   private val extraShowCols = Seq("tmp_key")
 
   private var spark: SparkSession = _
@@ -599,15 +599,16 @@ class UpsertPrepareTest extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   test("3단계: 남은 row의 최신 판단 컬럼 값이 키별 최댓값이다") {
-    // 중복이 있던 키 전부의 입력 버전을 보여 주고, 결과에 남은 것을 '채택'으로 표시한다
-    val dupKeyRows = input.groupBy(keys: _*).count().where(col("count") > 1).drop("count")
+    // 입력 row 전부를 보여 주고, 결과에 남은 것을 '채택', 버린 것을 '제거'로 표시한다
     val kept = prepared.select(keys :+ col(spec.orderCol).as("_kept"): _*)
     val showCols = (spec.keyCols :+ spec.orderCol) ++ extraShowCols.filter(input.columns.contains)
-    val versions = input.join(dupKeyRows, spec.keyCols).join(kept, spec.keyCols)
+    val marked = input.join(kept, spec.keyCols)
       .withColumn("결과", when(col(spec.orderCol) <=> col("_kept"), "채택").otherwise("제거"))
       .select((showCols :+ "결과").map(col): _*)
       .orderBy(keys :+ col(spec.orderCol).desc: _*)
-    info(s"중복 키 ${dupKeyRows.count()}개의 버전 전부\n" + table(versions, Int.MaxValue))
+    val adopted = marked.where(col("결과") === "채택").count()
+    info(s"입력 ${input.count()} row → 채택 $adopted row, 제거 ${input.count() - adopted} row (결과 ${prepared.count()} row)\n" +
+      table(marked, Int.MaxValue))
 
     val latest = input.groupBy(keys: _*).agg(max(spec.orderCol).as("_max"))
     val wrong = prepared.join(latest, spec.keyCols).where(!(col(spec.orderCol) <=> col("_max")))
@@ -640,11 +641,11 @@ class UpsertPrepareTest extends AnyFunSuite with BeforeAndAfterAll {
 | 키 NULL | 키 컬럼에 NULL이 없다 | 키별 NULL 건수 | NULL 키는 MERGE에서 batch마다 새 row로 쌓인다 |
 | 키별 1건 | 같은 키가 2건 이상 남지 않는다 | 중복 키 수 전·후, 키당 최대 건수 | MERGE가 에러로 실패한다 |
 | 남은 건수 | 남은 row 수 = 입력의 고유 키 수 | 입력 row, 고유 키, 결과 row | 키가 빠졌거나 덜 걸러짐 |
-| 최신 row | 남은 row의 `ts` = 키별 최댓값 | 중복 키의 모든 버전과 채택·제거 표시 | 과거 버전이 적재된다 |
+| 최신 row | 남은 row의 `ts` = 키별 최댓값 | 입력 row 전부와 채택·제거 표시, 채택 수 | 과거 버전이 적재된다 |
 | 컬럼 구성 | 입력과 컬럼이 같다 (`_rn` 없음) | 결과 컬럼 목록 | `INSERT *`가 컬럼 불일치로 실패한다 |
 | `ts` = `tmp_key` | `ts`를 `yyyyMMddHHmmssSSS`로 바꾼 값이 `tmp_key`와 같다 | 다른 row 수, 예시 5건 | `ts`로 최신 판단하는 전제가 깨진다 |
 
-중복 제거 전후는 "최신 row" 테스트 로그에서 본다. 중복이 있던 키 전부의 입력 버전을 보여 주고, 결과에 남은 버전을 `채택`으로 표시한다. 중복 키가 많으면 로그도 그만큼 길어진다. 키·`ts` 외에 보고 싶은 컬럼은 `extraShowCols`에 넣는다. 로그는 IntelliJ 테스트 실행 창에서는 각 테스트 아래에, `mvn test`에서는 콘솔에 찍힌다.
+중복 제거 전후는 "최신 row" 테스트 로그에서 본다. 입력 row 전부를 보여 주고, 결과에 남은 row를 `채택`, 버린 row를 `제거`로 표시한다. `채택` 수는 결과 row 수와 같다. 입력 row 수만큼 로그가 길어진다. 키·`ts` 외에 보고 싶은 컬럼은 `extraShowCols`에 넣는다. 로그는 IntelliJ 테스트 실행 창에서는 각 테스트 아래에, `mvn test`에서는 콘솔에 찍힌다.
 
 ```
 - 1·2단계: 목록 파일의 avro를 모두 읽는다
@@ -659,14 +660,17 @@ batch_2.avro | 2
 - 3단계: 남은 건수 = 입력의 고유 키 수
   + 입력 8 row, 고유 키 5 개 → 결과 5 row (제거 3 row)
 - 3단계: 남은 row의 최신 판단 컬럼 값이 키별 최댓값이다
-  + 중복 키 2개의 버전 전부
+  + 입력 8 row → 채택 5 row, 제거 3 row (결과 5 row)
 tmp_id1 | tmp_id2 | ts                      | tmp_key           | 결과
 ------- | ------- | ----------------------- | ----------------- | ----
 A       | 1       | 2026-10-15 00:01:00.456 | 20261015000100456 | 채택
 A       | 1       | 2026-10-14 23:59:00.123 | 20261014235900123 | 제거
+A       | 2       | 2026-10-14 23:59:00     | 20261014235900000 | 채택
 B       | 1       | 2026-10-14 10:05:00     | 20261014100500000 | 채택
 B       | 1       | 2026-10-14 10:03:00     | 20261014100300000 | 제거
 B       | 1       | 2026-10-14 10:00:00     | 20261014100000000 | 제거
+C       | 1       | 2026-10-15 00:02:00     | 20261015000200000 | 채택
+C       | 2       | 2026-10-15 00:03:00     | 20261015000300000 | 채택
 ```
 
 ### 8.5 로컬 검증
