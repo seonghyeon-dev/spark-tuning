@@ -38,8 +38,18 @@
 두 버전 공통:
 
 - `<테이블1>`, `<테이블2>`는 앱 인자 `tableName`으로 넘어오는 실제 이름으로 바꾼다.
-- `run`의 `???` 두 줄은 기존 코드 자리다.
-- `UpsertSpec`, `latestByKey`, `run`은 두 버전이 같고 `upsert`만 다르다.
+- `renameColumns`의 `???`는 기존 컬럼명 변환 함수 호출로 바꾼다. `readAvro`는 목록 파일을 한 줄에 경로 1개로 가정한 구현이다. 기존 구현이 있으면 그것으로 바꾼다.
+- `upsert`만 두 버전이 다르고 나머지는 같다.
+
+| 함수 | 역할 |
+|------|------|
+| `main` | 앱 진입점. 인자(`tableName`, `inputFileName`, `batchId`)를 받아 `run` 호출 |
+| `run` | 1~5단계 전체. `prepare` 결과를 `upsert`에 넘긴다 |
+| `prepare` | 1~4단계. Iceberg 적재 직전의 source DataFrame을 만든다. 로컬 테스트 대상(§8) |
+| `readAvro` / `renameColumns` / `latestByKey` | 1·2단계 / 4단계 / 3단계 |
+| `upsert` | 5단계 MERGE |
+
+Spark 앱은 `mainClass`로 지정한 object의 `main`에서 시작한다. 기존 앱의 `main`에 인자 파싱·SparkSession 설정이 있으면 그대로 두고 마지막에 `run`만 호출해도 된다. `run`이 SparkSession을 인자로 받는 것은 테스트에서 로컬 SparkSession을 넘기기 위해서다.
 
 ### 3.1 Spark 3.5.8 (운영): SQL `MERGE INTO`
 
@@ -105,15 +115,34 @@ object UpsertJob {
     }
   }
 
-  /** 메인 흐름. 1·2·4는 기존 코드 그대로 */
+  /** 1·2. 목록 파일(한 줄에 avro 경로 1개) → avro read. 기존 구현이 있으면 그것으로 교체 */
+  def readAvro(spark: SparkSession, inputFileName: String): DataFrame = {
+    val paths = spark.read.textFile(inputFileName).collect().map(_.trim).filter(_.nonEmpty)
+    spark.read.format("avro").load(paths.toSeq: _*)
+  }
+
+  /** 4. 컬럼명 변환. 기존 함수 호출로 교체 */
+  def renameColumns(df: DataFrame): DataFrame = ???
+
+  /** 1~4단계. Iceberg 적재 직전의 source DataFrame을 만든다 (로컬 테스트 대상) */
+  def prepare(spark: SparkSession, inputFileName: String, spec: UpsertSpec): DataFrame = {
+    val raw = readAvro(spark, inputFileName)              // 1, 2
+    val renamed = renameColumns(raw)                       // 4
+    latestByKey(renamed, spec.keyCols, spec.orderCol)      // 3
+  }
+
+  /** 1~5단계 */
   def run(spark: SparkSession, tableName: String, inputFileName: String, batchId: String): Unit = {
     val spec = upsertSpecs(tableName)
+    upsert(spark, prepare(spark, inputFileName, spec), tableName, spec, batchId)
+  }
 
-    val raw: DataFrame = ???      // 1, 2. 목록 파일 → avro read (기존과 동일)
-    val renamed: DataFrame = ???  // 4. 컬럼명 변환 (기존 함수)
-
-    val latest = latestByKey(renamed, spec.keyCols, spec.orderCol)   // 3
-    upsert(spark, latest, tableName, spec, batchId)                  // 5
+  /** 앱 진입점. 인자 파싱·SparkSession 생성은 기존 main을 그대로 쓰고 마지막에 run만 호출해도 된다 */
+  def main(args: Array[String]): Unit = {
+    val Array(tableName, inputFileName, batchId) = args
+    val spark = SparkSession.builder().getOrCreate()
+    try run(spark, tableName, inputFileName, batchId)
+    finally spark.stop()
   }
 }
 ```
@@ -179,15 +208,34 @@ object UpsertJob {
     }
   }
 
-  /** 메인 흐름. 1·2·4는 기존 코드 그대로 */
+  /** 1·2. 목록 파일(한 줄에 avro 경로 1개) → avro read. 기존 구현이 있으면 그것으로 교체 */
+  def readAvro(spark: SparkSession, inputFileName: String): DataFrame = {
+    val paths = spark.read.textFile(inputFileName).collect().map(_.trim).filter(_.nonEmpty)
+    spark.read.format("avro").load(paths.toSeq: _*)
+  }
+
+  /** 4. 컬럼명 변환. 기존 함수 호출로 교체 */
+  def renameColumns(df: DataFrame): DataFrame = ???
+
+  /** 1~4단계. Iceberg 적재 직전의 source DataFrame을 만든다 (로컬 테스트 대상) */
+  def prepare(spark: SparkSession, inputFileName: String, spec: UpsertSpec): DataFrame = {
+    val raw = readAvro(spark, inputFileName)              // 1, 2
+    val renamed = renameColumns(raw)                       // 4
+    latestByKey(renamed, spec.keyCols, spec.orderCol)      // 3
+  }
+
+  /** 1~5단계 */
   def run(spark: SparkSession, tableName: String, inputFileName: String, batchId: String): Unit = {
     val spec = upsertSpecs(tableName)
+    upsert(spark, prepare(spark, inputFileName, spec), tableName, spec, batchId)
+  }
 
-    val raw: DataFrame = ???      // 1, 2. 목록 파일 → avro read (기존과 동일)
-    val renamed: DataFrame = ???  // 4. 컬럼명 변환 (기존 함수)
-
-    val latest = latestByKey(renamed, spec.keyCols, spec.orderCol)   // 3
-    upsert(spark, latest, tableName, spec, batchId)                  // 5
+  /** 앱 진입점. 인자 파싱·SparkSession 생성은 기존 main을 그대로 쓰고 마지막에 run만 호출해도 된다 */
+  def main(args: Array[String]): Unit = {
+    val Array(tableName, inputFileName, batchId) = args
+    val spark = SparkSession.builder().getOrCreate()
+    try run(spark, tableName, inputFileName, batchId)
+    finally spark.stop()
   }
 }
 ```
@@ -196,7 +244,7 @@ object UpsertJob {
 
 ### 4.1 키별 최신 row 선택 (`latestByKey`)
 
-키가 같은 row끼리 묶어 `ts` 내림차순으로 번호를 매기고 1번만 남긴다.
+키가 같은 row끼리 묶어 `ts` 내림차순으로 번호를 매기고 1번만 남긴다. 번호는 임시 컬럼 `_rn`(row number)에 담고, 1번만 거른 뒤 `drop("_rn")`으로 지운다. 결과 컬럼은 입력과 같다. 이름 앞의 `_`는 실제 컬럼과 겹치지 않게 붙였다.
 
 | 입력 row | `tmp_id1` | `ts` | 번호 | 결과 |
 |---------|-----------|------|------|------|
@@ -249,7 +297,7 @@ MERGE는 source와 대상 테이블을 join한다. ON이 `t.tmp_id1 = s.tmp_id1`
 | `IN` 조건 추가 | 1개 읽음 | 1개 읽음 |
 
 - 하한 조건은 두지 않는다. 같은 키면 보관 중인 전체 데이터에서 최신 `ts`의 row로 upsert한다(사용자 확인). 그래서 `tmp_id1` 값 하나당 읽는 범위는 그 값의 `days(ts)` 파티션 전체이고, 보관이 3개월이므로 최대 약 90일치다.
-- 값 수집과 MERGE가 avro를 두 번 읽지 않도록 source를 `persist`한다. 캐시 크기는 중복 제거 후 batch 데이터 크기다.
+- 값 수집과 MERGE가 avro를 두 번 읽지 않도록 source를 `persist`한다. 캐시 크기는 중복 제거 후 batch 데이터 크기다. `finally`의 `unpersist()`는 이 캐시를 executor 메모리·디스크에서 지운다. MERGE가 실패해도 지우도록 `finally`에 뒀다.
 - SQL 버전은 값에 `'`나 `\`가 있어도 깨지지 않도록 escape한다. API 버전은 값이 SQL 문자열을 거치지 않아 escape가 필요 없다. 두 버전 모두 `Q'1\x` 키로 update가 정상 동작함을 확인했다.
 - batch가 0 row면 MERGE를 하지 않는다. snapshot이 생기지 않으므로 재처리 DAG이 이 batch를 다시 올리는데, 0 row라 결과는 같다.
 
@@ -333,7 +381,7 @@ TBLPROPERTIES (
 | B | 4.1.1 / 2.13.17 | `iceberg-spark-runtime-4.1_2.13-1.11.0` | §3.1 SQL |
 | C | 4.1.1 / 2.13.17 | `iceberg-spark-runtime-4.1_2.13-1.11.0` | §3.2 API |
 
-공통: `local[2]`, Hadoop 카탈로그(운영은 HMS), §5 테이블 설정(테이블1은 `tmp_id2` 컬럼 없음). §3 코드 블록을 그대로 컴파일해 실행했다. 읽은 파일 수는 Iceberg scan metric `resultDataFiles`로 쟀다.
+공통: `local[2]`, Hadoop 카탈로그(운영은 HMS), §5 테이블 설정(테이블1은 `tmp_id2` 컬럼 없음). §3 코드 블록을 그대로 컴파일해 실행했다(`renameColumns`만 입력을 그대로 돌려주는 스텁). 읽은 파일 수는 Iceberg scan metric `resultDataFiles`로 쟀다.
 
 ### 6.2 결과 (A·B·C 모두 동일)
 
@@ -356,3 +404,198 @@ TBLPROPERTIES (
 - **동시 MERGE 충돌 (미실측)**: append는 동시 커밋이 안전하지만 MERGE는 Iceberg가 충돌을 검사한다. 04:00 재처리와 append가 같은 테이블에 겹치면 한쪽이 `ValidationException`으로 실패할 수 있다. 데이터 유실은 아니고 FAILURE로 남아 다음날 회수된다.
 - **delete 파일 정리**: merge-on-read는 position delete 파일을 남긴다. Compaction에서 delete 파일 정리를 함께 다뤄야 한다.
 - **운영 카탈로그(HMS)·S3FileIO 환경 실행**: 로컬은 Hadoop 카탈로그다.
+
+## 8. 로컬 테스트 (avro → 중복 제거까지)
+
+Iceberg 적재(5단계) 직전까지, 즉 `prepare`의 결과를 실제 avro 파일로 검증한다. Iceberg·S3 없이 로컬 Spark만으로 돈다.
+
+### 8.1 파일 위치
+
+```
+src/
+├── main/scala/UpsertJob.scala              # §3 코드
+└── test/
+    ├── resources/avro/*.avro               # 테스트할 avro 파일 (같은 테이블 것)
+    └── scala/UpsertPrepareTest.scala       # 아래 §8.3 코드
+```
+
+- avro 파일은 한 테이블 것만 넣고, 테스트 코드의 `tableName`을 그 테이블로 맞춘다.
+- 테스트가 avro 경로 목록 파일(운영의 `inputFileName`과 같은 형식)을 임시로 만들어 `prepare`에 넘긴다. 1단계(목록 read)부터 검증된다.
+- `renameColumns`가 실제 변환 함수를 호출해야 4단계까지 검증된다.
+
+### 8.2 빌드 설정
+
+ScalaTest와 JVM 옵션이 필요하다. Java 17 이상에서 Spark를 테스트 JVM으로 띄우면 `--add-opens` 없이 `cannot access class sun.nio.ch.DirectBuffer`로 실패한다(로컬에서 확인). `spark-avro`는 `provided`여도 테스트 classpath에 들어간다.
+
+**sbt**
+
+```scala
+libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.19" % Test
+
+Test / fork := true
+Test / javaOptions ++= Seq(
+  "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+  "--add-opens=java.base/java.nio=ALL-UNNAMED",
+  "--add-opens=java.base/java.lang=ALL-UNNAMED",
+  "--add-opens=java.base/java.util=ALL-UNNAMED",
+  "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED"
+)
+```
+
+실행: `sbt "testOnly UpsertPrepareTest"`
+
+**Maven**
+
+```xml
+<dependency>
+  <groupId>org.scalatest</groupId>
+  <artifactId>scalatest_2.12</artifactId>
+  <version>3.2.19</version>
+  <scope>test</scope>
+</dependency>
+
+<!-- build/plugins: surefire 대신 scalatest-maven-plugin으로 실행 -->
+<plugin>
+  <groupId>org.scalatest</groupId>
+  <artifactId>scalatest-maven-plugin</artifactId>
+  <version>2.2.0</version>
+  <configuration>
+    <argLine>--add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED</argLine>
+  </configuration>
+  <executions>
+    <execution><id>test</id><goals><goal>test</goal></goals></execution>
+  </executions>
+</plugin>
+```
+
+실행: `mvn test -Dsuites=UpsertPrepareTest`
+
+IntelliJ에서 바로 돌릴 때는 Run Configuration의 VM options에 같은 `--add-opens` 5개를 넣는다. Spark 4 / Scala 2.13 프로젝트는 `scalatest_2.13`을 쓴다.
+
+### 8.3 테스트 코드
+
+```scala
+import java.io.File
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Files
+
+import scala.collection.JavaConverters._
+
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions._
+import org.scalatest.BeforeAndAfterAll
+import org.scalatest.funsuite.AnyFunSuite
+
+/** src/test/resources/avro 의 avro 파일로 1~4단계(Iceberg 적재 직전)까지 검증한다 */
+class UpsertPrepareTest extends AnyFunSuite with BeforeAndAfterAll {
+
+  // 테스트할 테이블. avro 파일이 어느 테이블 것인지에 맞춰 바꾼다
+  private val tableName = "<테이블2>"
+  private val spec = UpsertJob.upsertSpecs(tableName)
+
+  private var spark: SparkSession = _
+  private var avroFiles: Seq[String] = _
+  private var readFiles: Seq[String] = _  // Spark가 실제로 읽은 avro 파일
+  private var input: DataFrame = _     // 1·2·4단계 결과 (중복 제거 전)
+  private var prepared: DataFrame = _  // 1~4단계 결과 (MERGE에 넘길 source)
+
+  override def beforeAll(): Unit = {
+    spark = SparkSession.builder()
+      .master("local[2]")
+      .appName("upsert-prepare-test")
+      .config("spark.ui.enabled", "false")
+      .config("spark.sql.shuffle.partitions", "4")
+      .config("spark.sql.session.timeZone", "UTC")  // 운영 Pod TZ와 맞춘다
+      .getOrCreate()
+
+    val dir = new File(getClass.getResource("/avro").toURI)
+    avroFiles = dir.listFiles().filter(_.getName.endsWith(".avro")).map(_.toURI.toString).sorted.toSeq
+    require(avroFiles.nonEmpty, s"avro 파일이 없다: $dir")
+
+    // 운영의 inputFileName과 같은 형식(한 줄에 경로 1개)의 목록 파일을 만든다
+    val listFile = Files.createTempFile("avro-list", ".txt")
+    Files.write(listFile, avroFiles.asJava, UTF_8)
+    val inputFileName = listFile.toUri.toString
+
+    val read = UpsertJob.readAvro(spark, inputFileName)
+    readFiles = read.inputFiles.toSeq      // cache() 뒤에는 비어 있으므로 먼저 받아 둔다
+    input = UpsertJob.renameColumns(read).cache()
+    prepared = UpsertJob.prepare(spark, inputFileName, spec).cache()
+
+    val in = input.count()
+    val out = prepared.count()
+    println(s"[요약] avro ${avroFiles.size}개, 입력 $in row → 중복 제거 후 $out row (제거 ${in - out})")
+  }
+
+  override def afterAll(): Unit = if (spark != null) spark.stop()
+
+  private def keys = spec.keyCols.map(col)
+
+  test("1·2단계: 목록 파일의 avro를 모두 읽는다") {
+    assert(readFiles.size == avroFiles.size, s"읽은 파일: $readFiles")
+    assert(input.count() > 0)
+  }
+
+  test("4단계: 컬럼명 변환 후 키·최신 판단 컬럼이 있다") {
+    val missing = (spec.keyCols :+ spec.orderCol).filterNot(input.columns.contains)
+    assert(missing.isEmpty, s"없는 컬럼: $missing")
+  }
+
+  test("키 컬럼에 NULL이 없다") {
+    val nulls = input.where(spec.keyCols.map(c => col(c).isNull).reduce(_ || _)).count()
+    assert(nulls == 0, s"키 NULL row $nulls 건")
+  }
+
+  test("3단계: 키별로 1건만 남는다") {
+    val dup = prepared.groupBy(keys: _*).count().where(col("count") > 1).count()
+    assert(dup == 0, s"중복 키 $dup 개")
+  }
+
+  test("3단계: 남은 건수 = 입력의 고유 키 수") {
+    assert(prepared.count() == input.select(keys: _*).distinct().count())
+  }
+
+  test("3단계: 남은 row의 최신 판단 컬럼 값이 키별 최댓값이다") {
+    val latest = input.groupBy(keys: _*).agg(max(spec.orderCol).as("_max"))
+    val wrong = prepared.join(latest, spec.keyCols)
+      .where(!(col(spec.orderCol) <=> col("_max"))).count()
+    assert(wrong == 0, s"최신이 아닌 row $wrong 건")
+  }
+
+  test("3단계: 컬럼 구성이 입력과 같다 (임시 컬럼 _rn 없음)") {
+    assert(prepared.columns.toSeq == input.columns.toSeq)
+  }
+
+  test("ts와 tmp_key가 같은 시각이다 (최신 판단을 ts로 하는 전제)") {
+    assume(input.columns.contains("tmp_key"), "tmp_key 컬럼 없음")
+    val diff = input.where(date_format(col("ts"), "yyyyMMddHHmmssSSS") =!= col("tmp_key"))
+    val n = diff.count()
+    if (n > 0) diff.select("ts", "tmp_key").show(5, truncate = false)
+    assert(n == 0, s"ts와 tmp_key가 다른 row $n 건")
+  }
+}
+```
+
+### 8.4 검사 항목
+
+| 테스트 | 확인 내용 | 실패하면 |
+|--------|-----------|----------|
+| 1·2단계 | 목록의 avro 파일을 빠짐없이 읽고 row가 있다 | 목록 파일 형식·경로 문제 |
+| 4단계 | 변환 후 키 컬럼과 `ts`가 있다 | `renameColumns` 결과 이름이 `UpsertSpec`과 다름 |
+| 키 NULL | 키 컬럼에 NULL이 없다 | NULL 키는 MERGE에서 batch마다 새 row로 쌓인다 |
+| 키별 1건 | 같은 키가 2건 이상 남지 않는다 | MERGE가 에러로 실패한다 |
+| 남은 건수 | 남은 row 수 = 입력의 고유 키 수 | 키가 빠졌거나 덜 걸러짐 |
+| 최신 row | 남은 row의 `ts` = 키별 최댓값 | 과거 버전이 적재된다 |
+| 컬럼 구성 | 입력과 컬럼이 같다 (`_rn` 없음) | `INSERT *`가 컬럼 불일치로 실패한다 |
+| `ts` = `tmp_key` | `ts`를 `yyyyMMddHHmmssSSS`로 바꾼 값이 `tmp_key`와 같다 | `ts`로 최신 판단하는 전제가 깨진다. 다른 row 5건을 출력한다 |
+
+`beforeAll`에서 요약을 한 줄 출력한다. 예: `[요약] avro 3개, 입력 8 row → 중복 제거 후 5 row (제거 3)`.
+
+### 8.5 로컬 검증
+
+Spark 3.5.8 / Scala 2.12.18 / ScalaTest 3.2.19, Java 21. ScalaTest Runner로 직접 실행했다. §8.2의 sbt·Maven 설정으로 실행해 보지는 않았다.
+
+| 입력 | 결과 |
+|------|------|
+| 테스트용 avro 3개, 8 row (같은 키가 파일 사이·파일 안에 중복, 늦게 도착한 과거 버전 포함) | 8개 통과, 8 row → 5 row |
+| 위와 같고 `prepare`에서 중복 제거를 고의로 뺌 | 키별 1건·남은 건수·최신 row 등 4개 실패 |
