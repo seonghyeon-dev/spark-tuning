@@ -423,30 +423,12 @@ src/
 - 테스트가 avro 경로 목록 파일(운영의 `inputFileName`과 같은 형식)을 임시로 만들어 `prepare`에 넘긴다. 1단계(목록 read)부터 검증된다.
 - `renameColumns`가 실제 변환 함수를 호출해야 4단계까지 검증된다.
 
-### 8.2 빌드 설정
+### 8.2 빌드 설정 (Maven)
 
-ScalaTest와 JVM 옵션이 필요하다. Java 17 이상에서 Spark를 테스트 JVM으로 띄우면 `--add-opens` 없이 `cannot access class sun.nio.ch.DirectBuffer`로 실패한다(로컬에서 확인). `spark-avro`는 `provided`여도 테스트 classpath에 들어간다.
-
-**sbt**
-
-```scala
-libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.19" % Test
-
-Test / fork := true
-Test / javaOptions ++= Seq(
-  "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
-  "--add-opens=java.base/java.nio=ALL-UNNAMED",
-  "--add-opens=java.base/java.lang=ALL-UNNAMED",
-  "--add-opens=java.base/java.util=ALL-UNNAMED",
-  "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED"
-)
-```
-
-실행: `sbt "testOnly UpsertPrepareTest"`
-
-**Maven**
+pom.xml에 두 가지를 추가한다. ScalaTest 의존성과, 테스트 JVM에 옵션 1개(`--add-opens=java.base/sun.nio.ch=ALL-UNNAMED`)를 넘기는 scalatest-maven-plugin이다.
 
 ```xml
+<!-- dependencies -->
 <dependency>
   <groupId>org.scalatest</groupId>
   <artifactId>scalatest_2.12</artifactId>
@@ -454,23 +436,57 @@ Test / javaOptions ++= Seq(
   <scope>test</scope>
 </dependency>
 
-<!-- build/plugins: surefire 대신 scalatest-maven-plugin으로 실행 -->
+<!-- build/plugins -->
 <plugin>
   <groupId>org.scalatest</groupId>
   <artifactId>scalatest-maven-plugin</artifactId>
   <version>2.2.0</version>
   <configuration>
-    <argLine>--add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED</argLine>
+    <argLine>--add-opens=java.base/sun.nio.ch=ALL-UNNAMED</argLine>
   </configuration>
   <executions>
-    <execution><id>test</id><goals><goal>test</goal></goals></execution>
+    <execution>
+      <id>test</id>
+      <goals><goal>test</goal></goals>
+    </execution>
   </executions>
 </plugin>
 ```
 
 실행: `mvn test -Dsuites=UpsertPrepareTest`
 
-IntelliJ에서 바로 돌릴 때는 Run Configuration의 VM options에 같은 `--add-opens` 5개를 넣는다. Spark 4 / Scala 2.13 프로젝트는 `scalatest_2.13`을 쓴다.
+- surefire 설정은 건드리지 않는다. surefire는 ScalaTest 클래스를 0건 실행하고 넘어가며, 실제 테스트는 scalatest-maven-plugin이 돌린다(로컬 확인).
+- `spark-avro`, `spark-sql`이 `provided`여도 테스트 classpath에 들어간다.
+- Spark 4 / Scala 2.13 프로젝트는 `scalatest_2.13`을 쓴다.
+- IntelliJ의 테스트 실행 버튼으로 돌릴 때는 Run Configuration의 VM options에 같은 옵션을 넣는다.
+
+**옵션이 왜 필요한가**
+
+1. Java 17부터 JDK 내부 패키지(`sun.nio.ch` 등)는 기본적으로 외부 코드가 접근할 수 없다.
+2. Spark는 SparkSession을 만들 때 `StorageUtils`가 내부 클래스 `sun.nio.ch.DirectBuffer`를 참조한다. 막혀 있으면 `cannot access class sun.nio.ch.DirectBuffer`로 실패한다.
+3. `--add-opens=java.base/sun.nio.ch=ALL-UNNAMED`는 이 패키지 하나를 일반 코드(ALL-UNNAMED)에 열어 주는 옵션이다.
+
+운영에서 이 오류가 없는 이유는 spark-submit이 driver·executor JVM에 이런 옵션을 자동으로 붙이기 때문이다. Spark 3.5.8 기준 `--add-opens` 15개와 `-Djdk.reflect.useDirectMethodHandle=false`다(`spark-launcher`의 `JavaModuleOptions`에서 확인). 테스트는 Maven이 띄운 일반 JVM 안에서 SparkSession을 직접 만들므로 이 옵션이 붙지 않는다.
+
+이 테스트에 필요한 것은 그중 `sun.nio.ch` 1개다. 옵션 없이는 실패하고, 이것 하나만 넣으면 8개 모두 통과했다. 테스트에 다른 Spark 기능을 추가해 `IllegalAccessError`나 `InaccessibleObjectException`이 다른 패키지 이름(예: `java.nio`)으로 나면, 그 패키지를 같은 형식으로 하나 더 넣는다. spark-submit과 똑같이 맞추려면 아래 15개를 `argLine`에 공백으로 이어 넣는다.
+
+```
+--add-opens=java.base/java.lang=ALL-UNNAMED
+--add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+--add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+--add-opens=java.base/java.io=ALL-UNNAMED
+--add-opens=java.base/java.net=ALL-UNNAMED
+--add-opens=java.base/java.nio=ALL-UNNAMED
+--add-opens=java.base/java.util=ALL-UNNAMED
+--add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED
+--add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+--add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+--add-opens=java.base/sun.security.action=ALL-UNNAMED
+--add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+```
 
 ### 8.3 테스트 코드
 
@@ -593,9 +609,12 @@ class UpsertPrepareTest extends AnyFunSuite with BeforeAndAfterAll {
 
 ### 8.5 로컬 검증
 
-Spark 3.5.8 / Scala 2.12.18 / ScalaTest 3.2.19, Java 21. ScalaTest Runner로 직접 실행했다. §8.2의 sbt·Maven 설정으로 실행해 보지는 않았다.
+Spark 3.5.8 / Scala 2.12.18 / ScalaTest 3.2.19 / Maven 3.9.11 / Java 21. §8.2 pom 설정으로 `mvn test`를 실행했다.
 
-| 입력 | 결과 |
+| 조건 | 결과 |
 |------|------|
 | 테스트용 avro 3개, 8 row (같은 키가 파일 사이·파일 안에 중복, 늦게 도착한 과거 버전 포함) | 8개 통과, 8 row → 5 row |
 | 위와 같고 `prepare`에서 중복 제거를 고의로 뺌 | 키별 1건·남은 건수·최신 row 등 4개 실패 |
+| `argLine` 없음 | `sun.nio.ch.DirectBuffer` 접근 오류로 실행 중단 |
+| `argLine`에 `sun.nio.ch` 1개 | 8개 통과 |
+| surefire 설정 없음 (기본값) | surefire 0건 실행 후 통과, ScalaTest 8개 통과 |
