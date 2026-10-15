@@ -618,3 +618,48 @@ Spark 3.5.8 / Scala 2.12.18 / ScalaTest 3.2.19 / Maven 3.9.11 / Java 21. §8.2 p
 | `argLine` 없음 | `sun.nio.ch.DirectBuffer` 접근 오류로 실행 중단 |
 | `argLine`에 `sun.nio.ch` 1개 | 8개 통과 |
 | surefire 설정 없음 (기본값) | surefire 0건 실행 후 통과, ScalaTest 8개 통과 |
+
+### 8.6 오류: `Missing class: com/fasterxml/jackson/core/exc/StreamConstraintsException`
+
+**원인: 테스트 classpath에 Jackson 버전이 섞였다.** Spark 3.5.8은 Jackson 2.15.2(`jackson-core`, `jackson-databind`, `jackson-module-scala`)를 쓴다. `StreamConstraintsException`은 `jackson-core` 2.15에서 새로 생긴 클래스다. `jackson-databind`는 2.15인데 `jackson-core`가 2.14 이하로 잡히면, databind가 core에 없는 클래스를 찾다가 이 오류가 난다.
+
+**발생 지점: 2단계 avro read.** avro 라이브러리가 avro 파일 header에 든 스키마(JSON)를 Jackson으로 파싱한다(`org.apache.avro.Schema$Parser.parse`). 그래서 1·2단계 테스트부터 실패한다.
+
+**버전이 섞이는 이유: Maven은 의존 트리에서 가까운 버전을 고른다.** 같은 라이브러리를 여러 버전이 요구하면 트리에서 깊이가 얕은 쪽이 이긴다. Spark의 `jackson-core`는 `spark-sql` 아래 몇 단계 깊이에 있다. pom에 직접 적은 Jackson 의존성이나, 다른 라이브러리가 더 얕은 깊이에서 끌고 오는 낮은 버전이 Spark 것을 이긴다.
+
+로컬 재현:
+
+| pom 조건 | `jackson-core` / `jackson-databind` | 결과 |
+|----------|-------------------------------------|------|
+| Spark 의존성만 | 2.15.2 / 2.15.2 | 8개 통과 |
+| `jackson-core` 2.14.2를 직접 추가 | 2.14.2 / 2.15.2 | `Missing class: ...StreamConstraintsException` (같은 메시지) |
+| Jackson 2.14.2를 쓰는 라이브러리 추가 | 2.14.2 / 2.14.2 | `Scala module 2.15.2 requires Jackson Databind version >= 2.15.0` |
+| 위 + 아래 BOM 고정 | 2.15.2 / 2.15.2 | 8개 통과 |
+
+**확인 방법**
+
+```
+mvn dependency:tree -Dincludes=com.fasterxml.jackson.core
+```
+
+`jackson-core`나 `jackson-databind`가 2.15.2가 아니면, 그 줄의 상위 항목이 낮은 버전을 끌고 온 라이브러리다. IntelliJ에서는 Maven 탭의 Dependencies 또는 External Libraries에서 `jackson-core` 버전을 본다.
+
+**해결: Jackson 전체를 Spark와 같은 버전으로 고정한다.** pom의 `<dependencyManagement>`에 Jackson BOM을 넣으면 직접·간접 의존성 모두 이 버전으로 맞춰진다.
+
+```xml
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson</groupId>
+      <artifactId>jackson-bom</artifactId>
+      <version>2.15.2</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+
+- pom을 고친 뒤 IntelliJ에서 Maven 프로젝트를 다시 불러와야(Reload) IntelliJ 실행에도 반영된다.
+- BOM 버전은 Spark가 쓰는 Jackson 버전에 맞춘다. Spark 3.5.8은 2.15.2, Spark 4.1.1은 2.20.0이다(각 배포판 `jars/` 확인). Spark를 올리면 이 값도 같이 바꾼다.
+- 운영 실행은 이미지의 `$SPARK_HOME/jars`(Jackson 2.15.2)가 앱 jar보다 먼저 로드된다(`spark.driver.userClassPathFirst` 기본값 false). 이 오류는 테스트 classpath에서만 나는 것으로 본다(운영 미확인).
