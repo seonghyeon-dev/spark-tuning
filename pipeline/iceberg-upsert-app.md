@@ -614,7 +614,7 @@ Spark 3.5.8 / Scala 2.12.18 / ScalaTest 3.2.19 / Maven 3.9.11 / Java 21. §8.2 p
 | 조건 | 결과 |
 |------|------|
 | 테스트용 avro 3개, 8 row (같은 키가 파일 사이·파일 안에 중복, 늦게 도착한 과거 버전 포함) | 8개 통과, 8 row → 5 row |
-| 위와 같고 `prepare`에서 중복 제거를 고의로 뺌 | 키별 1건·남은 건수·최신 row 등 4개 실패 |
+| 위와 같고 `prepare`에서 중복 제거를 고의로 뺌 (ScalaTest Runner로 직접 실행) | 키별 1건·남은 건수·최신 row 등 4개 실패 |
 | `argLine` 없음 | `sun.nio.ch.DirectBuffer` 접근 오류로 실행 중단 |
 | `argLine`에 `sun.nio.ch` 1개 | 8개 통과 |
 | surefire 설정 없음 (기본값) | surefire 0건 실행 후 통과, ScalaTest 8개 통과 |
