@@ -5,8 +5,8 @@
 | 대상 | 빅테이블 4개 append Job (1번 테이블 먼저) |
 | 방식 | SparkApplication CRD 직접 apply, 테스트용 복제 테이블, 운영 5분치 고정 입력 |
 | 환경 | Spark 3.5.8, Iceberg 1.10.1 (운영) |
-| 결과 반영 | `tuning/spark-tuning-guide.md`, 보고용 요약은 측정 완료 후 작성 |
-| 작성일 | 2026-09-30 |
+| 결과 반영 | `tuning/spark-tuning-guide.md` §2.2·§4.1, `pipeline/examples/append_executor_sizing_example.py` |
+| 작성일 | 2026-09-30 (1번 테이블 결과·확정값 반영 2026-10-14) |
 
 ---
 
@@ -28,7 +28,7 @@
 | 단계 | 값 |
 |------|----|
 | parquet 출력 | 3,157MB |
-| shuffle 크기 | 3,157MB × 1.41 = 약 4.45GB (1.41 = 2026-03 벤치마크의 shuffle 9.2GiB ÷ 출력 6.5GiB, A안 스키마 값. 현행 값은 L0 실행의 shuffle write ÷ 출력으로 다시 잰다) |
+| shuffle 크기 | 3,157MB × 1.41 = 약 4.45GB (1.41 = 2026-03 벤치마크의 shuffle 9.2GiB ÷ 출력 6.5GiB, A안 스키마 값. **실측(§7.1): shuffle 4.59GiB ÷ 출력 3.2GiB = 1.43**) |
 | 총 core | 운영 14대 × 4 = 56 |
 | 목표 크기 | 4.45GB ÷ 56 = 약 79MB. 384MB보다 작으므로 79MB가 쓰인다 |
 | 결과 | 쓰기 task 약 56개 → 파일 약 58개, 파일당 79MB ÷ 1.41 = 약 56MB |
@@ -238,6 +238,19 @@ spec:
 - 실행 순서: L0 → L1 → L0 → L1 ... 순으로 번갈아 5회씩 돌린다. 시간대별 클러스터 부하가 한 후보에만 몰리지 않게 하기 위해서다.
 - L0 5회의 편차 (최댓값 − 최솟값) ÷ 평균을 이번 테스트의 노이즈 기준선으로 쓴다.
 
+**결과 (2026-10-06, 1번 테이블, instances 12)**: L0 유지. L2는 돌리지 않았다. 상세는 §7.1
+
+| | L0 | L1 |
+|---|---|---|
+| duration 중앙값 (10회) | 2.6분 (1.6~3.5) | 2.85분 (2.2~4.2) |
+| dcu 중앙값 (5회) | 0.129 | 0.157 |
+| 파일 (batch당) | 59개 × 55.5MB | 17개 × 192.7MB |
+| advisory / actual target size | 402653184 / 107578488 | 402653184 / 402653184 |
+
+- 차이 10~15%는 같은 설정 안의 흔들림(L0 1.6~3.5분)보다 작다. job 비용은 같은 수준이고 파일 수만 다르다.
+- 쓰기 속도 우선(사용자 결정 2026-10-06)이라 L0를 고른다. L1의 이점(Compaction 입력 59 → 17개)은 hourly Compaction이 지금 성능으로 충분해서 쓰지 않는다.
+- 구조상 L0가 같거나 빠르다. 쓰기 task가 L0는 48개(= 총 core), L1은 13개라 L1은 쓰기 stage에서 35 core가 논다. 측정에서 차이가 묻힌 건 쓰기 stage 비중이 작아서다.
+
 ---
 
 ## 5. 측정 방법
@@ -340,25 +353,128 @@ kubectl logs -n <ns> append-tune-t1-l0-r1-driver -c spark-kubernetes-driver \
 | 보조 | batch당 파일 수·평균 크기 (Compaction 입력 변화 확인용) |
 
 - duration만으로 판정하지 않는다. 쓰기 task가 줄면 duration은 늘지만 dcu는 줄 수 있다(작업 5와 같은 원칙).
+- **memory usage %는 판정에 쓰지 않는다.** JVM은 받은 메모리만큼 채워 쓰므로 memory를 8g → 6g → 4g로 줄여도 사용률은 60~89%로 비슷했다(§7.4). 메모리 부족은 spill로만 드러난다.
+- 설정마다 보는 지표가 다르다. memory·overhead는 spill·task error·retry(통과/실패), 비용은 dcu, duration은 구조가 바뀌는 변경(parallelismFirst, core 수)에서만 본다.
 
 ---
 
-## 7. 기록표
+## 7. 측정 결과 (1번 테이블, 2026-10-06 ~ 10-13)
 
-| 후보 | 회차 | instances | duration | dcu | row_cnt | gb | dcu/GB | idle cores | spill | task error | 유실 | files | avg_mb | min_mb | max_mb | actual target size | 샘플링 stage | 기동 |
-|------|------|-----------|----------|-----|---------|----|--------|-----------|-------|-----------|------|-------|--------|--------|--------|-------------------|-------------|------|
-| L0 | 1 | | | | | | | | | | | | | | | | | |
-| L1 | 1 | | | | | | | | | | | | | | | | | |
+입력 고정: 09/29 15:25 구간, JOB_HISTORY 123 row, avro 2,690개, 4,180,959,271 bytes(3.89GiB). 모든 회차 row_cnt 302,908 동일. 값 순서는 duration / dcu / 그 외.
+
+### 7.1 L0 vs L1 (instances 12, memory 8g, overhead 4g, 각 5회)
+
+| 회차 | L0 duration / dcu / idle / 샘플링 stage | L1 duration / dcu / idle / 샘플링 stage |
+|---|---|---|
+| 1 | 2.6m / 0.1304 / 28.8% / 66s | 4.2m / 0.2111 / 25.3% / 108s |
+| 2 | 2.6m / 0.1286 / 25.7% / 52s | 3.5m / 0.1794 / 32.8% / 90s |
+| 3 | 1.6m / 0.0795 / 33.3% / 29s | 3.1m / 0.1570 / 30.6% / 72s |
+| 4 | 3.5m / 0.1791 / 23.5% / 84s | 2.5m / 0.1244 / 27.2% / 56s |
+| 5 | 2.0m / 0.0983 / 42.8% / 43s | 2.2m / 0.1086 / 30.7% / 46s |
+| duration만 5회 추가 | 2.3 / 2.5 / 2.9 / 2.7 / 2.9m | 3.0 / 3.4 / 2.7 / 2.3 / 2.5m |
+
+- 공통: spill 0, task error 0%, retry 없음, 기동 11~13초. 파일 L0 59개(avg 55.5 / min 0.6 / max 71MB), L1 17개(192.7 / 3.2 / 261MB)
+- 첫 회차(instances 14): 1.8m / 0.0995, 파일 71개 × 46.1MB, actual target size 92,210,132. DataFlint input 7.83GiB(avro 3.9GiB × 2회 읽기), output 3.2GiB, shuffle read/write 4.59GiB → shuffle 배수 1.43
+- actual target size로 §1 가설 확인: 107,578,488 × 48 core = 4.81GiB(AQE 통계값, 실측 4.59GiB와 5% 차이), 쓰기 task 48개 + 파티션 경계 파일 11개 = 59개
+
+### 7.2 executor 수 (L0, memory 8g, overhead 4g, 각 5회)
+
+| instances | 총 core | duration 중앙값 / 최대 | dcu 중앙값 | 샘플링 stage 중앙값 | 파일 | memory usage |
+|---|---|---|---|---|---|---|
+| 12 | 48 | 2.8 / 4.0분 | 0.140 | 72초 | 59개 | 59~72% |
+| 8 | 32 | 4.3 / **5.7분** | 0.147 | 90초 | 39개 | 61~63% |
+| 6 | 24 | 4.2 / **5.7분** | 0.107 | 108초 | 29개 | 61~87% |
+
+- 8·6대는 5분을 넘긴 회차가 있어 탈락. core를 줄인 만큼 duration이 늘어 dcu는 거의 같다(dcu ≈ instances × 분 × 0.0042).
+- 샘플링 stage(avro 읽기만 하는 stage)가 core 수에 반비례한다. 읽기 task 약 114개를 48 core로 돌리면 48·48·18개씩 3차례, 32 core면 4차례, 24 core면 5차례가 되기 때문이다(§8.2).
+
+### 7.3 memoryOverhead (instances 12, memory 8g, 각 5회)
+
+| overhead | duration 중앙값 | dcu 중앙값 | 분당 dcu | task error / retry |
+|---|---|---|---|---|
+| 4g | 2.8분 | 0.140 | 0.050 | 0% / 없음 |
+| 2g | 1.9분 | 0.089 | 0.047 | 0% / 없음 |
+| 1g | 2.1분 | 0.095 | 0.045 | 0% / 없음 |
+
+- duration 차이는 회차 시점의 부하 차이다. overhead는 처리 속도를 바꾸지 않는다. 효과는 분당 dcu(메모리 할당량)에만 나타난다.
+- 2g 채택. 1g도 통과했지만 Compaction에서 overhead 부족이 executor 유실로 늦게 드러난 전례가 있어 한 단계 여유를 둔다.
+
+### 7.4 memory (instances 12, overhead 2g, 각 5회)
+
+| memory | core당 heap | duration 중앙값 | spill | memory usage |
+|---|---|---|---|---|
+| 8g | 2.0g | 1.9분 | 0 | 67~73% |
+| 6g | 1.5g | 2.5분 | 0 | 60~78% |
+| 4g | 1.0g | 2.3분 | 0 | 60~89% |
+| 3g | 0.75g | 2.0분 | 0 | |
+| 2g | 0.5g | 1.9분 | **5회 중 2회 (80.65MiB, 86.67MiB)** | |
+
+- spill이 처음 생긴 지점이 2g이므로 한 단계 위인 **core당 0.75g**(4c × 3g)로 정한다.
+- memory usage는 8g → 4g 사이에서 거의 같은 범위였다. 받은 메모리만큼 채워 쓰기 때문이며, 필요한 메모리의 근거가 되지 못한다.
+
+### 7.5 executor 모양·기타 (사용자 실행, 수치 미기록)
+
+- 8대 × 6c × 5g + 2g, 4대 × 12c × 8g + 2g: 모두 spill·오류 없이 정상 처리
+- `spark.sql.files.maxPartitionBytes` 확대: 효과 없음, 오히려 느려진 회차 있음 → 기본값 유지
 
 ---
 
-## 8. 이후 단계
+## 8. 확정값과 공식 (1번 테이블, 2026-10-14)
 
-1. **리소스 비교**: §4에서 고른 설정으로 비교한다. 순서는 executor 수(3지점) → memory(spill 0인 최솟값) → memoryOverhead(4g → 3g → 2g, task error rate로 판정) → `spark.kubernetes.allocation.batch.size`
-   - 채택한 executor 수는 `get_jobs` 공식의 계수(현재 1.5)로 환산해 운영에 반영한다.
-   - 계산 예시(가상 값): avro 4,700MB batch는 현재 공식으로 ceil(4,700 ÷ 128 × 1.5 ÷ 4) = 14대다. 이 batch에서 10대가 최적이면 계수 = 10 × 4 ÷ (4,700 ÷ 128) = 약 1.09
-2. **시간당 합계 검증**: batch 12개를 적재한 뒤 테스트 테이블에 hourly Compaction(운영 설정)을 1회 돌린다.
-   - 비교 지표: append dcu × 12 + Compaction dcu
-   - 입력 파일이 커지면 ratio 0.13의 전제(GB당 task 약 9개)가 바뀐다. 파일이 커지는 방향은 영향이 작다고 추정돼 있다(설계서 §4.5·§9). 실측 대수를 설계서 §4.4 역산 방법으로 확인한다.
-3. **2·3·4번 테이블 확장**: 1번 결과로 시작값을 잡고 테이블당 2~3회 확인한다. memory는 테이블별로 정한다.
-4. **운영 적용 후**: Airflow duration은 `job_durations.py`(`pipeline/airflow-job-duration.md`)로 집계한다.
+### 8.1 확정값
+
+| 항목 | 값 | 근거 |
+|---|---|---|
+| `parallelismFirst`, `shuffle.partitions`, `maxPartitionBytes` | 기본값 유지 | §7.1, §7.5 |
+| `write.distribution-mode` | `range` 유지 | 사용자 결정 |
+| executor core | **8** | core당 heap 0.75g(§7.4), task당 overhead 256MB(= 4c × 1g, §7.3)가 모두 실측 통과 범위. 12c는 task당 overhead 171MB로 미검증이고, K8s 기본 80% 등록 조건에서 4대 중 4대가 떠야 시작한다 |
+| executor memory / memoryOverhead | **6g / 2g** | 8c × 0.75g = 6g |
+| executor 수 | `ceil(총 core ÷ 8)`, 총 core = `ceil(읽기 task ÷ 2)` | §8.2 |
+| `spark.kubernetes.allocation.batch.size` | **20** | 3.5.8 기본값 5(jar 확인), 4.0~4.1은 10, 4.2는 20. 20이면 8대를 한 번에 요청하고 4.x에서도 그대로 쓴다 |
+
+- 공식 문서 조사(2026-10-13): "executor당 5 core" 권장의 근거는 HDFS client 처리량(Cloudera 2015)이라 MinIO에는 해당 없음. Spark 공식 문서에는 core 권장값이 없고, Databricks는 노드당 1 executor, Dataproc은 4·8·16, EMR Serverless는 최대 32 core를 쓴다. GC 경고는 heap 32~64GB 이상, S3A 연결 pool은 executor당 96개(Hadoop 3.3.4)라 두 모양 모두 한계에 걸리지 않는다.
+
+### 8.2 executor 수 산정 공식
+
+Spark는 avro 읽기 task를 "파일별 실제 크기 + 4MiB(`openCostInBytes`)"를 128MiB(`maxPartitionBytes`)까지 묶어 만든다. 1번 테스트 batch는 파일 2,690개(평균 1.48MiB)라 데이터 3,987MiB보다 파일 수 몫(2,690 × 4 = 10,760MiB)이 커서 읽기 task가 약 114개가 된다. 바이트만 보는 기존 공식(`ceil(바이트 ÷ 128MB × 1.5 ÷ 4)`)은 이 몫을 보지 못한다.
+
+읽기 stage 시간은 "읽기 task ÷ 총 core"(차례 수)에 비례한다(§7.2). 그래서 차례 수를 정하면 core가 정해진다.
+
+```python
+MiB = 1024 * 1024
+MAX_PARTITION_BYTES = 128 * MiB   # spark.sql.files.maxPartitionBytes 기본값
+OPEN_COST_BYTES     = 4 * MiB     # spark.sql.files.openCostInBytes 기본값
+READ_WAVES          = 2           # 읽기 task를 몇 차례에 처리할지 (사용자 선택: 속도 우선)
+EXECUTOR_CORES      = 8
+MAX_TOTAL_CORES     = 128         # 재처리 등 큰 batch 상한
+
+def spark_read_tasks(file_sizes):              # Spark 3.5 FilePartition 규칙 그대로
+    tasks, current = 0, 0
+    for size in sorted(file_sizes, reverse=True):          # 큰 파일부터
+        if current + size > MAX_PARTITION_BYTES and current > 0:   # 판단: 실제 크기만
+            tasks += 1; current = 0
+        current += size + OPEN_COST_BYTES                          # 누적: +4MiB
+    return tasks + (1 if current > 0 else 0)
+
+def executors_for(file_sizes):
+    read_tasks  = spark_read_tasks(file_sizes)
+    total_cores = min(math.ceil(read_tasks / READ_WAVES), MAX_TOTAL_CORES)
+    return math.ceil(total_cores / EXECUTOR_CORES)
+```
+
+- 1번 테스트 batch: 읽기 task 113~114 → 57 core → **8대 × 8c = 64 core**. 지금(48 core)보다 core 33% 증가, 읽기 stage 3차례 → 1.8차례. 예상 duration −20%, dcu +7%
+- 검증: 로컬 Spark 3.5.8에 파일 2,690개(크기 ÷ 4MiB 비율 0.37, 운영과 동일)를 만들어 읽은 결과 Spark 실제 114 = 이 함수 114. 단순 나눗셈 `(바이트 + 파일 수 × 4MiB) ÷ 128MiB`는 116으로 2개 많다. Spark가 "넣을지 판단"에는 4MiB를 안 더하기 때문이다
+- 차례 수 선택지: 2(64 core, 속도) / 3(5대 × 8c = 40 core, dcu −17%, 최악 duration 약 4.6분으로 5분 여유 적음)
+- 테이블마다 계수를 따로 잡을 필요는 없다. 읽기 task 1개의 일감은 테이블과 무관하게 같고(파일 약 24개, 128MiB), 테이블 차이는 읽기 task 수(파일 수)와 메모리(spill 확인)에 각각 반영된다
+- 전제: 총 core < 읽기 task 수. 128 상한에서도 성립한다. 4MiB가 MinIO에서 실제 파일 여는 비용과 같은지는 확인하지 않았다
+- 변경 전/후 코드: `pipeline/examples/append_executor_sizing_example.py`
+
+---
+
+## 9. 남은 단계
+
+1. **1번 확정 모양 확인 (사용자)**: 8대 × 8c × 6g + 2g, `allocation.batch.size=20`으로 3회. stage 4 task 수(약 113~114), 샘플링 stage 초(72 → 약 50 기대), spill 0, task error 0%, retry 없음. 노드 allocatable에 8 CPU + 8Gi pod 8개가 Pending 없이 뜨는지
+2. **2·3·4번 테이블**: 같은 모양으로 테이블당 2~3회 spill 0·task error 0%·retry 없음 확인. 2번은 row 폭이 좁아 같은 MiB에 row가 많으므로 spill을 특히 본다. 공식으로 2번은 읽기 task 약 101 → 51 core → 7대
+3. **운영 반영**: `get_jobs` 공식 교체(§8.2), SparkApplication executor 설정, `allocation.batch.size`
+4. **운영 적용 후**: Airflow duration을 `job_durations.py`(`pipeline/airflow-job-duration.md`)로 집계. hourly Compaction 입력 파일 수(총 core가 바뀌면 L0에서 파일 수도 바뀐다: 64 core면 batch당 약 75개)와 ratio 0.13 수렴 대수를 설계서 §8.3 체크표로 확인
+5. **이후 (사용자 계획)**: DA로 여러 batch 크기 테스트. 상한 128 core에 걸리는 batch에서 task당 처리량이 늘어나므로 spill을 다시 본다

@@ -7,7 +7,7 @@
 | 작성 목적 | Spark Job의 리소스 및 성능 설정에 대한 근거 기반 가이드 |
 | 대상 독자 | 데이터 엔지니어, 운영팀 |
 | 환경 | Kubernetes 클러스터, S3(MinIO), Spark 3.5.8 (운영·실측 환경, 임시 다운그레이드 — 목표 4.1.1), Iceberg 1.10.1, Airflow 3.2.2 |
-| 최종 수정일 | 2026-09-30 (§3.2 정정, §3.3 추가) |
+| 최종 수정일 | 2026-10-14 (§2.2·§4.1 확정값, §2.2.3 산정식 교체) |
 
 ### 근거 수준 라벨
 
@@ -150,6 +150,13 @@ Driver는 쿼리 플래닝, 태스크 스케줄링, Iceberg 커밋만 수행하�
 
 ### 2.2 Executor 설정
 
+> **✅ 2026-10-14 확정 (빅테이블 1번 테이블 실측, 2·3·4번 확인 중)**: executor **8 core / memory 6g / memoryOverhead 2g**, executor 수는 §2.2.3 공식, `spark.kubernetes.allocation.batch.size=20`. 아래 §2.2.1·§2.2.2의 4 core / 8g 서술은 2026-03 벤치마크 시점 값이다. 근거와 측정값은 [테스트 절차](append-tuning-test.md) §7·§8.
+>
+> - core당 heap 0.75g: 4c × 3g에서 spill 0, 4c × 2g(0.5g)에서 spill 발생
+> - task당 overhead 256MB: 4c × 1g까지 task error 0%. 2g는 한 단계 여유
+> - executor 8 core: 공식 문서에 core 권장값이 없고("executor당 5 core"는 HDFS 기준 Cloudera 2015), 12 core는 task당 overhead 171MB 미검증·80% 등록 조건 불리
+> - memory usage %는 판정 근거가 아니다. 8g → 4g로 줄여도 60~89%로 비슷했다. 기준은 spill이다
+
 #### 2.2.1 executor-cores
 
 | 항목 | 값 |
@@ -201,41 +208,48 @@ avro → Iceberg append는 데이터를 메모리에 장기 보관하지 않으�
 |------|----|
 | 설정 키 | `spark.executor.instances` (spark-submit: `--num-executors`) |
 | **기본값** | `2` |
-| **권장값** | `ceil(총 크기/128MB × 1.5 / executor-cores)` (동적 산정) |
-| 근거 수준 | ✅ 벤치마크 검증 완료 |
+| **권장값** | `ceil(총 core ÷ 8)`, 총 core = `ceil(읽기 task ÷ 2)` (동적 산정, 2026-10-14) |
+| 근거 수준 | ✅ 실측 검증 (1번 테이블) |
 
-**산정식 (벤치마크 검증 완료)**
+**산정식 (2026-10-14 확정)**
+
+Spark는 avro 읽기 task를 "파일별 실제 크기 + 4MiB(`spark.sql.files.openCostInBytes`)"를 128MiB(`spark.sql.files.maxPartitionBytes`)까지 묶어 만든다. 파일이 작고 많은 입력(파일 평균 1.5MiB)은 데이터 바이트보다 파일 수 몫이 커서, 바이트만 보는 기존 공식은 읽기 task 수를 못 맞춘다. 읽기 stage 시간은 "읽기 task ÷ 총 core"(차례 수)에 비례하므로 차례 수로 core를 정한다.
 
 ```python
 import math
 
-MAX_PARTITION_BYTES_MB = 128  # spark.sql.files.maxPartitionBytes 기본값
-EXECUTOR_CORES = 4
-PARALLELISM_FACTOR = 1.5      # 벤치마크 결과 최적값 (여유 50%)
+MiB = 1024 * 1024
+MAX_PARTITION_BYTES = 128 * MiB   # spark.sql.files.maxPartitionBytes 기본값
+OPEN_COST_BYTES     = 4 * MiB     # spark.sql.files.openCostInBytes 기본값
+READ_WAVES          = 2           # 읽기 task를 몇 차례에 처리할지 (속도 우선)
+EXECUTOR_CORES      = 8
+MAX_TOTAL_CORES     = 128         # 재처리 등 큰 batch 상한
 
-total_partitions = math.ceil(total_avro_size_mb / MAX_PARTITION_BYTES_MB)
-num_executors = math.ceil(total_partitions * PARALLELISM_FACTOR / EXECUTOR_CORES)
-num_executors = max(num_executors, 1)
+def spark_read_tasks(file_sizes):              # Spark 3.5 FilePartition 규칙 그대로
+    tasks, current = 0, 0
+    for size in sorted(file_sizes, reverse=True):          # 큰 파일부터
+        if current + size > MAX_PARTITION_BYTES and current > 0:   # 판단: 실제 크기만
+            tasks += 1; current = 0
+        current += size + OPEN_COST_BYTES                          # 누적: +4MiB
+    return tasks + (1 if current > 0 else 0)
+
+def num_executors(file_sizes):
+    read_tasks  = spark_read_tasks(file_sizes)
+    total_cores = min(math.ceil(read_tasks / READ_WAVES), MAX_TOTAL_CORES)
+    return max(math.ceil(total_cores / EXECUTOR_CORES), 1)
 ```
 
-산정식의 의미:
-1. `총 데이터 / 128MB` = Spark가 생성하는 읽기 파티션 수 (= 태스크 수)
-2. `× PARALLELISM_FACTOR(1.5)` = 파이프라이닝 여유 50% 확보
-3. `/ executor-cores(4)` = Executor 1개가 동시 처리하는 태스크 수 반영
+1번 테이블 5분 batch(파일 2,690개, 4,180,959,271 bytes)로 계산하면 읽기 task 113~114 → 57 core → **8대 × 8 core**. 기존 공식(`ceil(바이트 ÷ 128MB × 1.5 ÷ 4)` = 12대 × 4 core = 48 core)보다 core 33% 증가, 읽기 stage 3차례 → 1.8차례, 예상 duration −20%·dcu +7%. 읽기 task 수는 로컬 Spark 3.5.8에서 검증했다(계산 114 = 실제 114). 변경 전/후 코드는 `pipeline/examples/append_executor_sizing_example.py`.
 
-> **참고: PARALLELISM_FACTOR란?**
-> Spark 옵션이 아니라, num-executors를 계산하기 위해 만든 **산정식의 여유 계수(배수)**이다. 최소 Executor 수에 곱하여 파티션간 처리 시간 편차·S3 읽기 지연·shuffle 대기 등의 여유분을 확보한다. Airflow `get_jobs` task에서 사용하는 코드 상수이다.
+**실측 근거 (1번 테이블, 총 core를 줄였을 때)**
 
-**벤치마크 결과 (10분 주기 배치, ~8GB avro)**
+| 총 core | 읽기 차례 (114 ÷ core) | 샘플링 stage 중앙값 | duration 중앙값 / 최대 |
+|---|---|---|---|
+| 48 | 3 | 72초 | 2.8 / 4.0분 |
+| 32 | 4 | 90초 | 4.3 / 5.7분 |
+| 24 | 5 | 108초 | 4.2 / 5.7분 |
 
-| 케이스 | num-executors | 총 코어 수 | 소요시간 | 비고 |
-|--------|---------------|-----------|---------|------|
-| A | 16 | 64 | 55초 | 코어 부족으로 태스크 대기 발생 |
-| **B** | **24** | **96** | **44초** | **✅ 최적** |
-| C | 32 | 128 | 51초 | 오버헤드 발생 (scheduler 경합, shuffle 통신 증가) |
-| D | 60 | 240 | 51초 | 과다 할당. 24개 대비 2.5배 리소스에도 성능 저하 |
-
-> **결론**: 24개(PARALLELISM_FACTOR=1.5)가 최적. 32개 이상에서 성능이 나빠지는 이유는 executor 간 shuffle 통신 오버헤드, K8S Pod 스케줄링 경합, S3 동시 접속 부하 증가 때문이다.
+**이전 공식 (2026-03 벤치마크, 참고)**: `ceil(총 크기/128MB × 1.5 / 4)`. 10분 주기 ~8GB avro에서 24개(96 core)가 44초로 최적, 16개 55초, 32·60개 51초. 바이트만 보므로 파일이 작은 테이블(2번, 평균 1.0MiB)에 core를 적게 배정했다.
 
 ---
 
@@ -383,9 +397,11 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 |------|-----|--------|-----------|------|
 | `driver-cores` | `1` | `1` | 📘 일반적 관행 | 플래닝·커밋 전용 |
 | `driver-memory` | `2g` | `1g` | 📘 일반적 관행 | 경량 메타데이터 collect만 발생 |
-| `executor-cores` | `4` | `1` | 📘 일반적 관행 | S3 I/O throughput과 GC 균형 |
-| `executor-memory` | `8g` | `1g` | 📘 일반적 관행 | 코어당 2GB |
-| `num-executors` | `ceil(총크기/128MB×1.5/cores)` | `2` | ✅ 벤치마크 검증 | 24개 최적 |
+| `executor-cores` | `8` | `1` | ✅ 실측 검증 (2026-10) | 4c×3g·4c×1g 실측 범위를 8c로 환산. §2.2 확정 박스 |
+| `executor-memory` | `6g` | `1g` | ✅ 실측 검증 (2026-10) | core당 0.75g. 0.5g에서 spill 발생 |
+| `executor-memoryOverhead` | `2g` | `0.1×memory` | ✅ 실측 검증 (2026-10) | 1g까지 task error 0%, 한 단계 여유 |
+| `num-executors` | `ceil(ceil(읽기 task ÷ 2) ÷ 8)` | `2` | ✅ 실측 검증 (2026-10) | §2.2.3. 읽기 task = Spark FilePartition 규칙 |
+| `spark.kubernetes.allocation.batch.size` | `20` | `5` (3.5.8) | 📘 공식 문서 | 8대를 1라운드에 요청. 4.0~4.1 기본 10, 4.2 기본 20 |
 | `shuffle.partitions` | `200` (기본값) | `200` | ✅ 벤치마크 검증 | AQE 자동 조정에 맡김 |
 | `parallelismFirst` | `true` (기본값) | `true` | ✅ 벤치마크 검증 | I/O 중심 워크로드에 적합. small file은 Compaction으로 해결 |
 
