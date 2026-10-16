@@ -106,7 +106,7 @@
 
 ## 작업 1: Spark 튜닝 가이드 (append Job)
 
-- 7개 설정 확정 (가이드 §4.1: 3개는 벤치마크 검증, 4개는 일반 관행)
+- 설정 9개 (가이드 §4.1): driver 2개는 일반 관행, executor core·memory·overhead·수 4개는 2026-10 실측(공식은 로컬 검증, 8c 모양은 실측 대기), `allocation.batch.size`는 공식 문서, `shuffle.partitions`·`parallelismFirst`는 벤치마크
 - **재개 (2026-09-30, 빅테이블 4개)**: 테스트는 SparkApplication CRD 직접 apply + 테스트용 복제 테이블 + 운영 5분치 고정 입력. duration은 DataFlint UI, Airflow 집계는 운영 적용 후. 여러 batch 크기는 DA로 추후 테스트(사용자)
 - ⚠️ `parallelismFirst=true`(기본값)면 AQE 목표 크기 = `min(advisory 384MB, shuffle ÷ 총 core)` → **executor 수가 append 출력 파일 수를 정한다**. 리소스만 바꿔도 Compaction 입력이 바뀐다
 - ⚠️ 가이드 §3.2의 parallelismFirst 메커니즘 설명(1MB/64MB 기준, 분할 불가)은 틀렸다(정정 박스 추가). range 분배는 샘플링 job 때문에 avro를 두 번 읽는다. `shuffle.partitions` 200은 파일 수에 영향 없음
@@ -120,7 +120,7 @@
 - **executor 수 공식 (교체)**: 읽기 task = Spark FilePartition 규칙(큰 파일부터, 판단은 실제 크기, 누적은 +4MiB, 128MiB 묶음) → 총 core = `ceil(읽기 task ÷ 2)`(상한 128) → executor = `ceil(총 core ÷ 8)`. 1번 batch 읽기 task 113~114 → 8대 × 8c = 64 core(현재 48). 로컬 Spark 3.5.8 검증 114=114. 코드 `pipeline/examples/append_executor_sizing_example.py`. 사용자 결정값은 차례 수 2·core 8·상한 128
 - ⚠️ 읽기 stage는 "읽기 task ÷ 총 core"(차례 수)에 비례한다(48/32/24 core에서 72/90/108초). 계수 2.4 같은 비정수 차례는 마지막 차례 core 낭비를 고정하므로 쓰지 않는다
 - ⚠️ **memory usage %는 판정 근거가 아니다.** 8g → 4g로 줄여도 60~89%로 비슷했다(JVM이 받은 만큼 채움). 메모리는 spill, overhead는 task error·retry로만 판정
-- ⚠️ 같은 설정·입력에서도 duration이 1.6~4.0분으로 흔들린다(MinIO I/O, 샘플링 stage 29~186초). duration 비교로는 30% 미만 차이를 구분 못 한다. dcu는 instances × 분에 비례하므로 따로 잴 필요 없음
+- ⚠️ 같은 설정·입력에서도 duration이 1.6~4.0분으로 흔들린다(12대 기준, MinIO I/O. 샘플링 stage는 같은 설정에서 29~84초, 8대에서 최대 186초). duration 비교로는 30% 미만 차이를 구분 못 한다. L0 vs L1은 duration 중앙값 +10%, dcu 중앙값 +22%였지만 L0 안의 dcu 흔들림(0.080~0.179)이 그보다 커서 같은 수준으로 판정. dcu는 instances × 분에 비례하므로 따로 잴 필요 없음
 - 남은 단계: ① 8대 × 8c 3회 확인(stage 4 task 수 약 114, 샘플링 약 50초) ② 2·3·4번 spill 확인(2번 row 폭 좁음) ③ `get_jobs` 교체·운영 반영 ④ Airflow 집계, Compaction 입력 파일 수(64 core면 batch당 약 75개)·ratio 재확인 ⑤ DA 여러 batch 크기(사용자)
 
 ## 작업 2: Iceberg 스키마 설계

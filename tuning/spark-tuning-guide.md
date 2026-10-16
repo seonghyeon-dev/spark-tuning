@@ -163,14 +163,14 @@ Driver는 쿼리 플래닝, 태스크 스케줄링, Iceberg 커밋만 수행하�
 |------|----|
 | 설정 키 | `spark.executor.cores` (spark-submit: `--executor-cores`) |
 | **기본값** | `1` (K8S/YARN), 전체 가용 코어 (Standalone) |
-| **권장값** | `4` |
+| **권장값** | `4` (2026-03 시점. 2026-10 확정은 `8`, §2.2 박스) |
 | 근거 수준 | 📘 일반적 관행 |
 
 | 코어 수 | 특성 |
 |---------|------|
 | 1코어 | 멀티스레딩 이점 없음. JVM 오버헤드 대비 처리량 낮음 |
 | 2~4코어 | **권장 구간**. I/O throughput과 GC 오버헤드의 균형 |
-| 5코어 초과 | JVM GC pause 시간 증가 (힙이 커짐). S3 HTTP 커넥션 풀 경합 가능 |
+| 5코어 초과 | 2026-03에는 GC·S3 커넥션 풀 우려로 피했다. 2026-10 조사: GC 경고는 heap 32~64GB 이상, S3A pool은 executor당 96개(Hadoop 3.3.4)라 8 core × 6g는 해당 없음 |
 
 4코어는 S3 기반 I/O 중심 워크로드에서 태스크 병렬성과 JVM GC 부담의 균형점으로 널리 사용된다.
 
@@ -184,7 +184,7 @@ Driver는 쿼리 플래닝, 태스크 스케줄링, Iceberg 커밋만 수행하�
 |------|----|
 | 설정 키 | `spark.executor.memory` (spark-submit: `--executor-memory`) |
 | **기본값** | `1g` |
-| **권장값** | `8g` (executor-cores=4 기준) |
+| **권장값** | `8g` (executor-cores=4 기준, 2026-03 시점. 2026-10 확정은 `6g`/8 core, §2.2 박스) |
 | 근거 수준 | 📘 일반적 관행 |
 
 일반적으로 **코어당 2~4GB** 할당이 권장된다:
@@ -198,7 +198,7 @@ avro → Iceberg append는 데이터를 메모리에 장기 보관하지 않으�
 > `memoryOverhead` 기본값 = `executor-memory × 0.10` (최소 384MB)
 > 예) 8g 설정 시 → Pod 메모리 ≈ 8g + 819MB ≈ 8.8g
 >
-> 운영 빅테이블 append는 `memoryOverhead` 4g를 명시한다(pod당 12g, 2026-09-30 확인). 재검증 대상이다([테스트 절차](append-tuning-test.md) §8).
+> 운영 빅테이블 append는 `memoryOverhead` 4g를 명시한다(pod당 12g, 2026-09-30 확인) → 2026-10 실측으로 **2g 확정**([테스트 절차](append-tuning-test.md) §7.3). 1g까지 task error 0%.
 
 ---
 
@@ -209,7 +209,7 @@ avro → Iceberg append는 데이터를 메모리에 장기 보관하지 않으�
 | 설정 키 | `spark.executor.instances` (spark-submit: `--num-executors`) |
 | **기본값** | `2` |
 | **권장값** | `ceil(총 core ÷ 8)`, 총 core = `ceil(읽기 task ÷ 2)` (동적 산정, 2026-10-14) |
-| 근거 수준 | ✅ 실측 검증 (1번 테이블) |
+| 근거 수준 | ✅ 읽기 task 규칙 로컬 검증 + 차례 수 실측(1번 테이블, 4 core 구성). 8 core 구성 실측 대기 |
 
 **산정식 (2026-10-14 확정)**
 
@@ -239,7 +239,7 @@ def num_executors(file_sizes):
     return max(math.ceil(total_cores / EXECUTOR_CORES), 1)
 ```
 
-1번 테이블 5분 batch(파일 2,690개, 4,180,959,271 bytes)로 계산하면 읽기 task 113~114 → 57 core → **8대 × 8 core**. 기존 공식(`ceil(바이트 ÷ 128MB × 1.5 ÷ 4)` = 12대 × 4 core = 48 core)보다 core 33% 증가, 읽기 stage 3차례 → 1.8차례, 예상 duration −20%·dcu +7%. 읽기 task 수는 로컬 Spark 3.5.8에서 검증했다(계산 114 = 실제 114). 변경 전/후 코드는 `pipeline/examples/append_executor_sizing_example.py`.
+1번 테이블 5분 batch(파일 2,690개, 4,180,959,271 bytes)로 계산하면 읽기 task 113~114 → 57 core → **8대 × 8 core**. 기존 공식(`ceil(바이트 ÷ 128MB × 1.5 ÷ 4)` = 12대 × 4 core = 48 core)보다 core 33% 증가, 읽기 차례 비율 2.4 → 1.8(정수로 3 → 2). 예상 duration −20%(읽기 stage 2개가 duration의 약 60%, 차례 3 → 2로 −33%), dcu +7%(64 ÷ 48 × 0.8). 읽기 task 수는 로컬 Spark 3.5.8에서 검증했다(계산 114 = 실제 114). 변경 전/후 코드는 `pipeline/examples/append_executor_sizing_example.py`.
 
 **실측 근거 (1번 테이블, 총 core를 줄였을 때)**
 
@@ -400,7 +400,7 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 | `executor-cores` | `8` | `1` | ✅ 실측 검증 (2026-10) | 4c×3g·4c×1g 실측 범위를 8c로 환산. §2.2 확정 박스 |
 | `executor-memory` | `6g` | `1g` | ✅ 실측 검증 (2026-10) | core당 0.75g. 0.5g에서 spill 발생 |
 | `executor-memoryOverhead` | `2g` | `0.1×memory` | ✅ 실측 검증 (2026-10) | 1g까지 task error 0%, 한 단계 여유 |
-| `num-executors` | `ceil(ceil(읽기 task ÷ 2) ÷ 8)` | `2` | ✅ 실측 검증 (2026-10) | §2.2.3. 읽기 task = Spark FilePartition 규칙 |
+| `num-executors` | `ceil(ceil(읽기 task ÷ 2) ÷ 8)`, 상한 128 core | `2` | ✅ 공식 로컬 검증, 8c 실측 대기 | §2.2.3. 읽기 task = Spark FilePartition 규칙 |
 | `spark.kubernetes.allocation.batch.size` | `20` | `5` (3.5.8) | 📘 공식 문서 | 8대를 1라운드에 요청. 4.0~4.1 기본 10, 4.2 기본 20 |
 | `shuffle.partitions` | `200` (기본값) | `200` | ✅ 벤치마크 검증 | AQE 자동 조정에 맡김 |
 | `parallelismFirst` | `true` (기본값) | `true` | ✅ 벤치마크 검증 | I/O 중심 워크로드에 적합. small file은 Compaction으로 해결 |
@@ -415,7 +415,7 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 | Avro 총 크기 | ~8.08GB |
 | Parquet 총 크기 (Iceberg 적재 후) | ~6.54GB (압축률 ~82.9%) |
 | 총 Row 수 | 628,699건 |
-| 추정 읽기 파티션 수 | ~63개 (`8,080MB / 128MB`) |
+| 읽기 파티션 수 | 실측 228개 (Stage 5). 바이트만 본 추정 63개는 틀렸다. (8,090MiB + 5,355 × 4MiB) ÷ 128MiB = 약 230 (§2.2.3 규칙) |
 
 **테스트 조건**: 모든 벤치마크에서 `shuffle.partitions`와 `parallelismFirst`는 별도 설정하지 않고 Spark 기본값(200, true)으로 진행.
 
@@ -453,19 +453,19 @@ AQE는 Spark 3.2부터 기본 활성화되어 있다 (운영 3.5.8·목표 4.1.1
 | GC 시간 비율 | Spark UI → Executors 탭 | 전체 실행 시간의 5% 미만 |
 | Shuffle Read/Write 크기 | Spark UI → Stages 탭 | 파티션당 100~200MB 내외 |
 | Task 소요시간 분포 | Spark UI → Stages 탭 | 최대/최소 편차 3배 이내 (스큐 없음) |
-| Executor 메모리 사용률 | Spark UI → Executors 탭 | 80% 미만 (OOM 여유) |
+| spill (disk) | DataFlint / Spark UI Stages | 0. 메모리 사용률 %는 받은 만큼 채워지므로 기준이 아니다(테스트 §7.4) |
 | Pod CPU 사용률 | K8S Metrics (Grafana 등) | request 대비 70~90% |
 
 ### 4.7 트러블슈팅
 
 | 증상 | 원인 | 대응 |
 |------|------|------|
-| Executor OOM (`OutOfMemoryError`) | executor-memory 부족 또는 데이터 스큐 | executor-memory를 8g → 12g → 16g 순으로 증가. Spark UI에서 태스크별 메모리 사용량 확인 |
+| Executor OOM (`OutOfMemoryError`) | executor-memory 부족 또는 데이터 스큐 | spill이 먼저 나타난다. 확정 6g(8 core)에서 spill이 보이면 core당 0.25g씩 올린다(8g). 데이터 스큐는 task별 shuffle read로 확인 |
 | Driver OOM | Iceberg 메타데이터 collect 과다 (파일 수 급증) | driver-memory를 2g → 4g로 증가 |
 | Shuffle 단계 느림 | 파티션 스큐 (특정 키에 데이터 집중) | Spark UI → Stages → shuffle read 크기 편차 확인. 파티션 키 재설계 검토 |
 | S3 타임아웃 / 연결 오류 | MinIO 과부하 또는 동시 접속 초과 | `fs.s3a.connection.maximum` 확인 (기본 96). num-executors 줄여 동시 접속 감소 |
 | Pod Pending (스케줄링 지연) | K8S 노드 리소스 부족 | 4.4절 리소스 요구사항 대비 노드 풀 용량 확인. num-executors 축소 검토 |
-| 전체 소요시간 급증 | 데이터 볼륨 증가 | num-executors 산정식이 자동 반영. 산정 결과가 32 이상이면 executor-cores/memory 조합 재검토 |
+| 전체 소요시간 급증 | 데이터 볼륨 증가 | num-executors 산정식이 자동 반영. 상한 128 core(16대)에 걸리는 batch는 task당 처리량이 늘어나므로 spill을 다시 본다 |
 
 ---
 

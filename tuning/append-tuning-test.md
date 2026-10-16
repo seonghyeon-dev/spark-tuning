@@ -233,7 +233,7 @@ spec:
 | **L1** | `false` | 미지정 (= 384MB) | 약 12~16개 × 약 270MB, 쓰기 task 약 12개 |
 | **L2** | `false` | `201326592` (192MB) | 약 24~28개 × 약 136MB, 쓰기 task 약 24개 |
 
-- L1 파일 크기: 384MB ÷ 1.41 = 약 272MB. L2 값 계산: 4.45GB ÷ 192MB = 약 24 task, 파일당 192MB ÷ 1.41 = 약 136MB
+- 가설 계산(배수 1.41 기준, 실측 1.43): L1 파일 크기 384MB ÷ 1.41 = 약 272MB. L2는 4.45GB ÷ 192MB = 약 24 task, 파일당 192MB ÷ 1.41 = 약 136MB
 - L1이 필수 조건을 통과하고 dcu/GB가 L0보다 낮으면 L2는 생략한다. L1의 쓰기 stage가 길어 필수 조건을 못 맞추면 L2를 돌린다.
 - 실행 순서: L0 → L1 → L0 → L1 ... 순으로 번갈아 5회씩 돌린다. 시간대별 클러스터 부하가 한 후보에만 몰리지 않게 하기 위해서다.
 - L0 5회의 편차 (최댓값 − 최솟값) ÷ 평균을 이번 테스트의 노이즈 기준선으로 쓴다.
@@ -247,7 +247,7 @@ spec:
 | 파일 (batch당) | 59개 × 55.5MB | 17개 × 192.7MB |
 | advisory / actual target size | 402653184 / 107578488 | 402653184 / 402653184 |
 
-- 차이 10~15%는 같은 설정 안의 흔들림(L0 1.6~3.5분)보다 작다. job 비용은 같은 수준이고 파일 수만 다르다.
+- duration 중앙값 +10%, dcu 중앙값 +22%지만, L0 안의 흔들림(duration 1.6~3.5분, dcu 0.080~0.179)이 그보다 크다. job 비용은 같은 수준으로 보고, 확실한 차이는 파일 수뿐이다.
 - 쓰기 속도 우선(사용자 결정 2026-10-06)이라 L0를 고른다. L1의 이점(Compaction 입력 59 → 17개)은 hourly Compaction이 지금 성능으로 충분해서 쓰지 않는다.
 - 구조상 L0가 같거나 빠르다. 쓰기 task가 L0는 48개(= 총 core), L1은 13개라 L1은 쓰기 stage에서 35 core가 논다. 측정에서 차이가 묻힌 건 쓰기 stage 비중이 작아서다.
 
@@ -427,7 +427,7 @@ kubectl logs -n <ns> append-tune-t1-l0-r1-driver -c spark-kubernetes-driver \
 |---|---|---|
 | `parallelismFirst`, `shuffle.partitions`, `maxPartitionBytes` | 기본값 유지 | §7.1, §7.5 |
 | `write.distribution-mode` | `range` 유지 | 사용자 결정 |
-| executor core | **8** | core당 heap 0.75g(§7.4), task당 overhead 256MB(= 4c × 1g, §7.3)가 모두 실측 통과 범위. 12c는 task당 overhead 171MB로 미검증이고, K8s 기본 80% 등록 조건에서 4대 중 4대가 떠야 시작한다 |
+| executor core | **8** | core당 heap 0.75g(§7.4), task당 overhead 256MB(= 4c × 1g, §7.3)가 모두 실측 통과 범위. 12c는 task당 overhead 171MB로 §7.5에서 1회만 정상 확인(5회 검증 안 함)이고, K8s 기본 80% 등록 조건에서 4대 중 4대가 떠야 시작한다 |
 | executor memory / memoryOverhead | **6g / 2g** | 8c × 0.75g = 6g |
 | executor 수 | `ceil(총 core ÷ 8)`, 총 core = `ceil(읽기 task ÷ 2)` | §8.2 |
 | `spark.kubernetes.allocation.batch.size` | **20** | 3.5.8 기본값 5(jar 확인), 4.0~4.1은 10, 4.2는 20. 20이면 8대를 한 번에 요청하고 4.x에서도 그대로 쓴다 |
@@ -441,6 +441,8 @@ Spark는 avro 읽기 task를 "파일별 실제 크기 + 4MiB(`openCostInBytes`)"
 읽기 stage 시간은 "읽기 task ÷ 총 core"(차례 수)에 비례한다(§7.2). 그래서 차례 수를 정하면 core가 정해진다.
 
 ```python
+import math
+
 MiB = 1024 * 1024
 MAX_PARTITION_BYTES = 128 * MiB   # spark.sql.files.maxPartitionBytes 기본값
 OPEN_COST_BYTES     = 4 * MiB     # spark.sql.files.openCostInBytes 기본값
@@ -456,13 +458,13 @@ def spark_read_tasks(file_sizes):              # Spark 3.5 FilePartition 규칙 
         current += size + OPEN_COST_BYTES                          # 누적: +4MiB
     return tasks + (1 if current > 0 else 0)
 
-def executors_for(file_sizes):
+def num_executors(file_sizes):
     read_tasks  = spark_read_tasks(file_sizes)
     total_cores = min(math.ceil(read_tasks / READ_WAVES), MAX_TOTAL_CORES)
-    return math.ceil(total_cores / EXECUTOR_CORES)
+    return max(math.ceil(total_cores / EXECUTOR_CORES), 1)
 ```
 
-- 1번 테스트 batch: 읽기 task 113~114 → 57 core → **8대 × 8c = 64 core**. 지금(48 core)보다 core 33% 증가, 읽기 stage 3차례 → 1.8차례. 예상 duration −20%, dcu +7%
+- 1번 테스트 batch: 읽기 task 113~114 → 57 core → **8대 × 8c = 64 core**. 지금(48 core)보다 core 33% 증가, 읽기 차례 비율 2.4 → 1.8(정수로 3 → 2). 예상 duration −20%(읽기 stage 2개가 duration의 약 60%, 차례 3 → 2로 −33%), dcu +7%(64 ÷ 48 × 0.8)
 - 검증: 로컬 Spark 3.5.8에 파일 2,690개(크기 ÷ 4MiB 비율 0.37, 운영과 동일)를 만들어 읽은 결과 Spark 실제 114 = 이 함수 114. 단순 나눗셈 `(바이트 + 파일 수 × 4MiB) ÷ 128MiB`는 116으로 2개 많다. Spark가 "넣을지 판단"에는 4MiB를 안 더하기 때문이다
 - 차례 수 선택지: 2(64 core, 속도) / 3(5대 × 8c = 40 core, dcu −17%, 최악 duration 약 4.6분으로 5분 여유 적음)
 - 테이블마다 계수를 따로 잡을 필요는 없다. 읽기 task 1개의 일감은 테이블과 무관하게 같고(파일 약 24개, 128MiB), 테이블 차이는 읽기 task 수(파일 수)와 메모리(spill 확인)에 각각 반영된다
