@@ -422,6 +422,8 @@ src/
 - avro 파일은 한 테이블 것만 넣고, 테스트 코드의 `tableName`을 그 테이블로 맞춘다.
 - 테스트가 avro 경로 목록 파일(운영의 `inputFileName`과 같은 형식)을 임시로 만들어 `prepare`에 넘긴다. 1단계(목록 read)부터 검증된다.
 - `renameColumns`가 실제 변환 함수를 호출해야 4단계까지 검증된다.
+- 키 컬럼이나 `ts`가 없으면 `beforeAll`에서 바로 멈추고 없는 컬럼과 실제 컬럼 목록을 알려 준다. 예: `[<테이블2>] 키·최신 판단 컬럼이 없다: tmp_id2 / 컬럼명 변환 후 실제 컬럼: tmp_id1, tmp_key, v, ts`
+- avro 파일을 바꿔 넣을 때는 `mvn clean test`로 돌린다. Maven은 resources를 `target/test-classes`에 복사해 두므로, `src`에서 지운 파일도 clean 전까지는 남아 함께 읽힌다(로컬 확인).
 
 ### 8.2 빌드 설정 (Maven)
 
@@ -543,6 +545,13 @@ class UpsertPrepareTest extends AnyFunSuite with BeforeAndAfterAll {
     read = UpsertJob.readAvro(spark, inputFileName)
     readFiles = read.inputFiles.toSeq
     input = UpsertJob.renameColumns(read).cache()
+
+    // prepare(3단계)는 키 컬럼이 없으면 Window 에러로 멈추므로, 먼저 확인해 원인을 바로 알려 준다
+    val missing = (spec.keyCols :+ spec.orderCol).filterNot(c => input.columns.exists(_.equalsIgnoreCase(c)))
+    require(missing.isEmpty,
+      s"[$tableName] 키·최신 판단 컬럼이 없다: ${missing.mkString(", ")} / " +
+        s"컬럼명 변환 후 실제 컬럼: ${input.columns.mkString(", ")}")
+
     prepared = UpsertJob.prepare(spark, inputFileName, spec).cache()
   }
 
