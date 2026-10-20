@@ -114,6 +114,7 @@ nav:
       - 읽기 성능 비교 테스트: schema/read-performance-test.md
       - Trino 쿼리 가이드 (사용자용): schema/trino-query-guide.md
       - Spark 쿼리 메트릭 가이드: schema/spark-query-metrics-guide.md
+      - array 컬럼 제거 용량 산정 (빅테이블): schema/column-removal-storage-estimate.md
   - 파이프라인:
       - FileIO 전환 가이드 (S3A → S3FileIO): pipeline/s3fileio-migration-guide.md
       - FileIO 전환 결과 (보고용): pipeline/s3fileio-migration-report.md

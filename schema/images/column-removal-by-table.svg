@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="380" viewBox="0 0 760 380" font-family="'Noto Sans KR','NanumGothic','Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+<rect width="760" height="380" rx="8" fill="#fcfcfb"/>
+<rect x="56" y="21" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="78" y="31" font-size="13" fill="#52514e">현재 (90일)</text>
+<rect x="180" y="21" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="202" y="31" font-size="13" fill="#52514e">컬럼 제거 후 90일</text>
+<rect x="343" y="21" width="12" height="12" rx="3" fill="#1baf7a"/>
+<text x="365" y="31" font-size="13" fill="#52514e">컬럼 제거 후 180일</text>
+<line x1="56" y1="340.0" x2="740" y2="340.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="344.0" font-size="12" fill="#898781" text-anchor="end">0</text>
+<line x1="56" y1="271.0" x2="740" y2="271.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="275.0" font-size="12" fill="#898781" text-anchor="end">30</text>
+<line x1="56" y1="202.0" x2="740" y2="202.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="206.0" font-size="12" fill="#898781" text-anchor="end">60</text>
+<line x1="56" y1="133.0" x2="740" y2="133.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="137.0" font-size="12" fill="#898781" text-anchor="end">90</text>
+<line x1="56" y1="64.0" x2="740" y2="64.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="68.0" font-size="12" fill="#898781" text-anchor="end">120</text>
+<text x="48" y="50" font-size="12" fill="#898781" text-anchor="end">TiB</text>
+<path d="M86.5,340.0 V150.28441258246585 Q86.5,146.28441258246585 90.5,146.28441258246585 H116.5 Q120.5,146.28441258246585 120.5,150.28441258246585 V340.0 Z" fill="#2a78d6"/>
+<text x="103.5" y="140.3" font-size="12" fill="#0b0b0b" text-anchor="middle">84.2</text>
+<path d="M124.5,340.0 V213.33622111928162 Q124.5,209.33622111928162 128.5,209.33622111928162 H154.5 Q158.5,209.33622111928162 158.5,213.33622111928162 V340.0 Z" fill="#eb6834"/>
+<text x="141.5" y="203.3" font-size="12" fill="#0b0b0b" text-anchor="middle">56.8</text>
+<path d="M162.5,340.0 V82.67244223856324 Q162.5,78.67244223856324 166.5,78.67244223856324 H192.5 Q196.5,78.67244223856324 196.5,82.67244223856324 V340.0 Z" fill="#1baf7a"/>
+<text x="179.5" y="72.7" font-size="12" fill="#0b0b0b" text-anchor="middle">113.6</text>
+<text x="141.5" y="362.0" font-size="14" fill="#0b0b0b" text-anchor="middle" font-weight="600">1번</text>
+<path d="M257.5,340.0 V226.11541358668455 Q257.5,222.11541358668455 261.5,222.11541358668455 H287.5 Q291.5,222.11541358668455 291.5,226.11541358668455 V340.0 Z" fill="#2a78d6"/>
+<text x="274.5" y="216.1" font-size="12" fill="#0b0b0b" text-anchor="middle">51.3</text>
+<path d="M295.5,340.0 V285.17602968002393 Q295.5,281.17602968002393 299.5,281.17602968002393 H325.5 Q329.5,281.17602968002393 329.5,285.17602968002393 V340.0 Z" fill="#eb6834"/>
+<text x="312.5" y="275.2" font-size="12" fill="#0b0b0b" text-anchor="middle">25.6</text>
+<path d="M333.5,340.0 V226.35205936004786 Q333.5,222.35205936004786 337.5,222.35205936004786 H363.5 Q367.5,222.35205936004786 367.5,226.35205936004786 V340.0 Z" fill="#1baf7a"/>
+<text x="350.5" y="216.4" font-size="12" fill="#0b0b0b" text-anchor="middle">51.2</text>
+<text x="312.5" y="362.0" font-size="14" fill="#0b0b0b" text-anchor="middle" font-weight="600">2번</text>
+<path d="M428.5,340.0 V149.94461183404928 Q428.5,145.94461183404928 432.5,145.94461183404928 H458.5 Q462.5,145.94461183404928 462.5,149.94461183404928 V340.0 Z" fill="#2a78d6"/>
+<text x="445.5" y="139.9" font-size="12" fill="#0b0b0b" text-anchor="middle">84.4</text>
+<path d="M466.5,340.0 V213.11866283338986 Q466.5,209.11866283338986 470.5,209.11866283338986 H496.5 Q500.5,209.11866283338986 500.5,213.11866283338986 V340.0 Z" fill="#eb6834"/>
+<text x="483.5" y="203.1" font-size="12" fill="#0b0b0b" text-anchor="middle">56.9</text>
+<path d="M504.5,340.0 V82.23732566677972 Q504.5,78.23732566677972 508.5,78.23732566677972 H534.5 Q538.5,78.23732566677972 538.5,82.23732566677972 V340.0 Z" fill="#1baf7a"/>
+<text x="521.5" y="72.2" font-size="12" fill="#0b0b0b" text-anchor="middle">113.8</text>
+<text x="483.5" y="362.0" font-size="14" fill="#0b0b0b" text-anchor="middle" font-weight="600">3번</text>
+<path d="M599.5,340.0 V155.90708951230772 Q599.5,151.90708951230772 603.5,151.90708951230772 H629.5 Q633.5,151.90708951230772 633.5,155.90708951230772 V340.0 Z" fill="#2a78d6"/>
+<text x="616.5" y="145.9" font-size="12" fill="#0b0b0b" text-anchor="middle">81.8</text>
+<path d="M637.5,340.0 V215.55199243638071 Q637.5,211.55199243638071 641.5,211.55199243638071 H667.5 Q671.5,211.55199243638071 671.5,215.55199243638071 V340.0 Z" fill="#eb6834"/>
+<text x="654.5" y="205.6" font-size="12" fill="#0b0b0b" text-anchor="middle">55.8</text>
+<path d="M675.5,340.0 V87.10398487276143 Q675.5,83.10398487276143 679.5,83.10398487276143 H705.5 Q709.5,83.10398487276143 709.5,87.10398487276143 V340.0 Z" fill="#1baf7a"/>
+<text x="692.5" y="77.1" font-size="12" fill="#0b0b0b" text-anchor="middle">111.7</text>
+<text x="654.5" y="362.0" font-size="14" fill="#0b0b0b" text-anchor="middle" font-weight="600">4번</text>
+<line x1="56" y1="340.0" x2="740" y2="340.0" stroke="#c3c2b7" stroke-width="1"/>
+</svg>
