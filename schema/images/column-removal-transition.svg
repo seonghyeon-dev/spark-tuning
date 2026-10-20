@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" font-family="'Noto Sans KR','NanumGothic','Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+<rect width="760" height="420" rx="8" fill="#fcfcfb"/>
+<line x1="56" y1="27" x2="72" y2="27" stroke="#eb6834" stroke-width="2.5"/>
+<text x="78" y="31" font-size="13" fill="#52514e">제거와 동시에 180일로 연장</text>
+<line x1="278" y1="27" x2="294" y2="27" stroke="#2a78d6" stroke-width="2.5"/>
+<text x="300" y="31" font-size="13" fill="#52514e">제거 90일 후 180일로 연장</text>
+<line x1="495" y1="27" x2="511" y2="27" stroke="#898781" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="517" y="31" font-size="13" fill="#52514e">현재 사용량 301.6</text>
+<line x1="56" y1="368.0" x2="736" y2="368.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="372.0" font-size="12" fill="#898781" text-anchor="end">150</text>
+<line x1="56" y1="292.0" x2="736" y2="292.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="296.0" font-size="12" fill="#898781" text-anchor="end">250</text>
+<line x1="56" y1="216.0" x2="736" y2="216.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="220.0" font-size="12" fill="#898781" text-anchor="end">350</text>
+<line x1="56" y1="140.0" x2="736" y2="140.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="144.0" font-size="12" fill="#898781" text-anchor="end">450</text>
+<line x1="56" y1="64.0" x2="736" y2="64.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="48" y="68.0" font-size="12" fill="#898781" text-anchor="end">550</text>
+<text x="48" y="50" font-size="12" fill="#898781" text-anchor="end">TiB</text>
+<text x="56.0" y="388" font-size="12" fill="#898781" text-anchor="middle">0</text>
+<text x="169.3" y="388" font-size="12" fill="#898781" text-anchor="middle">30</text>
+<text x="282.7" y="388" font-size="12" fill="#898781" text-anchor="middle">60</text>
+<text x="396.0" y="388" font-size="12" fill="#898781" text-anchor="middle">90</text>
+<text x="509.3" y="388" font-size="12" fill="#898781" text-anchor="middle">120</text>
+<text x="622.7" y="388" font-size="12" fill="#898781" text-anchor="middle">150</text>
+<text x="736.0" y="388" font-size="12" fill="#898781" text-anchor="middle">180</text>
+<text x="736" y="410" font-size="12" fill="#898781" text-anchor="end">컬럼 제거 후 경과일</text>
+<line x1="56" y1="368.0" x2="736" y2="368.0" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="56" y1="252.8" x2="736" y2="252.8" stroke="#898781" stroke-width="1.5" stroke-dasharray="4 3"/>
+<polyline points="56.0,252.8 396.0,333.7 736.0,185.4" fill="none" stroke="#2a78d6" stroke-width="2.5" stroke-linejoin="round"/>
+<polyline points="56.0,252.8 396.0,104.5 736.0,185.4" fill="none" stroke="#eb6834" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="396.0" cy="104.5" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="396.0" y="92.5" font-size="13" fill="#0b0b0b" text-anchor="middle">최대 496.8</text>
+<circle cx="396.0" cy="333.7" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="396.0" y="355.7" font-size="13" fill="#0b0b0b" text-anchor="middle">최저 195.1</text>
+<circle cx="736.0" cy="185.4" r="5" fill="#52514e" stroke="#fcfcfb" stroke-width="2"/>
+<text x="728.0" y="173.4" font-size="13" fill="#0b0b0b" text-anchor="end">390.3</text>
+</svg>

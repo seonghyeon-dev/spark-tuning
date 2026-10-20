@@ -33,6 +33,7 @@ Spark → Iceberg(S3/MinIO, HMS) → Trino 로 이어지는 배치 파이프라�
 | [읽기 성능 비교 테스트](schema/read-performance-test.md) | 파티션 전략 5개 비교, Sort Order/Bloom Filter 조합 비교 |
 | [Trino 쿼리 가이드](schema/trino-query-guide.md) | Trino 사용자용 — `ts` 필터링 방법, WHERE 필수 컬럼, 잘못된 패턴 |
 | [Spark 쿼리 메트릭 가이드](schema/spark-query-metrics-guide.md) | Spark History Server SQL 탭의 Iceberg Scan 메트릭 해설 |
+| [array 컬럼 제거 용량 산정](schema/column-removal-storage-estimate.md) | 빅테이블 4개 `array<double>` 컬럼 제거 시 하루·90일·180일 용량, 180일 연장 적용 시점 |
 
 ### 파이프라인
 

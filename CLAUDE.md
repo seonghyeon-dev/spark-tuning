@@ -103,6 +103,7 @@
 | 8 | Trino Partition Pruning 검증 | 완료 | `tuning/trino-iceberg-partition-pruning.md` |
 | 9 | 테이블 재생성 + `tmp_id` 추가 | 운영 적용 중 | `pipeline/recreate-table-tmp-id.md`, `intent/schema/recreate-table-tmp-id/intent.md` |
 | 10 | 일일 리소스 사용량 시각화 | 완료 | `pipeline/airflow-job-duration.md`, `pipeline/resource-timeline.md` |
+| 11 | array 컬럼 제거 용량 산정 (빅테이블) | 산정 완료 | `schema/column-removal-storage-estimate.md` |
 
 ## 작업 1: Spark 튜닝 가이드 (append Job)
 
@@ -233,6 +234,15 @@
 - 결과 문구 (사용자 2026-09-29): 보고서체. '붐빈다'(→ 최대 사용), 초보 설명('파랑이 회색보다 낮은 만큼'), '순간의 값을 이었다', 쓸모없는 안내·생성 도구 문구 금지
 - 사용자 작업 엑셀은 사내 DRM → Windows Python + xlwings로 엑셀 경유 읽기 (WSL 불가). 실제 엑셀 경유 읽기는 사용자 첫 실행으로만 검증 가능
 
+## 작업 11: array 컬럼 제거 용량 산정 (빅테이블) — 산정 완료 (2026-10-20)
+
+- 제거 대상: array<double> value 컬럼 1·2번 1개, 3·4번 2개. 산정 = 운영 `$files` 하루치 `readable_metrics['<컬럼>.element'].column_size` 합 × 보관일수(사용자 방식)
+- **결과 (4개 합계, TiB)**: 하루 3.351 → 2.168(−35.3%). 90일 301.6 → 195.1(−106.5), 180일 390.3(+88.6). 현재 용량으로 139일 보관 가능. 2번은 제거율 50.1%라 180일 = 현재 90일(51.2 ≈ 51.3)
+- ⚠️ 180일 연장은 **컬럼 제거 90일 후** 적용. 동시 적용 시 기존 90일치가 남아 90일째 496.8 TiB. `DROP COLUMN`은 기존 파일 크기를 바꾸지 않는다(로컬 확인)
+- 검증: 로컬(Spark 3.5.8 + Iceberg 1.10.1) DROP + rewrite 예측 오차 0.02%, 운영 gap(파일 크기 − column_sizes 합) 5.5~101KB, 운영 컬럼 수 일치(사용자 확인)
+- ⚠️ `write.metadata.metrics.column.<array 컬럼>=none`은 하위 `<컬럼>.element`에 적용되지 않는다(Iceberg는 이름 정확히 일치만 적용). 그래서 `column_size`가 기록된다. 키를 `.element`로 바꾸면 이 산정 불가
+- 미반영: snapshot 보존 3일분, MinIO 물리 배수, 데이터 증가. 적용 전 확인: append 앱이 제거 컬럼을 넘기는지, 조회 쿼리, Compaction ratio·append executor 공식 재검증
+
 ## 파일 구조
 
 ```
@@ -262,6 +272,8 @@
 │   ├── iceberg-schema-design-guide.md  # Iceberg 스키마 설계 가이드
 │   ├── read-performance-test.md        # 파티션 전략별 읽기 성능 비교 테스트
 │   ├── spark-query-metrics-guide.md    # Spark 쿼리 메트릭 가이드
+│   ├── column-removal-storage-estimate.md  # array 컬럼 제거 용량 산정 (작업 11)
+│   ├── images/                         # 작업 11 그래프 (SVG)
 │   └── trino-query-guide.md            # Trino 쿼리 가이드 (사용자용)
 └── pipeline/
     ├── s3fileio-migration-guide.md      # FileIO 전환 가이드 (S3A → S3FileIO, 상세)
