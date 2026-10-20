@@ -238,7 +238,7 @@
 
 - 제거 대상: array<double> value 컬럼 1·2번 1개, 3·4번 2개. 산정 = 운영 `$files` 하루치 `readable_metrics['<컬럼>.element'].column_size` 합 × 보관일수(사용자 방식)
 - **결과 (4개 합계, TiB)**: 하루 3.351 → 2.168(−35.3%). 90일 301.6 → 195.1(−106.5), 180일 390.3(+88.6). 현재 용량으로 139일 보관 가능. 2번은 제거율 50.1%라 180일 = 현재 90일(51.2 ≈ 51.3)
-- ⚠️ 180일 연장은 **컬럼 제거 90일 후** 적용. 동시 적용 시 기존 90일치가 남아 90일째 496.8 TiB. `DROP COLUMN`은 기존 파일 크기를 바꾸지 않는다(로컬 확인)
+- ⚠️ `DROP COLUMN`은 기존 파일 크기를 바꾸지 않는다(로컬 확인). 기존 90일치 처리: A) rewrite + expire snapshots면 180일 연장 바로 가능(사용자 지적 2026-10-20). 하루 rewrite 12일치 이하여야 최대 390.3 유지(snapshot 보존 3일 겹침), 90일치 약 207시간 추정(hourly 2.41초/GB 환산, 1일치 시험으로 확인) B) rewrite 없으면 **컬럼 제거 90일 후** 연장. 처리 없이 바로 연장하면 90일째 496.8 TiB
 - 검증: 로컬(Spark 3.5.8 + Iceberg 1.10.1) DROP + rewrite 예측 오차 0.02%, 운영 gap(파일 크기 − column_sizes 합) 5.5~101KB, 운영 컬럼 수 일치(사용자 확인)
 - ⚠️ `write.metadata.metrics.column.<array 컬럼>=none`은 하위 `<컬럼>.element`에 적용되지 않는다(Iceberg는 이름 정확히 일치만 적용). 그래서 `column_size`가 기록된다. 키를 `.element`로 바꾸면 이 산정 불가
 - 미반영: snapshot 보존 3일분, MinIO 물리 배수, 데이터 증가. 적용 전 확인: append 앱이 제거 컬럼을 넘기는지, 조회 쿼리, Compaction ratio·append executor 공식 재검증
