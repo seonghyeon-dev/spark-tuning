@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" font-family="'Noto Sans KR','NanumGothic','Malgun Gothic','Apple SD Gothic Neo',sans-serif">
 <rect width="760" height="420" rx="8" fill="#fcfcfb"/>
 <line x1="56" y1="27" x2="72" y2="27" stroke="#eb6834" stroke-width="2.5"/>
-<text x="78" y="31" font-size="13" fill="#52514e">제거와 동시에 180일로 연장</text>
-<line x1="278" y1="27" x2="294" y2="27" stroke="#2a78d6" stroke-width="2.5"/>
-<text x="300" y="31" font-size="13" fill="#52514e">제거 90일 후 180일로 연장</text>
-<line x1="495" y1="27" x2="511" y2="27" stroke="#898781" stroke-width="2" stroke-dasharray="4 3"/>
-<text x="517" y="31" font-size="13" fill="#52514e">현재 사용량 301.6</text>
+<text x="78" y="31" font-size="13" fill="#52514e">처리 없이 바로 180일로 연장</text>
+<line x1="285" y1="27" x2="301" y2="27" stroke="#2a78d6" stroke-width="2.5"/>
+<text x="307" y="31" font-size="13" fill="#52514e">제거 90일 뒤 180일로 연장 (B)</text>
+<line x1="530" y1="27" x2="546" y2="27" stroke="#898781" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="552" y="31" font-size="13" fill="#52514e">현재 사용량 301.6</text>
 <line x1="56" y1="368.0" x2="736" y2="368.0" stroke="#e1e0d9" stroke-width="1"/>
 <text x="48" y="372.0" font-size="12" fill="#898781" text-anchor="end">150</text>
 <line x1="56" y1="292.0" x2="736" y2="292.0" stroke="#e1e0d9" stroke-width="1"/>
