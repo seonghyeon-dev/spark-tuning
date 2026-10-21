@@ -249,3 +249,56 @@ WHERE file_path LIKE '%/ts_hour=<yyyy-MM-dd>-%'
 4번,89917540079760,81.8,61404381687330,55.8,122808763374660,111.7,+29.9
 합계,331645440108060,301.6,214556353705080,195.1,429112707410160,390.3,+88.6
 ```
+
+---
+
+## 8. Hive 테이블 검토 (진행 안 함)
+
+> **결정 (사용자 2026-10-21)**: Hive 테이블은 컬럼 제거를 진행하지 않는다. Hive는 전부 Iceberg로 전환한 뒤 제거할 예정이다. 아래는 검토 결과 기록이다.
+
+### 8.1 대상
+
+| 항목 | 내용 |
+|------|------|
+| 테이블 | 빅테이블 4개로 수직분할되기 전의 Hive 테이블 1개 |
+| 형식 | external 테이블, ORC, HDFS, 파티션 `dt` |
+| 적재 | raw text 테이블 → ORC로 CTAS(temp 테이블) → 파일을 external 테이블 경로로 `hdfs mv` |
+| raw 보관 | 7일 |
+| 제거 대상 | array&lt;double&gt; 6개 (Iceberg 1~4번의 제거 대상 합) |
+
+### 8.2 방식: 컬럼을 지우지 않고 NULL로 다시 쓴다
+
+ORC는 값이 전부 NULL인 컬럼을 거의 공간 없이 저장한다. 스키마는 그대로 두고 6개 컬럼만 NULL로 다시 쓰면, 용량은 컬럼을 지운 것과 같고 조회 쪽 영향이 없다.
+
+| 파일 (로컬, Spark 3.5.8 ORC writer, zlib, 100만 row) | 크기 |
+|------|------|
+| 원본 (array 2개) | 312,785,949 B |
+| array 1개를 NULL로 | 161,039,618 B |
+| array 1개를 제거 | 161,038,706 B |
+| NULL과 제거의 차이 | 912 B |
+
+검토했지만 채택하지 않은 방식:
+
+| 방식 | 채택하지 않은 이유 |
+|------|------------------|
+| `REPLACE COLUMNS` | 메타데이터만 바뀌어 용량이 줄지 않는다. 컬럼을 위치로 읽는 도구(Trino `hive.orc.use-column-names=false` 기본값, `_col0` 이름의 ORC 파일)가 있으면 옛 파일의 값이 다른 컬럼 자리로 밀려 에러 없이 틀린 값이 나온다 |
+| 새 테이블 + 이름 교체 | 이름을 두 번 바꾸는 사이 테이블이 없는 순간이 생겨 무중단이 아니다 |
+| `UPDATE ... SET col = NULL` | Hive `UPDATE`는 ACID(transactional) managed 테이블만 지원한다. external 테이블은 불가 |
+
+### 8.3 용량 산정: CTAS 1개
+
+- 산정용 CTAS는 6개 컬럼을 NULL로 바꾼 것 하나만 만든다. 기존 파일도 같은 CTAS 경로로 만들어졌으므로 원본 `dt`와 바로 비교한다
+- 운영 변환 job의 `SET` 문(엔진, `orc.compress`, stripe 크기, merge 설정)을 그대로 쓰고, 입력은 같은 `dt`의 raw text 테이블로 한다(raw 7일 보관이라 최근 `dt`만 가능)
+- 크기는 `hdfs dfs -du -s <경로>`로 잰다. 두 번째 값이 replication(3)을 포함한 실제 디스크 사용량이다
+- 다 쓴 임시 테이블은 `DROP TABLE ... PURGE`로 지운다
+
+### 8.4 기존 데이터 처리 방법
+
+| 방법 | 내용 | 특징 |
+|------|------|------|
+| `INSERT OVERWRITE` (자기 자신에서) | `INSERT OVERWRITE TABLE t PARTITION (dt='X') SELECT <전체 컬럼, 6개는 CAST(NULL AS array<double>)> FROM t WHERE dt='X'` | SQL 한 문장. raw가 없는 오래된 `dt`도 가능. 옛 파일 삭제와 새 파일 이동 사이에 짧은 공백이 있다 |
+| CTAS + `SET LOCATION` | NULL CTAS → 새 디렉터리로 `hdfs mv` → `ALTER TABLE t PARTITION (dt='X') SET LOCATION` | 위치 변경이 한 번에 바뀌어 공백이 없다. 보관일수 삭제가 경로 규칙(`dt=...`)이면 새 경로 이름을 맞춰야 한다 |
+
+- 신규 데이터는 변환 job SELECT에서 6개 컬럼을 `CAST(NULL AS array<double>)`로 바꾸면 된다
+- `INSERT OVERWRITE`의 SELECT는 컬럼 위치대로 들어가므로 전체 컬럼을 순서대로 나열한다
+- 옛 파일이 Trash로 가면 보존 기간 동안 공간이 줄지 않는다. `auto.purge` 설정 또는 `-skipTrash` 삭제를 확인한다

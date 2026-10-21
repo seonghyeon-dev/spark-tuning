@@ -242,6 +242,7 @@
 - 검증: 로컬(Spark 3.5.8 + Iceberg 1.10.1) DROP + rewrite 예측 오차 0.02%, 운영 gap(파일 크기 − column_sizes 합) 5.5~101KB, 운영 컬럼 수 일치(사용자 확인)
 - ⚠️ `write.metadata.metrics.column.<array 컬럼>=none`은 하위 `<컬럼>.element`에 적용되지 않는다(Iceberg는 이름 정확히 일치만 적용). 그래서 `column_size`가 기록된다. 키를 `.element`로 바꾸면 이 산정 불가
 - 미반영: snapshot 보존 3일분, MinIO 물리 배수, 데이터 증가. 적용 전 확인: append 앱이 제거 컬럼을 넘기는지, 조회 쿼리, Compaction ratio·append executor 공식 재검증
+- **Hive 테이블(수직분할 전 1개, external·ORC·HDFS)은 컬럼 제거 진행 안 함** (사용자 2026-10-21, Hive는 Iceberg 전환 후 제거 예정). 검토 결과는 문서 §8: 방식은 6개 컬럼 NULL로 다시 쓰기(로컬 NULL vs 제거 차이 912 B), `REPLACE COLUMNS`는 용량 안 줄고 위치 매핑 위험, external이라 `UPDATE` 불가, raw text 보관 7일
 
 ## 파일 구조
 
